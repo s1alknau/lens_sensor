@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Leapfrog-Schema 1D-FDTD (rechtslaufend)</title>
+<style>
+  body{font-family:Segoe UI,Arial,sans-serif;color:#2b2f36;background:#fafbfc;margin:0;padding:24px}
+  .wrap{max-width:1000px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 12px}
+  .ctl{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px;font-size:14px}
+  .leg{display:flex;gap:20px;align-items:center;font-size:13.5px;margin-bottom:2px}
+  canvas{width:100%;height:auto;display:block}
+  #eq{font-size:14px;margin:6px 2px 0;min-height:40px;line-height:1.5}
+  p.note{font-size:12.5px;color:#8a929e;margin:6px 2px 0;line-height:1.55}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Leapfrog-Schema (1D-FDTD, rechtslaufende Welle)</h1>
+  <div class="ctl">
+    <button id="play" style="padding:6px 14px;border:none;border-radius:6px;background:#0d9aa8;color:#fff;cursor:pointer;font-weight:600">Start</button>
+    <button id="stepb" style="padding:6px 14px;border:1px solid #b9c0cc;border-radius:6px;background:transparent;cursor:pointer">1 Halbschritt &#9654;</button>
+    <button id="reset" style="padding:6px 14px;border:1px solid #b9c0cc;border-radius:6px;background:transparent;cursor:pointer">Reset</button>
+    <span style="margin-left:6px">Tempo</span>
+    <input id="spd" type="range" min="400" max="1600" value="950" step="50" style="width:110px">
+  </div>
+  <div class="leg">
+    <span style="color:#0d9aa8;font-weight:600">&#9679; E<sub>z</sub> (Knoten i, ganze Zeit n)</span>
+    <span style="color:#ff6b47;font-weight:600">&#9679; H<sub>y</sub> (Halbknoten i+&#189;, halbe Zeit n+&#189;)</span>
+  </div>
+  <canvas id="cv" width="960" height="520"></canvas>
+  <div id="eq"></div>
+  <p class="note">
+    Jeder neue Wert (oben) entsteht aus dem <b>eigenen Wert einen ganzen Schritt zuvor</b> (graue senkrechte Verbindung)
+    plus der <b>Differenz der beiden Nachbarn des anderen Feldes einen halben Schritt zuvor</b> (farbige Diagonalen).
+    So &#8222;springt&#8220; jedes Feld &#252;ber das andere &#8212; daher <i>Leapfrog</i>. Zeit l&#228;uft nach oben.
+  </p>
+</div>
+<script>
+(function(){
+  const cv=document.getElementById('cv'), ctx=cv.getContext('2d'), eqEl=document.getElementById('eq');
+  const W=cv.width,Hh=cv.height, padL=40,padR=70,padT=48,padB=30;
+  const nx=13, M=9;
+  const teal='#0d9aa8', coral='#ff6b47', gray='#9aa2ad';
+  let ez=new Float64Array(nx), hy=new Float64Array(nx-1);
+  let levels=[], nextH=true, tt=0, playing=false, timer=null;
+  function X(pos){ return padL + pos*(W-padL-padR)/(nx-1); }
+  function rowY(r){ return padT + r*(Hh-padT-padB)/(M-1); }
+  function initField(){
+    ez.fill(0); hy.fill(0); const x0=3, w=1.8;
+    for(let i=0;i<nx;i++) ez[i]=Math.exp(-Math.pow((i-x0)/w,2));
+    for(let i=0;i<nx-1;i++) hy[i]=-Math.exp(-Math.pow((i+0.5-x0)/w,2));
+  }
+  function reset(){
+    initField(); levels=[]; nextH=true; tt=0;
+    levels.push({type:'E',vals:Float64Array.from(ez),t:0,hot:3});
+    eqEl.innerHTML='Startzustand: rechtslaufender Puls (E<sub>z</sub> und H<sub>y</sub> mit entgegengesetztem Vorzeichen).';
+    draw();
+  }
+  function argmaxAbs(a){ let m=-1,c=0; for(let i=0;i<a.length;i++){ if(Math.abs(a[i])>m){m=Math.abs(a[i]);c=i;} } return c; }
+  function tick(){
+    if(nextH){
+      for(let i=0;i<nx-1;i++) hy[i]+=(ez[i+1]-ez[i]);
+      tt+=0.5; levels.push({type:'H',vals:Float64Array.from(hy),t:tt,hot:argmaxAbs(hy)});
+      eqEl.innerHTML='<b style="color:'+coral+'">H-Update</b> (Zeit '+(tt-0.5).toFixed(1)+' &#8594; '+tt.toFixed(1)+'):&nbsp; '+
+        'H<sub>y</sub><sup>n+&#189;</sup>[i+&#189;] = H<sub>y</sub><sup>n&#8722;&#189;</sup>[i+&#189;] + (&#916;t/&#956;&#916;x)&#183;( E<sub>z</sub><sup>n</sup>[i+1] &#8722; E<sub>z</sub><sup>n</sup>[i] )';
+    } else {
+      const ez1=ez[1], ezN2=ez[nx-2];
+      for(let i=1;i<nx;i++) ez[i]+=(hy[i]-hy[i-1]);
+      ez[0]=ez1; ez[nx-1]=ezN2; tt+=0.5;
+      levels.push({type:'E',vals:Float64Array.from(ez),t:tt,hot:argmaxAbs(ez)});
+      eqEl.innerHTML='<b style="color:'+teal+'">E-Update</b> (Zeit '+(tt-0.5).toFixed(1)+' &#8594; '+tt.toFixed(1)+'):&nbsp; '+
+        'E<sub>z</sub><sup>n+1</sup>[i] = E<sub>z</sub><sup>n</sup>[i] + (&#916;t/&#949;&#916;x)&#183;( H<sub>y</sub><sup>n+&#189;</sup>[i+&#189;] &#8722; H<sub>y</sub><sup>n+&#189;</sup>[i&#8722;&#189;] )';
+    }
+    nextH=!nextH;
+    if(levels.length>M) levels.shift();
+    if(argmaxAbs(ez)>=nx-3 && tt>4){ reset(); return; }
+    draw();
+  }
+  function dot(pos,y,val,col){
+    const a=Math.min(1,0.14+Math.abs(val)*1.1), r=4.4;
+    ctx.beginPath(); ctx.arc(X(pos),y,r,0,7); ctx.globalAlpha=a; ctx.fillStyle=col; ctx.fill(); ctx.globalAlpha=1;
+    ctx.lineWidth=1; ctx.strokeStyle=col; ctx.stroke();
+    if(val<-0.02){ ctx.beginPath(); ctx.arc(X(pos),y,r+2.3,0,7); ctx.strokeStyle=col; ctx.globalAlpha=0.5; ctx.stroke(); ctx.globalAlpha=1; }
+  }
+  function arrow(x1,y1,x2,y2,col,wdt){
+    ctx.strokeStyle=col; ctx.fillStyle=col; ctx.lineWidth=wdt;
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    const ang=Math.atan2(y2-y1,x2-x1), hl=8;
+    ctx.beginPath(); ctx.moveTo(x2,y2);
+    ctx.lineTo(x2-hl*Math.cos(ang-0.4),y2-hl*Math.sin(ang-0.4));
+    ctx.lineTo(x2-hl*Math.cos(ang+0.4),y2-hl*Math.sin(ang+0.4));
+    ctx.closePath(); ctx.fill();
+  }
+  function draw(){
+    ctx.clearRect(0,0,W,Hh);
+    ctx.fillStyle='#8a929e'; ctx.font='12px Segoe UI'; ctx.textAlign='left';
+    ctx.save(); ctx.translate(W-16,padT+60); ctx.rotate(-Math.PI/2); ctx.fillText('Zeit  ↑',0,0); ctx.restore();
+    const nL=levels.length;
+    ctx.strokeStyle='#eceef1'; ctx.lineWidth=1;
+    for(let i=0;i<nx;i++){ ctx.beginPath(); ctx.moveTo(X(i),padT-10); ctx.lineTo(X(i),Hh-padB+6); ctx.stroke(); }
+    for(let r=0;r<nL;r++){
+      const lv=levels[nL-1-r], y=rowY(r);
+      ctx.fillStyle='#b0b7c0'; ctx.font='11px Segoe UI'; ctx.textAlign='right';
+      ctx.fillText('t='+lv.t.toFixed(1), padL-8, y+4);
+      if(lv.type==='E'){ for(let i=0;i<nx;i++) dot(i,y,lv.vals[i],teal); }
+      else { for(let i=0;i<nx-1;i++) dot(i+0.5,y,lv.vals[i],coral); }
+    }
+    if(nL>=2){
+      const lv=levels[nL-1], y0=rowY(0), y1=rowY(1), c=lv.hot;
+      if(lv.type==='E'){
+        if(c-1>=0) arrow(X(c-0.5),y1,X(c),y0,coral,2);
+        if(c<=nx-2) arrow(X(c+0.5),y1,X(c),y0,coral,2);
+        if(nL>=3) arrow(X(c),rowY(2),X(c),y0,gray,1.6);
+      } else {
+        arrow(X(c),y1,X(c+0.5),y0,teal,2);
+        arrow(X(c+1),y1,X(c+0.5),y0,teal,2);
+        if(nL>=3) arrow(X(c+0.5),rowY(2),X(c+0.5),y0,gray,1.6);
+      }
+      const px=lv.type==='E'?X(c):X(c+0.5);
+      ctx.beginPath(); ctx.arc(px,y0,9,0,7); ctx.strokeStyle='#333'; ctx.lineWidth=1.5; ctx.globalAlpha=0.8; ctx.stroke(); ctx.globalAlpha=1;
+    }
+  }
+  const bp=document.getElementById('play');
+  function setPlay(p){ playing=p; bp.textContent=p?'Pause':'Start'; bp.style.background=p?'#ff6b47':'#0d9aa8';
+    if(timer){clearInterval(timer);timer=null;} if(p){ timer=setInterval(tick, +document.getElementById('spd').value); } }
+  bp.onclick=()=>setPlay(!playing);
+  document.getElementById('stepb').onclick=()=>{ if(playing) setPlay(false); tick(); };
+  document.getElementById('reset').onclick=()=>{ setPlay(false); reset(); };
+  document.getElementById('spd').oninput=()=>{ if(playing) setPlay(true); };
+  reset();
+})();
+</script>
+</body>
+</html>

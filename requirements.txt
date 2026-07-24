@@ -1,0 +1,17 @@
+# Kern-Abhängigkeiten (CPU) — installieren mit:  pip install -r requirements.txt
+numpy>=1.21
+scipy>=1.7
+matplotlib>=3.5
+imageio>=2.19
+scikit-image>=0.19
+psutil>=5.9
+
+# --- GPU (optional, NUR falls CUDA vorhanden) ------------------------------
+# CuPy ist CUDA-versionsabhängig und daher NICHT hier aufgeführt.
+# Passend zur installierten CUDA-Version separat installieren, z.B.:
+#   pip install cupy-cuda12x      # CUDA 12.x
+#   pip install cupy-cuda11x      # CUDA 11.x
+# Ohne CuPy läuft alles automatisch auf der CPU (NumPy-Fallback).
+
+# Hinweis: tkinter (für den Datei-Dialog des Analyzers) gehört zu Python.
+# Unter Linux ggf. per System-Paket nachinstallieren: sudo apt install python3-tk

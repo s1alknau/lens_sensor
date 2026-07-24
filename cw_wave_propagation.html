@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CW-Welle Ausbreitung (1D-FDTD)</title>
+<style>
+  body{font-family:Segoe UI,Arial,sans-serif;color:#2b2f36;background:#fafbfc;margin:0;padding:24px}
+  .wrap{max-width:1040px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 12px}
+  .ctl{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px;font-size:14px}
+  .leg{display:flex;gap:22px;align-items:center;font-size:14px;margin-bottom:4px}
+  canvas{width:100%;height:auto;display:block}
+  p.note{font-size:12.5px;color:#8a929e;margin:8px 2px 0;line-height:1.55}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>CW-Laser &#8212; Ausbreitung nach rechts (1D-FDTD, Leapfrog)</h1>
+  <div class="ctl">
+    <button id="play" style="padding:6px 14px;border:none;border-radius:6px;background:#ff6b47;color:#fff;cursor:pointer;font-weight:600">Pause</button>
+    <button id="reset" style="padding:6px 14px;border:1px solid #b9c0cc;border-radius:6px;background:transparent;cursor:pointer">Reset</button>
+    <span style="margin-left:6px">Tempo</span>
+    <input id="spd" type="range" min="1" max="4" value="1" style="width:90px">
+    <span style="margin-left:6px">Wellenl&#228;nge</span>
+    <input id="lam" type="range" min="26" max="70" value="46" style="width:90px">
+  </div>
+  <div class="leg">
+    <span style="color:#0d9aa8;font-weight:600">&#9644; E<sub>z</sub></span>
+    <span style="color:#ff6b47;font-weight:600">&#9644; H<sub>y</sub> (&#183;&#951;, normiert)</span>
+    <span style="color:#8a929e">Quelle links = CW-Laser</span>
+    <span id="stepc" style="margin-left:auto;color:#8a929e">Schritt 0</span>
+  </div>
+  <canvas id="cv" width="1000" height="300"></canvas>
+  <p class="note">
+    Der Laser wird links als Dauerstrich (sin&#8202;&#969;t) eingekoppelt. Die <b>Wellenfront</b> l&#228;uft nach rechts;
+    dahinter stellt sich der eingeschwungene CW-Zustand ein. E<sub>z</sub> und H<sub>y</sub> haben f&#252;r die +x-Welle
+    <b>entgegengesetztes Vorzeichen</b> und sind um eine halbe Zelle / einen halben Zeitschritt versetzt (Leapfrog).
+    Rechts absorbiert eine ABC-Grenze &#8594; keine R&#252;ckreflexion.
+  </p>
+</div>
+<script>
+(function(){
+  const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+  const W=cv.width,H=cv.height, mx=18, midY=H*0.5, amp=110;
+  const N=520; let ez=new Float64Array(N), hy=new Float64Array(N);
+  let t=0, playing=true, P=46;
+  function px(i){ return mx + i*(W-2*mx)/(N-1); }
+  function reset(){ ez.fill(0); hy.fill(0); t=0; }
+  function step(){
+    const ezN2=ez[N-2];
+    for(let i=0;i<N-1;i++) hy[i]+=(ez[i+1]-ez[i]);
+    for(let i=1;i<N;i++) ez[i]+=(hy[i]-hy[i-1]);
+    const env=1-Math.exp(-Math.pow(t/(1.6*P),2));
+    ez[0]=env*Math.sin(2*Math.PI*t/P);
+    ez[N-1]=ezN2;
+    t++;
+  }
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    ctx.strokeStyle='#c7cdd6'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(mx,midY); ctx.lineTo(W-mx,midY); ctx.stroke();
+    ctx.strokeStyle='#ffb37a'; ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(px(0),24); ctx.lineTo(px(0),H-24); ctx.stroke(); ctx.setLineDash([]);
+    ctx.strokeStyle='#ff6b47'; ctx.lineWidth=2.2; ctx.beginPath();
+    for(let i=0;i<N-1;i++){ const X=px(i+0.5), Y=midY-hy[i]*amp; i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);} ctx.stroke();
+    ctx.strokeStyle='#0d9aa8'; ctx.lineWidth=2.2; ctx.beginPath();
+    for(let i=0;i<N;i++){ const X=px(i), Y=midY-ez[i]*amp; i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);} ctx.stroke();
+    const xf=Math.min(N-1, t);
+    if(xf<N-2){ ctx.strokeStyle='#0d9aa8'; ctx.globalAlpha=0.35; ctx.setLineDash([3,5]);
+      ctx.beginPath(); ctx.moveTo(px(xf),40); ctx.lineTo(px(xf),H-40); ctx.stroke();
+      ctx.setLineDash([]); ctx.globalAlpha=1;
+      ctx.fillStyle='#0d9aa8'; ctx.font='11px Segoe UI'; ctx.textAlign='center';
+      ctx.fillText('Wellenfront', px(xf), 32); }
+    document.getElementById('stepc').textContent='Schritt '+t;
+  }
+  function loop(){ if(playing){ const s=+document.getElementById('spd').value; for(let k=0;k<s;k++) step(); } draw(); requestAnimationFrame(loop); }
+  const bp=document.getElementById('play');
+  bp.onclick=()=>{ playing=!playing; bp.textContent=playing?'Pause':'Start'; bp.style.background=playing?'#ff6b47':'#0d9aa8'; };
+  document.getElementById('reset').onclick=reset;
+  document.getElementById('lam').oninput=(e)=>{ P=+e.target.value; reset(); };
+  reset(); loop();
+})();
+</script>
+</body>
+</html>

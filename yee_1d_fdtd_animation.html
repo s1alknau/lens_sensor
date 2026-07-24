@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1D-FDTD: Ez / Hy Ausbreitung (Yee-Leapfrog)</title>
+<style>
+  body{font-family:Segoe UI,Arial,sans-serif;color:#2b2f36;background:#fafbfc;margin:0;padding:24px}
+  .wrap{max-width:1040px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 14px}
+  button{font-family:inherit}
+  .ctl{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;font-size:14px}
+  .leg{display:flex;gap:22px;align-items:center;font-size:14px;margin-bottom:4px}
+  canvas{width:100%;height:auto;display:block}
+  p.note{font-size:12.5px;color:#8a929e;margin:8px 2px 0;line-height:1.55}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>1D-FDTD &#8212; E<sub>z</sub> / H<sub>y</sub> Ausbreitung (Yee-Leapfrog)</h1>
+  <div class="ctl">
+    <button id="play" style="padding:6px 14px;border:none;border-radius:6px;background:#0d9aa8;color:#fff;cursor:pointer;font-weight:600">Pause</button>
+    <button id="reset" style="padding:6px 14px;border:1px solid #b9c0cc;border-radius:6px;background:transparent;cursor:pointer">Reset</button>
+    <span style="margin-left:6px">Quelle:</span>
+    <button id="mPoint" style="padding:6px 12px;border:none;border-radius:6px;background:#0d9aa8;color:#fff;cursor:pointer">Punktquelle (beidseitig)</button>
+    <button id="mDir" style="padding:6px 12px;border:1px solid #b9c0cc;border-radius:6px;background:transparent;cursor:pointer">gerichtet (+x)</button>
+    <span style="margin-left:6px">Tempo</span>
+    <input id="spd" type="range" min="1" max="6" value="2" style="width:90px">
+  </div>
+  <div class="leg">
+    <span style="color:#0d9aa8;font-weight:600">&#9644; E<sub>z</sub> (Knoten i)</span>
+    <span style="color:#ff6b47;font-weight:600">&#9644; H<sub>y</sub> (Halbknoten i+&#189;)</span>
+    <span id="stepc" style="margin-left:auto;color:#8a929e">Schritt 0</span>
+  </div>
+  <canvas id="cv" width="1000" height="340"></canvas>
+  <p class="note">
+    E und H sind um <b>eine halbe Zelle</b> (r&#228;umlich) und einen <b>halben Zeitschritt</b> (Leapfrog) versetzt.
+    Beim <b>+x</b>-laufenden Puls haben E<sub>z</sub> und H<sub>y</sub> <b>entgegengesetztes</b> Vorzeichen, beim
+    <b>&#8722;x</b>-laufenden <b>gleiches</b> &#8212; das kodiert die Energieflussrichtung (Poynting-Vektor S = E&#215;H).
+    Eine Punktquelle strahlt symmetrisch in beide Richtungen &#8594; zwei Pulse.
+  </p>
+</div>
+<script>
+(function(){
+  const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+  const W=cv.width, H=cv.height, mx=24, midY=H*0.5, amp=118;
+  const N=420, imp0=1.0;
+  let ez=new Float64Array(N), hy=new Float64Array(N);
+  let t=0, playing=true, mode='point';
+  const spread=14, t0=42, cx=Math.floor(N/2);
+  function pulse(tt){ return Math.exp(-Math.pow((tt-t0)/spread,2)); }
+  function reset(){
+    ez.fill(0); hy.fill(0); t=0;
+    if(mode==='dir'){ const x0=Math.floor(N*0.30), w=16;
+      for(let i=0;i<N;i++){ const g=Math.exp(-Math.pow((i-x0)/w,2)); ez[i]=g; hy[i]=-g; } }
+  }
+  function step(){
+    const ez1=ez[1], ezN2=ez[N-2];
+    for(let i=0;i<N-1;i++) hy[i]+=(ez[i+1]-ez[i])/imp0;
+    for(let i=1;i<N;i++) ez[i]+=(hy[i]-hy[i-1])*imp0;
+    if(mode==='point'){ ez[cx]+=pulse(t); }
+    ez[0]=ez1; ez[N-1]=ezN2; t++;
+  }
+  function px(i){ return mx + i*(W-2*mx)/(N-1); }
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    ctx.strokeStyle='#c7cdd6'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(mx,midY); ctx.lineTo(W-mx,midY); ctx.stroke();
+    ctx.strokeStyle='#ff6b47'; ctx.lineWidth=2.4; ctx.beginPath();
+    for(let i=0;i<N-1;i++){ const X=px(i+0.5), Y=midY-hy[i]*amp; i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); } ctx.stroke();
+    ctx.strokeStyle='#0d9aa8'; ctx.lineWidth=2.4; ctx.beginPath();
+    for(let i=0;i<N;i++){ const X=px(i), Y=midY-ez[i]*amp; i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); } ctx.stroke();
+    document.getElementById('stepc').textContent='Schritt '+t;
+  }
+  function loop(){ if(playing){ const s=+document.getElementById('spd').value; for(let k=0;k<s;k++) step(); } draw(); requestAnimationFrame(loop); }
+  const bP=document.getElementById('play');
+  bP.onclick=()=>{ playing=!playing; bP.textContent=playing?'Pause':'Start'; };
+  document.getElementById('reset').onclick=reset;
+  const mp=document.getElementById('mPoint'), md=document.getElementById('mDir');
+  function setMode(m){ mode=m;
+    mp.style.background=m==='point'?'#0d9aa8':'transparent'; mp.style.color=m==='point'?'#fff':'inherit'; mp.style.border=m==='point'?'none':'1px solid #b9c0cc';
+    md.style.background=m==='dir'?'#0d9aa8':'transparent'; md.style.color=m==='dir'?'#fff':'inherit'; md.style.border=m==='dir'?'none':'1px solid #b9c0cc';
+    reset(); }
+  mp.onclick=()=>setMode('point'); md.onclick=()=>setMode('dir');
+  reset(); loop();
+})();
+</script>
+</body>
+</html>

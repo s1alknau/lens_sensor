@@ -1,0 +1,76 @@
+<svg viewBox="0 0 640 600" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial, sans-serif" role="img" aria-labelledby="ti de">
+  <title id="ti">Korrekte Yee-Zelle</title>
+  <desc id="de">E-Komponenten auf den Kantenmitten (entlang ihrer Achse), H-Komponenten in den Flaechenzentren (senkrecht zur Flaeche). Hy auf der y=j-Vorderflaeche.</desc>
+  <defs>
+    <marker id="teal" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto">
+      <path d="M0,0 L7,3.2 L0,6.4 Z" fill="#0d9aa8"/>
+    </marker>
+    <marker id="coral" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto">
+      <path d="M0,0 L7,3.2 L0,6.4 Z" fill="#ff6b47"/>
+    </marker>
+  </defs>
+
+  <!-- drei ursprungsnahe Flaechen: hier sitzen die H-Zentren (schwach koralle) -->
+  <polygon points="170,470 280,400 280,230 170,300" fill="#ff6b47" opacity="0.06"/>
+  <polygon points="170,470 320,530 320,360 170,300" fill="#ff6b47" opacity="0.06"/>
+  <polygon points="170,470 320,530 430,460 280,400" fill="#ff6b47" opacity="0.06"/>
+
+  <!-- Wuerfel-Kanten (hellgrau) -->
+  <g stroke="#b9c0cc" stroke-width="1.3" fill="none">
+    <polyline points="320,530 430,460 430,290 320,360" />
+    <polyline points="280,400 430,460" />
+    <polyline points="280,230 430,290" />
+    <polyline points="170,300 320,360" />
+    <polyline points="280,230 280,400" />
+    <polyline points="170,300 280,230" />
+    <polyline points="320,360 320,530" />
+  </g>
+  <!-- Kanten mit E (teal, etwas kraeftiger): Ursprungs-Kanten entlang x, y, z -->
+  <g stroke="#0d9aa8" stroke-width="2" fill="none" opacity="0.55">
+    <line x1="170" y1="470" x2="320" y2="530"/>  <!-- x-Kante -->
+    <line x1="170" y1="470" x2="280" y2="400"/>  <!-- y-Kante -->
+    <line x1="170" y1="470" x2="170" y2="300"/>  <!-- z-Kante -->
+  </g>
+
+  <!-- E-Felder: auf Kantenmitten, entlang der jeweiligen Achse -->
+  <g stroke="#0d9aa8" stroke-width="3" marker-end="url(#teal)">
+    <line x1="245" y1="500" x2="305" y2="524"/>  <!-- Ex -->
+    <line x1="225" y1="435" x2="269" y2="407"/>  <!-- Ey -->
+    <line x1="170" y1="385" x2="170" y2="317"/>  <!-- Ez -->
+  </g>
+  <g fill="#0d9aa8">
+    <circle cx="245" cy="500" r="3.2"/><circle cx="225" cy="435" r="3.2"/><circle cx="170" cy="385" r="3.2"/>
+  </g>
+  <g fill="#0d9aa8" font-size="19" font-style="italic" font-weight="600">
+    <text x="300" y="546">E</text><text x="316" y="551" font-size="12">x</text>
+    <text x="185" y="418">E</text><text x="201" y="423" font-size="12">y</text>
+    <text x="120" y="352">E</text><text x="136" y="357" font-size="12">z</text>
+  </g>
+
+  <!-- H-Felder: in den Flaechenzentren, senkrecht zur Flaeche (= entlang eigener Achse) -->
+  <g stroke="#ff6b47" stroke-width="3" marker-end="url(#coral)">
+    <line x1="225" y1="350" x2="285" y2="374"/>  <!-- Hx : Zentrum linke Flaeche (x=i), +x -->
+    <line x1="245" y1="415" x2="289" y2="387"/>  <!-- Hy : Zentrum Vorderflaeche (y=j), +y -->
+    <line x1="300" y1="465" x2="300" y2="397"/>  <!-- Hz : Zentrum Bodenflaeche (z=k), +z -->
+  </g>
+  <g fill="#ff6b47">
+    <circle cx="225" cy="350" r="3.2"/><circle cx="245" cy="415" r="3.2"/><circle cx="300" cy="465" r="3.2"/>
+  </g>
+  <g fill="#ff6b47" font-size="19" font-style="italic" font-weight="600">
+    <text x="238" y="338">H</text><text x="256" y="343" font-size="12">x</text>
+    <text x="296" y="381">H</text><text x="314" y="386" font-size="12">y</text>
+    <text x="312" y="452">H</text><text x="330" y="457" font-size="12">z</text>
+  </g>
+
+  <!-- Ursprung -->
+  <circle cx="170" cy="470" r="3" fill="#333"/>
+  <text x="96" y="486" font-size="15" fill="#333" font-style="italic">(i, j, k)</text>
+
+  <!-- Legende -->
+  <g font-size="13.5" fill="#333">
+    <rect x="40" y="524" width="16" height="4" rx="2" fill="#0d9aa8"/>
+    <text x="62" y="530">E &#8212; Kantenmitten, entlang der Achse:  Ex(i+&#189;,j,k)  Ey(i,j+&#189;,k)  Ez(i,j,k+&#189;)</text>
+    <rect x="40" y="546" width="16" height="4" rx="2" fill="#ff6b47"/>
+    <text x="62" y="552">H &#8212; Fl&#228;chenzentren, senkrecht zur Fl&#228;che:  Hx(i,j+&#189;,k+&#189;)  Hy(i+&#189;,j,k+&#189;)  Hz(i+&#189;,j+&#189;,k)</text>
+  </g>
+</svg>

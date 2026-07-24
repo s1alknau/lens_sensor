@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lens-sensor"
+version = "0.1.0"
+description = "2D/3D-FDTD-Simulation eines Kontaktlinsen-/Wellenleiter-Traenenfilm-Sensors (NumPy/CuPy)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "matplotlib>=3.5",
+    "imageio>=2.19",
+    "scikit-image>=0.19",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+# GPU: passend zur CUDA-Version, z.B.  pip install ".[gpu-cuda12]"
+gpu-cuda12 = ["cupy-cuda12x"]
+gpu-cuda11 = ["cupy-cuda11x"]
+
+# Das Projekt ist eine Sammlung direkt ausführbarer Skripte (keine Paket-Importe),
+# daher keine automatische Paket-Erkennung — pip installiert nur die Abhängigkeiten.
+[tool.setuptools]
+py-modules = []

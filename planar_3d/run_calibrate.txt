@@ -1,0 +1,2 @@
+runtime estimation for full Domain calculation.
+sliding window and stitched not included yet

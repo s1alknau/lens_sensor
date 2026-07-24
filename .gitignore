@@ -1,0 +1,28 @@
+# --- Rechenergebnisse / grosse Binärdaten (gehören NICHT ins Repo) ---
+results/
+**/results/
+*.npz
+*.npy
+*.pkl
+*.gif
+*.mp4
+*.log
+
+# temporäre Streaming-Memmaps
+_stream_*.npy
+**/_stream*.npy
+**/_tmp_*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
