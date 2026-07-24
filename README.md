@@ -28,7 +28,7 @@ Polarisation **s (TE, Ez)** / **p (TM, Ey)** wählbar.
 ## Installation
 
 ```
-git clone <REPO-URL> lens_sensor
+git clone https://github.com/s1alknau/lens_sensor.git
 cd lens_sensor
 pip install -r requirements.txt        # CPU-Abhängigkeiten
 #   oder:  pip install .                # gleiche Abhängigkeiten via pyproject
