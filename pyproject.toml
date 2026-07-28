@@ -9,7 +9,8 @@ description = "2D/3D-FDTD-Simulation eines Kontaktlinsen-/Wellenleiter-Traenenfi
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "numpy>=1.21",
+    # numpy<2.6 deckt sich mit der neuesten CuPy 13.x -> kein Konflikt beim GPU-Install
+    "numpy>=1.22,<2.6",
     "scipy>=1.7",
     "matplotlib>=3.5",
     "imageio>=2.19",
@@ -18,9 +19,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# GPU: passend zur CUDA-Version, z.B.  pip install ".[gpu-cuda12]"
-gpu-cuda12 = ["cupy-cuda12x"]
-gpu-cuda11 = ["cupy-cuda11x"]
+# GPU: pip zieht die neueste passende CuPy (14.x auf Python >=3.10, sonst 13.x).
+# z.B.  pip install ".[gpu-cuda12]"
+gpu-cuda12 = ["cupy-cuda12x>=13"]
+gpu-cuda11 = ["cupy-cuda11x>=13"]
 
 # Das Projekt ist eine Sammlung direkt ausführbarer Skripte (keine Paket-Importe),
 # daher keine automatische Paket-Erkennung — pip installiert nur die Abhängigkeiten.

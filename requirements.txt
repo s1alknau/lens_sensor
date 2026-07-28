@@ -1,5 +1,8 @@
 # Kern-Abhängigkeiten (CPU) — installieren mit:  pip install -r requirements.txt
-numpy>=1.21
+# numpy-Band deckt sich mit der Anforderung der neuesten CuPy 13.x (numpy<2.6),
+# damit ein späterer GPU-Install (siehe unten) keinen Versionskonflikt erzeugt.
+# Auf Python 3.9 liefert pip max. numpy 2.0.x, auf 3.10+ bis 2.5.x.
+numpy>=1.22,<2.6
 scipy>=1.7
 matplotlib>=3.5
 imageio>=2.19
@@ -7,10 +10,12 @@ scikit-image>=0.19
 psutil>=5.9
 
 # --- GPU (optional, NUR falls CUDA vorhanden) ------------------------------
-# CuPy ist CUDA-versionsabhängig und daher NICHT hier aufgeführt.
-# Passend zur installierten CUDA-Version separat installieren, z.B.:
-#   pip install cupy-cuda12x      # CUDA 12.x
-#   pip install cupy-cuda11x      # CUDA 11.x
+# CuPy ist CUDA-versionsabhängig und daher NICHT hier fest aufgeführt.
+# Neueste Serie: CuPy 14.x (Python >=3.10, braucht numpy>=2.0,<2.6). Auf
+# Python 3.9 zieht pip automatisch die letzte kompatible 13.x. Passend zur
+# installierten CUDA-Version separat installieren, z.B.:
+#   pip install "cupy-cuda12x>=13"      # CUDA 12.x  (neueste: 14.1.1 auf Py>=3.10)
+#   pip install "cupy-cuda11x>=13"      # CUDA 11.x
 # Ohne CuPy läuft alles automatisch auf der CPU (NumPy-Fallback).
 
 # Hinweis: tkinter (für den Datei-Dialog des Analyzers) gehört zu Python.

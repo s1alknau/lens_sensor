@@ -27,53 +27,19 @@ Domaingroesse beachten: Zellen = (lx*ly*lz)/dx^3.
 Default 40 x 16 x 8 um @ 50 nm = 41M Zellen ~= 1.4 GB GPU-RAM.
 """
 import os
+import sys
 import time
 import pickle
 import numpy as np
 
-try:
-    import cupy as cp
-    xp = cp
-    GPU_AVAILABLE = True
-    print('[Backend] CuPy detected - using NVIDIA GPU')
-    # Pinned-Memory-Allokator abschalten: umgeht "cudaErrorAlreadyMapped", das
-    # bei grossen Host->Device-Transfers (v.a. nach abgebrochenen Laeufen) auftritt.
-    # Kostet minimal Transfer-Speed, ist aber robust. Transfers sind hier selten.
-    try:
-        cp.cuda.set_pinned_memory_allocator(None)
-    except Exception:
-        pass
-except ImportError:
-    xp = np
-    GPU_AVAILABLE = False
-    print('[Backend] CuPy not available - fallback to NumPy (CPU)')
-
-
-def to_np(a):
-    return a.get() if (GPU_AVAILABLE and hasattr(a, 'get')) else np.asarray(a)
-
-
-# ---------- Physik ----------
-C0 = 2.99792458e8
-EPS0 = 8.8541878128e-12
-MU0 = 4.0*np.pi*1e-7
-N_AIR = 1.000
-
-# identisch zu demo_beads.py
-DISPERSION = {
-    'pmma':       {532: 1.496, 850: 1.491, 940: 1.490},
-    'polystyrol': {532: 1.601, 850: 1.590, 940: 1.588},
-    'aqueous':    {532: 1.342, 850: 1.336, 940: 1.335},
-    'mucin':      {532: 1.348, 850: 1.342, 940: 1.341},
-    'cornea':     {532: 1.382, 850: 1.376, 940: 1.375},
-    'lipid':      {532: 1.486, 850: 1.480, 940: 1.479},
-}
-
-
-def n_at(mat, lam_nm):
-    tbl = DISPERSION[mat]
-    xs = sorted(tbl)
-    return float(np.interp(lam_nm, xs, [tbl[x] for x in xs]))
+# Repo-Root auf den Importpfad, damit das geteilte common/-Paket gefunden wird,
+# unabhaengig davon, aus welchem Ordner das Skript gestartet wurde.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+# Backend (GPU/CPU) und Physik/Materialdaten aus den geteilten Modulen.
+from common.backend import xp, cp, GPU_AVAILABLE, to_np           # noqa: E402
+from common.physics import C0, EPS0, MU0, N_AIR, DISPERSION, n_at  # noqa: E402
 
 
 def build_eps3d(Nx, Ny, Nz, dx_um, y0_um, z0_um,
@@ -211,6 +177,56 @@ def _colocate_E(Ex, Ey, Ez):
     eyc = 0.25*(Ey[:-1, :, :-1] + Ey[1:, :, :-1] + Ey[:-1, :, 1:] + Ey[1:, :, 1:])
     ezc = 0.25*(Ez[:-1, :-1, :] + Ez[1:, :-1, :] + Ez[:-1, 1:, :] + Ez[1:, 1:, :])
     return exc, eyc, ezc
+
+
+def _resolve_pol(polarization, Ny, Nz):
+    """Normalisiert die Polarisation und liefert das Gitter der getriebenen
+    Hauptkomponente. 's'/TE -> Ez (Ny, Nz-1); 'p'/TM -> Ey (Ny-1, Nz).
+    Rueckgabe (pol, Nj, Nk). Geteilt von run_3d und run_3d_stitched."""
+    pol = str(polarization).lower()
+    pol = 'p' if pol in ('p', 'tm') else 's'
+    Nj, Nk = (Ny-1, Nz) if pol == 'p' else (Ny, Nz-1)
+    return pol, Nj, Nk
+
+
+def _build_gauss_source(n_sp, t_wg_um, y0_um, z0_um, dx_um, dx, LAM, Nj, Nk,
+                        vcsel_waist_um, vcsel_waist_z_um,
+                        vcsel_offset_y_um, vcsel_offset_z_um, vcsel_tilt_deg):
+    """Gauss-Spot-Quelle (Taille in y und z) auf der getriebenen Komponente.
+    Zentrum standardmaessig WG-Mitte (y=t_wg/2) und z=0. Rueckgabe
+    (src_ix, j_src, k_src, src_p, use_tilt, src_phase); src_phase ist None ohne
+    Neigung. Geteilt von run_3d und run_3d_stitched (zuvor doppelt)."""
+    src_ix = n_sp + 6
+    j_src = min(max(int(round((t_wg_um/2 + vcsel_offset_y_um - y0_um)/dx_um)), 0), Nj-1)
+    k_src = min(max(int(round((0.0 + vcsel_offset_z_um - z0_um)/dx_um)), 0), Nk-1)
+    wy = max(2.0, vcsel_waist_um/dx_um)
+    wz = max(2.0, vcsel_waist_z_um/dx_um)
+    jj = xp.arange(Nj, dtype=xp.float32)[:, None]
+    kk = xp.arange(Nk, dtype=xp.float32)[None, :]
+    src_p = xp.exp(-((jj - j_src)/wy)**2 - ((kk - k_src)/wz)**2)
+    # Strahlneigung in der x-y-Ebene: lineare Phasenrampe entlang y ueber die
+    # Quellebene -> der Gauss laeuft unter dem Winkel vcsel_tilt_deg zur x-Achse.
+    use_tilt = abs(vcsel_tilt_deg) > 1e-9
+    src_phase = None
+    if use_tilt:
+        _ky = 2*np.pi/LAM*np.sin(np.deg2rad(vcsel_tilt_deg))*dx   # Phase pro Zelle in y
+        src_phase = xp.asarray(_ky*(np.arange(Nj) - j_src), dtype=xp.float32)[:, None]
+    return src_ix, j_src, k_src, src_p, use_tilt, src_phase
+
+
+def _yee_step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch):
+    """Ein voller Yee-Leapfrog-Schritt: H-Update, dann E-Update (Innenbereich).
+    Aktualisiert alle sechs Felder IN PLACE. Identisch fuer run_3d und
+    run_3d_stitched (zuvor im heissen Loop dupliziert)."""
+    Hx += Ch*((Ey[:, :, 1:] - Ey[:, :, :-1]) - (Ez[:, 1:, :] - Ez[:, :-1, :]))
+    Hy += Ch*((Ez[1:, :, :] - Ez[:-1, :, :]) - (Ex[:, :, 1:] - Ex[:, :, :-1]))
+    Hz += Ch*((Ex[:, 1:, :] - Ex[:, :-1, :]) - (Ey[1:, :, :] - Ey[:-1, :, :]))
+    Ex[:, 1:-1, 1:-1] += ce_x[:, 1:-1, 1:-1]*(
+        (Hz[:, 1:, 1:-1] - Hz[:, :-1, 1:-1]) - (Hy[:, 1:-1, 1:] - Hy[:, 1:-1, :-1]))
+    Ey[1:-1, :, 1:-1] += ce_y[1:-1, :, 1:-1]*(
+        (Hx[1:-1, :, 1:] - Hx[1:-1, :, :-1]) - (Hz[1:, :, 1:-1] - Hz[:-1, :, 1:-1]))
+    Ez[1:-1, 1:-1, :] += ce_z[1:-1, 1:-1, :]*(
+        (Hy[1:, 1:-1, :] - Hy[:-1, 1:-1, :]) - (Hx[1:-1, 1:, :] - Hx[1:-1, :-1, :]))
 
 
 def _gpu_free_gb():
@@ -398,32 +414,16 @@ def run_3d(label, wg_n, t_wg_um=5.0,
     Hz = xp.zeros((Nx-1, Ny-1, Nz),   dtype=xp.float32)
     # Polarisation: 's'/TE -> Quelle+Hauptfeld = Ez (Gitter Ny x Nz-1);
     #               'p'/TM -> Quelle+Hauptfeld = Ey (Gitter Ny-1 x Nz).
-    _pol = str(polarization).lower()
-    _pol = 'p' if _pol in ('p', 'tm') else 's'
+    _pol, _Nj, _Nk = _resolve_pol(polarization, Ny, Nz)
     src_field = Ey if _pol == 'p' else Ez
-    _Nj, _Nk = (Ny-1, Nz) if _pol == 'p' else (Ny, Nz-1)
     Iavg = xp.zeros_like(src_field)
 
     # Quelle: Gauss-Spot (Taille in y und z) an x = src_ix auf der getriebenen
     # Komponente. Zentrum standardmaessig WG-Mitte (y=t_wg/2) und z=0.
-    src_ix = n_sp + 6
-    j_src = int(round((t_wg_um/2 + vcsel_offset_y_um - y0_um)/dx_um))
-    k_src = int(round((0.0 + vcsel_offset_z_um - z0_um)/dx_um))
-    j_src = min(max(j_src, 0), _Nj-1)
-    k_src = min(max(k_src, 0), _Nk-1)
-    wy = max(2.0, vcsel_waist_um/dx_um)
-    wz = max(2.0, vcsel_waist_z_um/dx_um)
-    jj = xp.arange(_Nj, dtype=xp.float32)[:, None]
-    kk = xp.arange(_Nk, dtype=xp.float32)[None, :]
-    src_p = xp.exp(-((jj - j_src)/wy)**2 - ((kk - k_src)/wz)**2)
-    # Strahlneigung in der x-y-Ebene: lineare Phasenrampe entlang y ueber die
-    # Quellebene -> der Gauss laeuft unter dem Winkel vcsel_tilt_deg zur x-Achse.
-    _use_tilt = abs(vcsel_tilt_deg) > 1e-9
-    if _use_tilt:
-        _theta = np.deg2rad(vcsel_tilt_deg)
-        _ky = 2*np.pi/LAM*np.sin(_theta)*dx     # Phase pro Zelle in y
-        src_phase = xp.asarray(_ky*(np.arange(_Nj) - j_src),
-                               dtype=xp.float32)[:, None]
+    src_ix, j_src, k_src, src_p, _use_tilt, src_phase = _build_gauss_source(
+        n_sp, t_wg_um, y0_um, z0_um, dx_um, dx, LAM, _Nj, _Nk,
+        vcsel_waist_um, vcsel_waist_z_um,
+        vcsel_offset_y_um, vcsel_offset_z_um, vcsel_tilt_deg)
     print(f'Polarisation: {_pol}-Pol -> Quelle treibt '
           f'{"Ey (TM, E in x-y-Ebene)" if _pol=="p" else "Ez (TE, E entlang z)"}')
 
@@ -515,17 +515,8 @@ def run_3d(label, wg_n, t_wg_um=5.0,
             if GPU_AVAILABLE:
                 cp.cuda.runtime.deviceSynchronize()
             t_cal0 = time.time()
-        # --- H-Update ---
-        Hx += Ch*((Ey[:, :, 1:] - Ey[:, :, :-1]) - (Ez[:, 1:, :] - Ez[:, :-1, :]))
-        Hy += Ch*((Ez[1:, :, :] - Ez[:-1, :, :]) - (Ex[:, :, 1:] - Ex[:, :, :-1]))
-        Hz += Ch*((Ex[:, 1:, :] - Ex[:, :-1, :]) - (Ey[1:, :, :] - Ey[:-1, :, :]))
-        # --- E-Update (Innenbereich) ---
-        Ex[:, 1:-1, 1:-1] += ce_x[:, 1:-1, 1:-1]*(
-            (Hz[:, 1:, 1:-1] - Hz[:, :-1, 1:-1]) - (Hy[:, 1:-1, 1:] - Hy[:, 1:-1, :-1]))
-        Ey[1:-1, :, 1:-1] += ce_y[1:-1, :, 1:-1]*(
-            (Hx[1:-1, :, 1:] - Hx[1:-1, :, :-1]) - (Hz[1:, :, 1:-1] - Hz[:-1, :, 1:-1]))
-        Ez[1:-1, 1:-1, :] += ce_z[1:-1, 1:-1, :]*(
-            (Hy[1:, 1:-1, :] - Hy[:-1, 1:-1, :]) - (Hx[1:-1, 1:, :] - Hx[1:-1, :-1, :]))
+        # --- Yee-Schritt: H-Update, dann E-Update (Innenbereich) ---
+        _yee_step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch)
         # --- Quelle (soft) ---
         t_phys = n*dt
         if source_type == 'pulse':
@@ -751,23 +742,14 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
     g_sp = _sponge_profile(n_sp, sponge_alpha)
     # Polarisation: 's'/TE -> getriebene+assemblierte Komponente Ez (Ny x Nz-1),
     #               'p'/TM -> Ey (Ny-1 x Nz).
-    _pol = str(polarization).lower()
-    _pol = 'p' if _pol in ('p', 'tm') else 's'
-    _Nj, _Nk = (Ny-1, Nz) if _pol == 'p' else (Ny, Nz-1)
+    _pol, _Nj, _Nk = _resolve_pol(polarization, Ny, Nz)
     print(f'Polarisation: {_pol}-Pol -> treibt/assembliert '
           f'{"Ey (TM)" if _pol=="p" else "Ez (TE)"}')
     # Quelle (Fenster 0): Gauss-Spot auf der getriebenen Komponente
-    src_ix = n_sp + 6
-    j_src = min(max(int(round((t_wg_um/2 + vcsel_offset_y_um - y0_um)/dx_um)), 0), _Nj-1)
-    k_src = min(max(int(round((0.0 + vcsel_offset_z_um - z0_um)/dx_um)), 0), _Nk-1)
-    wy = max(2.0, vcsel_waist_um/dx_um); wz = max(2.0, vcsel_waist_z_um/dx_um)
-    jj = xp.arange(_Nj, dtype=xp.float32)[:, None]
-    kk = xp.arange(_Nk, dtype=xp.float32)[None, :]
-    src_p = xp.exp(-((jj - j_src)/wy)**2 - ((kk - k_src)/wz)**2)
-    _use_tilt = abs(vcsel_tilt_deg) > 1e-9
-    if _use_tilt:
-        _ky = 2*np.pi/LAM*np.sin(np.deg2rad(vcsel_tilt_deg))*dx
-        src_phase = xp.asarray(_ky*(np.arange(_Nj) - j_src), dtype=xp.float32)[:, None]
+    src_ix, j_src, k_src, src_p, _use_tilt, src_phase = _build_gauss_source(
+        n_sp, t_wg_um, y0_um, z0_um, dx_um, dx, LAM, _Nj, _Nk,
+        vcsel_waist_um, vcsel_waist_z_um,
+        vcsel_offset_y_um, vcsel_offset_z_um, vcsel_tilt_deg)
     # cosinus-Taper fuer weiche Overlap-Einpraegung (1 -> 0 ueber O_cells)
     _wtap = xp.asarray((0.5*(1.0 + np.cos(np.pi*np.arange(O_cells)/max(O_cells-1, 1)))
                         ).astype(np.float32))[:, None, None]
@@ -808,15 +790,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
         # Fenster w>0: linke Flaeche wird getrieben -> NICHT absorbieren
         aface = tuple(f for f in ALL_FACES if not (w > 0 and f == 'xmin'))
         for n in range(steps_win):
-            Hx += Ch*((Ey[:, :, 1:] - Ey[:, :, :-1]) - (Ez[:, 1:, :] - Ez[:, :-1, :]))
-            Hy += Ch*((Ez[1:, :, :] - Ez[:-1, :, :]) - (Ex[:, :, 1:] - Ex[:, :, :-1]))
-            Hz += Ch*((Ex[:, 1:, :] - Ex[:, :-1, :]) - (Ey[1:, :, :] - Ey[:-1, :, :]))
-            Ex[:, 1:-1, 1:-1] += ce_x[:, 1:-1, 1:-1]*(
-                (Hz[:, 1:, 1:-1] - Hz[:, :-1, 1:-1]) - (Hy[:, 1:-1, 1:] - Hy[:, 1:-1, :-1]))
-            Ey[1:-1, :, 1:-1] += ce_y[1:-1, :, 1:-1]*(
-                (Hx[1:-1, :, 1:] - Hx[1:-1, :, :-1]) - (Hz[1:, :, 1:-1] - Hz[:-1, :, 1:-1]))
-            Ez[1:-1, 1:-1, :] += ce_z[1:-1, 1:-1, :]*(
-                (Hy[1:, 1:-1, :] - Hy[:-1, 1:-1, :]) - (Hx[1:-1, 1:, :] - Hx[1:-1, :-1, :]))
+            _yee_step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch)
             t_phys = n*dt
             env = float(1 - np.exp(-((t_phys/(2*sigma_t))**2)))
             if w == 0:

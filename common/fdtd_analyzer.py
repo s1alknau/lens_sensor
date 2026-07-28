@@ -1,4 +1,4 @@
-"""Interaktives Dashboard fuer Sliding-FDTD-Analysen.
+r"""Interaktives Dashboard fuer Sliding-FDTD-Analysen.
 
 Alle Analysen in einem Fenster, per Radio-Button umschaltbar:
   - Field 2D     : Wellenfeld als Heatmap, mit Schicht-Outlines

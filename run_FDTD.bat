@@ -1,34 +1,32 @@
 @echo off
 REM ============================================================================
-REM GEMEINSAMER FDTD-LAUNCHER
-REM   Fragt zuerst: 3D oder 2D-planar?  Bei 2D: Methode full oder sliding?
-REM   Leitet dann in den passenden (interaktiven) Lauf weiter.
-REM   ENTER = Vorgabewert [in Klammern].
+REM VEREINHEITLICHTER FDTD-LAUNCHER
+REM   Aktiviert die conda-Umgebung und reicht ALLE Argumente an run_simulation.py
+REM   durch (Kontaktlinse | planar, in 2D | 3D, Methode full/sliding/stitch).
+REM   Ohne Argumente wird die Hilfe angezeigt.
 REM ============================================================================
-setlocal enabledelayedexpansion
+setlocal
 cd /d "%~dp0"
+call C:\Users\AdminAlex\miniconda3\Scripts\activate.bat lens_sensor
+if errorlevel 1 (echo FEHLER conda-Env & pause & exit /b 1)
 
-echo(
-echo ================= FDTD LAUNCHER =================
-echo   3d = echte 3D-FDTD (Bead / planarer Waveguide, kurze Strecke,
-echo        volle Yee-Zelle, GPU-speicherbegrenzt)
-echo   2d = 2D planarer Waveguide + Bead (lange Strecke, full/sliding/stitch,
-echo        gut fuer Moden / evaneszentes Feld / Sensor-Auswertung)
-echo =================================================
-set "DIM=3d"
-set /p "DIM=Rechnungstyp 3d oder 2d [!DIM!]: "
+if "%~1"=="" (
+  echo(
+  echo ================= FDTD LAUNCHER =================
+  echo   Ein Einstieg fuer alle Faelle ^(run_simulation.py^):
+  echo(
+  echo   Beispiele:
+  echo     run_FDTD.bat --geometry planar --dim 3 --method full
+  echo     run_FDTD.bat --geometry planar --dim 2 --method stitch
+  echo     run_FDTD.bat --geometry lens   --dim 2 --scenario DED
+  echo     run_FDTD.bat --geometry lens   --dim 3 --scenario Gesund --length-um 60
+  echo     run_FDTD.bat --dim 3 --calibrate 30      ^(nur Laufzeit-Schaetzung^)
+  echo =================================================
+  echo(
+  echo Vollstaendige Optionsliste:
+  python run_simulation.py --help
+  goto :eof
+)
 
-if /i "!DIM!"=="3d" goto do3d
-goto do2d
-
-:do3d
-echo(
-echo -> starte interaktiven 3D-Lauf (planar_3d\run_beads_3D.bat) ...
-call "%~dp0planar_3d\run_beads_3D.bat"
-goto :eof
-
-:do2d
-echo(
-echo -> starte interaktiven 2D-Bead/Waveguide-Lauf (planar_beads\run_BEADS.bat) ...
-call "%~dp0planar_beads\run_BEADS.bat"
-goto :eof
+python -u run_simulation.py %*
+endlocal

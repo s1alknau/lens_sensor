@@ -9,7 +9,7 @@ REQUIRED = {
     'numpy':      'pip install numpy',
     'matplotlib': 'pip install matplotlib',
     'imageio':    'pip install imageio',
-    'cupy':       'pip install cupy-cuda12x',
+    'cupy':       'pip install "cupy-cuda12x>=13"',
 }
 
 PYTHON_VERSION_MIN = (3, 10)

@@ -1,36 +1,33 @@
-"""Planare FDTD-Demo mit EINEM spaerischen Bead am Waveguide-Tear-Interface.
+"""2D-FDTD-Kern (planarer Waveguide + optionaler Bead am Waveguide-Tear-Interface).
 
-Ein Bead pro Lauf -> die Mucin-Oberkante ist FLACH bei y=-d ueber die ganze
-x-Achse (Aqueous-Dicke = Bead-Durchmesser d), der Bead sitzt mittig auf der Mucin.
+Gegenstueck zu planar_3d/fdtd3d_core.py fuer 2D. Reine Solver-Library ohne CLI -
+der Einstieg laeuft ueber run_simulation.py im Repo-Root (Geometrie/Dimension/Methode).
 
-Schichtsystem (KEIN Lipid):
-  Air / Waveguide / Aqueous (Dicke = d) / Mucin (2um) / Cornea
+Schichtsystem: Air / Waveguide / (Lipid) / Aqueous / Mucin / Cornea. Ein optionaler
+Bead (place_bead) sitzt in der Aqueous.
 
 METHODEN:
-  full    - ganzes Fenster auf einmal (Default)
+  full    - ganzes Fenster auf einmal
   sliding - Co-Moving-Window (Felder + Mur-Rand verschoben, Material pro Slide neu)
+  stitch  - Gebiets-Zerlegung -> voller gefuellter CW-Waveguide (Handoff)
 
 2D-Hinweis: ein "Bead" ist ein unendlich langer Zylinder, keine echte Kugel.
 """
-import argparse, os, time, pickle
+import os, sys, time, pickle
 import numpy as np
 
-try:
-    import cupy as cp
-    xp = cp; GPU_AVAILABLE = True
-    print('[Backend] CuPy detected - using NVIDIA GPU')
-except ImportError:
-    xp = np; GPU_AVAILABLE = False
-    print('[Backend] CuPy not available - fallback to NumPy (CPU)')
+# Repo-Root auf den Importpfad, damit das geteilte common/-Paket gefunden wird,
+# unabhaengig davon, aus welchem Ordner das Skript gestartet wurde.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+# Backend (GPU/CPU) und Physik/Materialdaten aus den geteilten Modulen.
+from common.backend import xp, cp, GPU_AVAILABLE, to_np           # noqa: E402
+from common.physics import C0, EPS0, MU0, N_AIR, DISPERSION, n_at  # noqa: E402
 
-def to_np(a):
-    return a.get() if (GPU_AVAILABLE and hasattr(a, 'get')) else np.asarray(a)
-
-# ---------- Physik ----------
-C0 = 2.99792458e8
-EPS0 = 8.8541878128e-12
-MU0 = 4.0*np.pi*1e-7
-N_AIR = 1.000
+# ---------- demo_beads-spezifische Material-Defaults ----------
+# Kurznamen-Konstanten fuer die 2D-Demo (Brechzahlen aus common.physics ableiten
+# waere moeglich, die festen 850nm-Defaults bleiben hier aber bewusst explizit).
 N_POLYSTYR = 1.590
 N_PMMA = 1.491
 N_AQ = 1.336
@@ -38,20 +35,6 @@ N_MUCIN = 1.342
 N_CORNEA = 1.376
 N_LIPID = 1.480
 MAT = {'polystyrol': N_POLYSTYR, 'pmma': N_PMMA}
-
-# Wellenlaengen-abhaengige Brechzahlen n(lambda[nm]) - lineare Interpolation.
-# 850nm = bisherige Werte (Kontinuitaet); 532/940 aus Dispersion (Literatur).
-DISPERSION = {
-    'pmma':       {532: 1.496, 850: 1.491, 940: 1.490},
-    'polystyrol': {532: 1.601, 850: 1.590, 940: 1.588},
-    'aqueous':    {532: 1.342, 850: 1.336, 940: 1.335},
-    'mucin':      {532: 1.348, 850: 1.342, 940: 1.341},
-    'cornea':     {532: 1.382, 850: 1.376, 940: 1.375},
-}
-
-def n_at(mat, lam_nm):
-    tbl = DISPERSION[mat]; xs = sorted(tbl)
-    return float(np.interp(lam_nm, xs, [tbl[x] for x in xs]))
 
 # ---------- Geometrie ----------
 L_DEMO = 1.0e-3
@@ -856,69 +839,3 @@ def save_results(result, out_dir='results'):
             os.remove(mm_path)
         except OSError:
             pass
-
-
-def main():
-    ap = argparse.ArgumentParser(description='Planare FDTD mit einem Bead')
-    ap.add_argument('--wg-material', choices=['polystyrol', 'pmma'], required=True)
-    ap.add_argument('--bead-material', choices=['polystyrol', 'pmma'], required=True)
-    ap.add_argument('--bead-diameter', type=float, required=True, help='Bead-Durchmesser in um')
-    ap.add_argument('--gpu', action='store_true')
-    ap.add_argument('--resolution', type=float, default=20.0)
-    ap.add_argument('--wg-thickness', type=float, default=5.0)
-    ap.add_argument('--lambda-nm', type=float, default=850.0)
-    ap.add_argument('--vcsel-waist', type=float, default=2.0)
-    ap.add_argument('--vcsel-tilt', type=float, default=0.0)
-    ap.add_argument('--vcsel-offset', type=float, default=0.0)
-    ap.add_argument('--source-type', choices=['cw', 'pulse'], default='cw')
-    ap.add_argument('--polarization', choices=['s', 'p'], default='s',
-                    help='s/TE = Ez (E aus der x-y-Ebene); p/TM = Ey (E in der '
-                         'x-y-Ebene, entlang Dicke). p nutzt einen eigenen TM-Solver.')
-    ap.add_argument('--method', choices=['full', 'sliding', 'stitch'], default='full',
-                    help='full=ganze Domaene; sliding=mitlaufendes Fenster (Puls); '
-                         'stitch=Gebiets-Zerlegung -> voller gefuellter WG (CW-Handoff)')
-    ap.add_argument('--window-w', type=float, default=350.0)
-    ap.add_argument('--slide', type=float, default=150.0)
-    ap.add_argument('--snapshots', type=int, default=12)
-    ap.add_argument('--no-frames', action='store_true')
-    ap.add_argument('--no-bead', action='store_true', help='Referenzlauf OHNE Bead (gleiche Geometrie)')
-    ap.add_argument('--t-aqueous', type=float, default=None,
-                    help='Feste Aqueous-Dicke in um (an WG angrenzend, Bead darin). '
-                         'Default T_AQ=6um. Muss >= Bead-Durchmesser sein.')
-    ap.add_argument('--t-mucin', type=float, default=None, help='Mucin-Dicke um (Default 2)')
-    ap.add_argument('--t-lipid', type=float, default=0.0,
-                    help='Lipid-Dicke um direkt unter WG (0=keine)')
-    ap.add_argument('--length', type=float, default=None,
-                    help='Propagationslaenge in um (Default 1000)')
-    ap.add_argument('--input-gap', type=float, default=0.0,
-                    help='Einkoppelabstand Laser-zu-WG in um (Luftweg + Fresnel-Eintritt)')
-    ap.add_argument('--bead-x', type=float, default=None,
-                    help='Bead-x-Position in um (Default Mitte lx/2)')
-    ap.add_argument('--wg-n', type=float, default=None, help='Freie WG-Brechzahl')
-    ap.add_argument('--bead-n', type=float, default=None, help='Freie Bead-Brechzahl')
-    ap.add_argument('--n-aqueous', type=float, default=None)
-    ap.add_argument('--n-mucin', type=float, default=None)
-    ap.add_argument('--n-cornea', type=float, default=None)
-    ap.add_argument('--n-lipid', type=float, default=None)
-    args = ap.parse_args()
-    if args.gpu and not GPU_AVAILABLE:
-        print('[Warnung] --gpu angefordert aber CuPy fehlt.')
-    res = run_beads(args.wg_material, args.bead_material, args.bead_diameter,
-                    dx_nm=args.resolution, save_frames=not args.no_frames,
-                    n_snapshots=args.snapshots, wg_thickness_um=args.wg_thickness,
-                    lambda_nm=args.lambda_nm, vcsel_waist=args.vcsel_waist,
-                    vcsel_tilt=args.vcsel_tilt, vcsel_offset=args.vcsel_offset,
-                    source_type=args.source_type, method=args.method,
-                    window_w_um=args.window_w, slide_um=args.slide,
-                    place_bead=not args.no_bead, t_aqueous_um=args.t_aqueous,
-                    t_mucin_um=args.t_mucin, t_lipid_um=args.t_lipid,
-                    input_gap_um=args.input_gap, length_um=args.length,
-                    bead_x_um=args.bead_x, wg_n=args.wg_n, bead_n=args.bead_n,
-                    n_aqueous=args.n_aqueous, n_mucin=args.n_mucin,
-                    n_cornea=args.n_cornea, n_lipid=args.n_lipid,
-                    polarization=args.polarization)
-    save_results(res)
-
-
-if __name__ == '__main__':
-    main()

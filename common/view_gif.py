@@ -1,4 +1,4 @@
-"""Interaktiver Frame-Browser fuer Sliding-FDTD-GIFs.
+r"""Interaktiver Frame-Browser fuer Sliding-FDTD-GIFs.
 
 Zeigt das GIF mit einem Slider an. Du kannst frei durch die Slides scrollen,
 einzelne Frames als PNG exportieren, oder einen Bereich als neues GIF ausschneiden.

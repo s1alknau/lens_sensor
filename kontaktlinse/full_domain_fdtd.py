@@ -18,33 +18,23 @@ VERWENDUNG:
 
 import argparse
 import os
+import sys
 import time
 import pickle
 import numpy as np
 
-# ---------- GPU/CPU Backend ----------
-try:
-    import cupy as cp
-    xp = cp
-    GPU_AVAILABLE = True
-    print('[Backend] CuPy detected - using NVIDIA GPU')
-except ImportError:
-    xp = np
-    GPU_AVAILABLE = False
-    print('[Backend] CuPy not available - fallback to NumPy (CPU)')
+# Repo-Root auf den Importpfad, damit das geteilte common/-Paket gefunden wird,
+# unabhaengig davon, aus welchem Ordner das Skript gestartet wurde.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+# Backend (GPU/CPU) und Fundamentalkonstanten aus den geteilten Modulen.
+# Hinweis: EPS0/MU0 kommen jetzt in voller Genauigkeit aus common.physics
+# (zuvor lokal auf ~8 Stellen gerundet) -> numerisch nur ~1e-8 relativ anders.
+from common.backend import xp, cp, GPU_AVAILABLE, to_np   # noqa: E402
+from common.physics import C0, EPS0, MU0                  # noqa: E402
 
-
-def to_np(arr):
-    if GPU_AVAILABLE and hasattr(arr, 'get'):
-        return arr.get()
-    return np.asarray(arr)
-
-
-# Physikalische Konstanten
-C0 = 2.99792458e8
-EPS0 = 8.854187817e-12
-MU0 = 1.25663706e-6
-LAM = 850e-9
+LAM = 850e-9   # Default-Wellenlaenge dieses Legacy-Solvers
 
 # Geometrie (kann via CLI ueberschrieben werden)
 T_LENS = 250e-6

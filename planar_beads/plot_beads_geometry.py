@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 from matplotlib.patches import Patch
 
-import demo_beads as db
+import fdtd2d_core as db
 
 IDS = {'Air': 0, 'Waveguide': 1, 'Aqueous': 2, 'Mucin': 3, 'Cornea': 4, 'Bead': 5}
 COLORS = ['#f2f2f2', '#8ec9ff', '#2aa6a0', '#ff9e2c', '#b98a5e', '#ffe14d']
