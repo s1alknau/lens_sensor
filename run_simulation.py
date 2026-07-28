@@ -299,6 +299,9 @@ def build_parser():
                     help='Bead-Durchmesser in um (nur planar; 0/--no-bead = kein Bead)')
     ap.add_argument('--bead-x', type=float, default=None,
                     help='Bead-x-Position in um (Default Mitte)')
+    ap.add_argument('--bead-y-um', type=float, default=None,
+                    help='Bead-y-Position in um (Default: aufliegend unter WG bei -d/2; '
+                         '0..t_wg = im WG-Kern -> starke Streuung)')
     ap.add_argument('--bead-material', choices=('polystyrol', 'pmma'),
                     default='polystyrol')
     ap.add_argument('--no-bead', action='store_true',
@@ -314,9 +317,9 @@ def build_parser():
                          'Mode-Konversion (M Laeufe/Fenster).')
     ap.add_argument('--meep-handoff', choices=('mode', 'field'), default='mode',
                     help='(engine meep, method stitch) mode = Mode-Kaskade (geführte '
-                         'Moden); field = VOLL-FELD (Ez+Hy per Aequivalenzprinzip, '
-                         'fluss-kalibriert + Yee-phasenkorrigiert -> traegt auch '
-                         'Strahlung, aufloesungsrobust validiert).')
+                         'Moden; robust, empfohlen); field = VOLL-FELD (Ez+Hy per '
+                         'Aequivalenzprinzip, aufloesungsrobust NUR fuer gefuehrt-'
+                         'dominierte Felder - bricht bei starker Streuung, dann mode).')
     # --- 3D-spezifisch ---
     ap.add_argument('--lz-um', type=float, default=8.0, help='Tiefe z in um (nur 3D)')
     ap.add_argument('--air', type=float, default=3.0, help='Luft ueber WG in um (nur 3D)')

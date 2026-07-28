@@ -124,6 +124,21 @@ def _profile_interp(prof_y, ys, y):
     return complex(np.interp(y, ys, prof_y.real) + 1j*np.interp(y, ys, prof_y.imag))
 
 
+def _yee_angular_filter(prof, res, kmed):
+    """Yee-Offset-Korrektur WINKELAUFGELOEST: statt einer globalen (Grundmoden-)
+    Phase bekommt jede transversale ky-Komponente ihre eigene kx-Phase
+    exp(-i*kx*dx/2) mit kx=sqrt(kmed^2-ky^2). Damit wird der halbe-Zellen-Versatz
+    zwischen E- und H-Blatt fuer ALLE Winkel korrekt korrigiert (auch Strahlung),
+    nicht nur fuer die gefuehrte Mode. Reduziert sich fuer ky~0 auf die
+    Grundmoden-Korrektur. dx = 1/res; Einheiten wie Meeps kdom (cycles/um)."""
+    prof = np.asarray(prof)
+    N = len(prof)
+    ky = np.fft.fftfreq(N, d=1.0/res)
+    kx = np.sqrt((kmed*kmed - ky*ky).astype(complex))
+    ph = np.exp(-1j*kx*(0.5/res))
+    return np.fft.ifft(np.fft.fft(prof)*ph)
+
+
 def _calibrate_C(cfg, Wx):
     """Bestimmt den Aequivalenz-Skalenfaktor C selbst: extrahiert in einem
     uniformen Fenster das Ez/Hy-Profil + Mode-Amplitude a_ref an einer Ebene,
@@ -178,11 +193,11 @@ def _calibrate_C(cfg, Wx):
     jc = int(round((y_off + ly/2)*res)); j0 = jc - len(ys)//2
     sl = slice(max(0, j0), max(0, j0)+len(ys))
     ez_p, hy_p = ezA[ix, sl].copy(), hyA[ix, sl].copy()
-    # Yee-Offset: Hy liegt in x um +dx/2 versetzt zu Ez -> die magnetische
-    # Stromquelle bekommt eine Phasenkorrektur exp(-i*beta*dx/2), damit sich E- und
-    # H-Blatt am selben effektiven Ort ueberlagern. dx = 1/res.
-    phi_h = np.exp(-1j*beta*(0.5/res))
-    # Run B: Zwei-Strom-Quelle mit KRAEFTIGER Probe A_PROBE (mit Yee-Phasenkorrektur).
+    # Yee-Offset (Hy in x um +dx/2 versetzt zu Ez) WINKELAUFGELOEST korrigieren:
+    # das ez_p-Profil (treibt die magnetische Stromquelle) durch den Winkelspektrum-
+    # Filter (kmed = f0*n_wg) -> jede ky-Komponente ihre eigene kx-Phase.
+    kmed = f0*cfg['wg_n']
+    ez_pf = _yee_angular_filter(ez_p, res, kmed)
     src_t = mp.GaussianSource(f0, fwidth=0.15*f0)
     aprobe, _, _, P_probe, _ = _win([
         mp.Source(src=src_t, component=comp, center=mp.Vector3(x_inj, y_off, 0),
@@ -190,13 +205,13 @@ def _calibrate_C(cfg, Wx):
                   amp_func=lambda p: A_PROBE*_profile_interp(hy_p, ys, p.y)),
         mp.Source(src=src_t, component=hcomp, center=mp.Vector3(x_inj, y_off, 0),
                   size=mp.Vector3(0, mode_h, 0),
-                  amp_func=lambda p: -A_PROBE*phi_h*_profile_interp(ez_p, ys, p.y))], xP)
+                  amp_func=lambda p: -A_PROBE*_profile_interp(ez_pf, ys, p.y))], xP)
     Cmag = A_PROBE*np.sqrt(abs(P_target)/max(abs(P_probe), 1e-30))
     phase = np.angle(aref) - np.angle(aprobe) if abs(aprobe) > 1e-30 else 0.0
     C = Cmag*np.exp(1j*phase)
-    print(f'[meep-stitch/fullfield] Auto-Kalibrierung |C|={Cmag:.3g} beta={beta:.2f} '
-          f'(P_target={P_target:.2e}, P_probe={P_probe:.2e})')
-    return C, beta
+    print(f'[meep-stitch/fullfield] Auto-Kalibrierung |C|={Cmag:.3g} '
+          f'kmed={kmed:.2f} (P_target={P_target:.2e}, P_probe={P_probe:.2e})')
+    return C
 
 
 def run_stitch_fullfield(cfg, window_w_um, slide_um, C=None):
@@ -206,13 +221,22 @@ def run_stitch_fullfield(cfg, window_w_um, slide_um, C=None):
     Hy, magnetisch aus Ez) VORWAERTS eingepraegt -> traegt auch Strahlung mit.
     C wird selbst kalibriert: Betrag ueber Fluss (kraeftige Probe, rauschfrei),
     Phase ueber den Mode-Koeffizienten, plus Yee-Offset-Korrektur exp(-i*beta*dx/2)
-    zwischen E- und H-Blatt. Damit AUFLOESUNGSROBUST (validiert nm=15..60, Amplitude
-    <1% erhalten). Pro Fenster werden Vorwaerts/Rueckwaerts-Mode-Koeffizient
-    ausgegeben (Richtwirkungs-Diagnose)."""
+    zwischen E- und H-Blatt. Damit AUFLOESUNGSROBUST (nm=15..60) fuer gefuehrt-
+    dominierte Felder (validiert vs Full-Domain: ~0.997 vs ~1.0).
+
+    GRENZE: Die skalare Kalibrierung C ist auf die Grundmode getunt. Ist das
+    Handoff-Feld radiation-dominiert (STARKE Streuung, z.B. Bead im WG-Kern),
+    wird die Strahlung fehl-skaliert -> unphysikalische Ergebnisse (Transmission
+    kann >1 werden, Amplitude explodiert). In dem Regime ist die Mode-Kaskade
+    (--meep-handoff mode) oder der native Stitch vorzuziehen."""
     print('  [voll-feldbasierter Handoff] Aequivalenzprinzip (Ez+Hy), '
           'fluss-selbstkalibriert + Yee-Offset-phasenkorrigiert -> '
-          'aufloesungsrobust (validiert nm=15..60). Traegt auch Strahlung im '
-          'Querschnitt (nicht nur gefuehrte Moden).')
+          'aufloesungsrobust (nm=15..60) fuer GEFUEHRT-DOMINIERTE Felder.')
+    print('  !!! WICHTIG: Die skalare Kalibrierung ist auf die Grundmode getunt. '
+          'Bei STARKER Streuung (radiation-lastiges Handoff-Feld, z.B. Bead im '
+          'WG-Kern) skaliert sie die Strahlung falsch -> UNPHYSIKALISCH (Amplitude '
+          'kann explodieren). Dann --meep-handoff mode (Multi-Mode) oder nativen '
+          'Stitch nutzen. !!!')
     comp = mp.Ez if cfg['pol'] == 's' else mp.Ey
     hcomp = mp.Hy if cfg['pol'] == 's' else mp.Hx
     parity = mp.NO_PARITY
@@ -220,10 +244,8 @@ def run_stitch_fullfield(cfg, window_w_um, slide_um, C=None):
     lx, ly, res = cfg['lx'], cfg['ly'], cfg['resolution']
     Wx = min(window_w_um, lx)
     if C is None:
-        C, beta = _calibrate_C(cfg, Wx)
-    else:
-        beta = 0.0
-    phi_h = np.exp(-1j*beta*(0.5/res))     # Yee-Offset-Phasenkorrektur (Hy)
+        C = _calibrate_C(cfg, Wx)
+    kmed = cfg['f0']*cfg['wg_n']            # fuer die winkelaufgeloeste Yee-Korrektur
     dpml = max(0.1, min(cfg['lam_nm']/1000.0, 0.4*min(Wx, ly)))
     y_off = cfg['t_wg']/2 - cfg['cy']
     mode_h = min(ly - 2*dpml, cfg['t_wg'] + 6.0)
@@ -250,11 +272,12 @@ def run_stitch_fullfield(cfg, window_w_um, slide_um, C=None):
                 eig_match_freq=True, eig_parity=parity, amplitude=1.0)]
         else:
             ez_p, hy_p = handoff
+            ez_pf = _yee_angular_filter(ez_p, res, kmed)   # winkelaufgeloeste Yee-Korr.
             def amp_e(p, hy_p=hy_p):     # elektrische Stromquelle (treibt Ez) ~ +C*Hy
                 return C*_profile_interp(hy_p, ys, p.y)
 
-            def amp_h(p, ez_p=ez_p):     # magnetische Stromquelle (treibt Hy) ~ -C*Ez
-                return -C*phi_h*_profile_interp(ez_p, ys, p.y)
+            def amp_h(p, ez_pf=ez_pf):   # magnetische Stromquelle (treibt Hy) ~ -C*Ez
+                return -C*_profile_interp(ez_pf, ys, p.y)
             src_t = mp.GaussianSource(f0, fwidth=0.15*f0)
             sources = [
                 mp.Source(src=src_t, component=comp,
@@ -311,6 +334,11 @@ def run_stitch_fullfield(cfg, window_w_um, slide_um, C=None):
     Tr = abs(afwd_last/afwd0)**2 if (afwd0 and abs(afwd0) > 1e-30) else 0.0
     print(f'[meep-stitch/fullfield Result] {cfg["label"]}: '
           f'Transmission(gefuehrt)~{Tr:.4f} ({n_win} Fenster, voll-feldbasiert)')
+    if Tr > 1.05:
+        print('  !!! WARNUNG: Transmission > 1 ist UNPHYSIKALISCH -> das Handoff-Feld '
+              'ist radiation-dominiert (starke Streuung), die skalare Kalibrierung '
+              'ueber-skaliert die Strahlung. Ergebnis NICHT belastbar. Nutze '
+              '--meep-handoff mode oder --engine native --method stitch. !!!')
     return dict(Efull=Efull, transmission=Tr, n_win=n_win, shape=(Nx_full, Ny))
 
 

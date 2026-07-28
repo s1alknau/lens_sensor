@@ -46,8 +46,9 @@ def _build_cfg(args, layers):
     bead = None
     if rs._place_bead(args):
         r = args.bead_diameter/2.0
+        by = getattr(args, 'bead_y_um', None)
         bead = dict(x=(args.bead_x if args.bead_x is not None else lx/2.0),
-                    y=-r, z=0.0, r=r,
+                    y=(by if by is not None else -r), z=0.0, r=r,
                     n=(args.bead_n if args.bead_n is not None
                        else n_at(args.bead_material, lam)))
 
