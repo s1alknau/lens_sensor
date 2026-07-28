@@ -309,9 +309,14 @@ def build_parser():
     ap.add_argument('--slide-um', type=float, default=None,
                     help='Schrittweite in um (nur --method stitch)')
     ap.add_argument('--meep-modes', type=int, default=1, metavar='M',
-                    help='(engine meep, method stitch) Anzahl gefuehrter Moden im '
-                         'Handoff. 1 = Fundamentalmode; >1 erfasst Mode-Konversion '
-                         '(M Laeufe/Fenster). Strahlung bleibt unerfasst.')
+                    help='(engine meep, method stitch, handoff mode) Anzahl gefuehrter '
+                         'Moden im Handoff. 1 = Fundamentalmode; >1 erfasst '
+                         'Mode-Konversion (M Laeufe/Fenster).')
+    ap.add_argument('--meep-handoff', choices=('mode', 'field'), default='mode',
+                    help='(engine meep, method stitch) mode = Mode-Kaskade (geführte '
+                         'Moden); field = VOLL-FELD (Ez+Hy per Aequivalenzprinzip, '
+                         'fluss-kalibriert + Yee-phasenkorrigiert -> traegt auch '
+                         'Strahlung, aufloesungsrobust validiert).')
     # --- 3D-spezifisch ---
     ap.add_argument('--lz-um', type=float, default=8.0, help='Tiefe z in um (nur 3D)')
     ap.add_argument('--air', type=float, default=3.0, help='Luft ueber WG in um (nur 3D)')

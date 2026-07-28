@@ -107,8 +107,11 @@ def main(argv=None):
             print('[dry-run] Meep-Stitch-Konfiguration aufgeloest - kein Lauf.')
             return 0
         import meep_stitch as ms
-        st = ms.run_stitch(cfg, args.window_um, args.slide_um,
-                           modes=getattr(args, 'meep_modes', 1))
+        if getattr(args, 'meep_handoff', 'mode') == 'field':
+            st = ms.run_stitch_fullfield(cfg, args.window_um, args.slide_um)
+        else:
+            st = ms.run_stitch(cfg, args.window_um, args.slide_um,
+                               modes=getattr(args, 'meep_modes', 1))
         if not args.no_save:
             Efull = st['Efull']
             nfr = max(2, args.snapshots)
