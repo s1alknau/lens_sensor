@@ -13,6 +13,7 @@ Stitch) steckt in run_simulation.py; die entsprechenden Hinweise erscheinen im L
 """
 import os
 import sys
+import glob
 import queue
 import threading
 import subprocess
@@ -100,11 +101,13 @@ class SimGUI:
     def _build(self):
         top = ttk.Frame(self.root, padding=8)
         top.pack(fill='x')
-        ttk.Label(top, text='FDTD-Simulation - alle Optionen aus run_simulation.py',
-                  font=('Segoe UI', 11, 'bold')).pack(anchor='w')
-        ttk.Label(top, text='Leeres Feld = Default. Maus ueber den Namen = Hilfe. '
-                  'Grosse Kontaktlinse laeuft nur im Stitch-Modus (Hinweis im Log).',
-                  foreground='#555').pack(anchor='w')
+        ttk.Label(top, text='FDTD-Simulation starten',
+                  font=('Segoe UI', 12, 'bold')).pack(anchor='w')
+        ttk.Label(top, text='Nach Sektionen gruppiert. Oben die wichtigsten '
+                  'Auswahlen (Engine/Geometrie/Dimension/Methode/Material). '
+                  'Leeres Feld = Default. Maus ueber den Namen = Hilfe. '
+                  'Zuerst "Konfiguration pruefen (dry-run)" zeigt die aufgeloeste Config.',
+                  foreground='#555', wraplength=820, justify='left').pack(anchor='w')
 
         # Scrollbarer Formularbereich
         mid = ttk.Frame(self.root)
@@ -121,29 +124,37 @@ class SimGUI:
         canvas.bind_all('<MouseWheel>',
                         lambda e: canvas.yview_scroll(int(-e.delta/120), 'units'))
 
+        # Formular aus den argparse-GRUPPEN: je Gruppe eine Sektion mit Ueberschrift.
         row = 0
-        for act in self.parser._actions:
-            if not act.option_strings or act.dest == 'help':
+        for grp in self.parser._action_groups:
+            acts = [a for a in grp._group_actions
+                    if a.option_strings and a.dest != 'help']
+            if not acts:
                 continue
-            name = act.option_strings[0]
-            lbl = ttk.Label(form, text=name, width=20, anchor='w')
-            lbl.grid(row=row, column=0, sticky='w', padx=(0, 6), pady=2)
-            if act.help:
-                _Tooltip(lbl, act.help)
-            if act.nargs == 0:                          # Flag -> Checkbox
-                var = tk.BooleanVar(value=bool(act.default))
-                ttk.Checkbutton(form, variable=var).grid(row=row, column=1, sticky='w')
-            elif act.choices:                           # Auswahl -> Combobox
-                var = tk.StringVar(value='' if act.default is None else str(act.default))
-                cb = ttk.Combobox(form, textvariable=var, width=28, state='readonly',
-                                  values=[str(c) for c in act.choices])
-                cb.grid(row=row, column=1, sticky='w')
-            else:                                       # Freitext -> Entry
-                var = tk.StringVar(value='' if act.default is None else str(act.default))
-                ttk.Entry(form, textvariable=var, width=30).grid(
-                    row=row, column=1, sticky='w')
-            self.vars[act.dest] = var
+            hdr = ttk.Label(form, text='  ' + (grp.title or ''),
+                            font=('Segoe UI', 10, 'bold'), foreground='#14618c')
+            hdr.grid(row=row, column=0, columnspan=2, sticky='w', pady=(12, 3))
             row += 1
+            for act in acts:
+                name = act.option_strings[0]
+                lbl = ttk.Label(form, text=name, width=20, anchor='w')
+                lbl.grid(row=row, column=0, sticky='w', padx=(16, 6), pady=1)
+                if act.help:
+                    _Tooltip(lbl, act.help)
+                if act.nargs == 0:                          # Flag -> Checkbox
+                    var = tk.BooleanVar(value=bool(act.default))
+                    ttk.Checkbutton(form, variable=var).grid(row=row, column=1, sticky='w')
+                elif act.choices:                           # Auswahl -> Combobox
+                    var = tk.StringVar(value='' if act.default is None else str(act.default))
+                    ttk.Combobox(form, textvariable=var, width=28, state='readonly',
+                                 values=[str(c) for c in act.choices]).grid(
+                                     row=row, column=1, sticky='w')
+                else:                                       # Freitext -> Entry
+                    var = tk.StringVar(value='' if act.default is None else str(act.default))
+                    ttk.Entry(form, textvariable=var, width=30).grid(
+                        row=row, column=1, sticky='w')
+                self.vars[act.dest] = var
+                row += 1
 
         # Buttons
         btns = ttk.Frame(self.root, padding=8)
@@ -156,6 +167,8 @@ class SimGUI:
         self.btn_stop = ttk.Button(btns, text='Stop', command=self.on_stop,
                                    state='disabled')
         self.btn_stop.pack(side='left')
+        ttk.Button(btns, text='Analyzer oeffnen', command=self.on_analyzer).pack(
+            side='left', padx=(16, 0))
         ttk.Button(btns, text='Log leeren', command=self._clear_log).pack(side='right')
 
         # Log
@@ -172,6 +185,23 @@ class SimGUI:
 
     def on_run(self):
         self._launch(collect_argv(self.parser, self._values()))
+
+    def on_analyzer(self):
+        """Startet den FDTD-Analyzer (eigenes Fenster). Oeffnet das NEUESTE
+        Ergebnis in results/ direkt; sonst nur den Datei-Dialog des Analyzers."""
+        analyzer = os.path.join(_REPO_ROOT, 'common', 'fdtd_analyzer.py')
+        cmd = [sys.executable, analyzer]
+        frames = sorted(glob.glob(os.path.join(_REPO_ROOT, 'results', '*_frames.npz')),
+                        key=os.path.getmtime)
+        if frames:
+            cmd.append(frames[-1])
+        try:
+            subprocess.Popen(cmd, cwd=_REPO_ROOT)   # nicht-blockierend, eigenes Fenster
+            self._append('[Analyzer gestartet'
+                         + (f': {os.path.basename(frames[-1])}' if frames
+                            else ' (Datei-Dialog)') + ']\n')
+        except Exception as e:
+            self._append(f'[FEHLER] Analyzer-Start: {e}\n')
 
     def _launch(self, argv):
         if self.proc is not None:

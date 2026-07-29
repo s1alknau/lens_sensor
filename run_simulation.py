@@ -36,6 +36,9 @@ for _sub in ("planar_beads", "planar_3d"):
     _p = os.path.join(_REPO_ROOT, _sub)
     if _p not in sys.path:
         sys.path.insert(0, _p)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from common.physics import n_at            # noqa: E402  (Brechzahl aus Material+Lambda)
 
 # WSL-Ziel fuer den Meep-Zweig (Meep laeuft nur unter Linux).
 WSL_DISTRO = "Ubuntu-24.04"
@@ -92,8 +95,9 @@ def _resolve_layers(args):
     else:
         base = dict(t_wg_um=args.wg_thickness_um, t_lip_um=0.0,
                     t_aq_um=None, t_mu_um=None, n_aq=None)
-    # WG-Brechzahl: --wg-n ueberschreibt; sonst PMMA (Linse wie planar = 1.491).
-    base['wg_n'] = args.wg_n if args.wg_n is not None else N_LENS
+    # WG-Brechzahl: --wg-n ueberschreibt; sonst aus --wg-material + Wellenlaenge.
+    base['wg_n'] = (args.wg_n if args.wg_n is not None
+                    else n_at(getattr(args, 'wg_material', 'pmma'), args.lambda_nm))
     # CLI-Overrides (nur wenn explizit gesetzt)
     if args.t_aqueous is not None: base['t_aq_um'] = args.t_aqueous
     if args.t_mucin is not None:   base['t_mu_um'] = args.t_mucin
@@ -129,7 +133,7 @@ def _place_bead(args):
 def _run_2d(args, layers):
     import fdtd2d_core as d2
     result = d2.run_beads(
-        wg_mat='pmma', bead_mat=args.bead_material,
+        wg_mat=args.wg_material, bead_mat=args.bead_material,
         bead_d_um=(args.bead_diameter if _place_bead(args) else 0.0),
         dx_nm=args.resolution_nm, save_frames=not args.no_save,
         n_snapshots=args.snapshots, wg_thickness_um=layers['t_wg_um'],
@@ -250,104 +254,116 @@ def _q(s):
 def build_parser():
     ap = argparse.ArgumentParser(
         description='Vereinheitlichter FDTD-Einstieg: Kontaktlinse | planar, in 2D | 3D.')
-    # --- Fall-Auswahl ---
-    ap.add_argument('--engine', '-e', choices=('native', 'meep'), default='native',
-                    help='native = eigener NumPy/CuPy-Solver; meep = Meep-Toolbox '
-                         '(laeuft nur unter Linux/WSL, wird auf Windows automatisch '
-                         'nach WSL ausgelagert)')
-    ap.add_argument('--geometry', '-g', default='planar',
-                    help='kontaktlinse/lens ODER planar/waveguide (Default: planar)')
-    ap.add_argument('--dim', '-d', type=int, choices=(2, 3), default=3,
-                    help='Dimension: 2 oder 3 (Default: 3)')
-    ap.add_argument('--method', '-m', choices=('full', 'sliding', 'stitch'),
-                    default='full', help='full | sliding (nur 2D) | stitch')
-    ap.add_argument('--scenario', default='Gesund', choices=list(LENS_SCENARIOS),
-                    help='Trockenauge-Szenario (nur --geometry lens)')
-    # --- Allgemein ---
-    ap.add_argument('--length-um', type=float, default=None,
-                    help='Propagationslaenge in um (Default geometrie-/dim-abhaengig)')
-    ap.add_argument('--resolution-nm', type=float, default=None,
-                    help='dx in nm (Default: 2D=20, 3D=50)')
-    ap.add_argument('--lambda-nm', type=float, default=850.0)
-    ap.add_argument('--polarization', choices=('s', 'p'), default='s')
-    ap.add_argument('--source-type', choices=('cw', 'pulse'), default='cw')
-    ap.add_argument('--snapshots', type=int, default=8)
-    ap.add_argument('--input-gap', type=float, default=0.0,
-                    help='Einkoppelabstand Laser-zu-WG in um (Luftweg + Fresnel-Eintritt)')
-    # --- Quelle (VCSEL) ---
-    ap.add_argument('--vcsel-waist', type=float, default=2.0, help='Taille (y) in um')
-    ap.add_argument('--vcsel-waist-z', type=float, default=2.0, help='Taille z in um (nur 3D)')
-    ap.add_argument('--vcsel-tilt', type=float, default=0.0, help='Strahlneigung in Grad')
-    ap.add_argument('--vcsel-offset', type=float, default=0.0,
-                    help='Spot-Versatz in y (um); in 3D = Offset y')
-    ap.add_argument('--vcsel-offset-z', type=float, default=0.0,
-                    help='Spot-Versatz in z (um, nur 3D)')
-    # --- Schichten / Brechzahlen (Overrides; Linse nutzt sonst das Szenario) ---
-    ap.add_argument('--wg-thickness-um', type=float, default=5.0,
-                    help='Waveguide-Dicke (nur planar; Linse nutzt fest 250um)')
-    ap.add_argument('--t-aqueous', type=float, default=None, help='Aqueous-Dicke um')
-    ap.add_argument('--t-mucin', type=float, default=None, help='Mucin-Dicke um')
-    ap.add_argument('--t-lipid', type=float, default=None, help='Lipid-Dicke um')
-    ap.add_argument('--wg-n', type=float, default=None, help='Freie WG-Brechzahl')
-    ap.add_argument('--bead-n', type=float, default=None, help='Freie Bead-Brechzahl')
-    ap.add_argument('--n-aqueous', type=float, default=None)
-    ap.add_argument('--n-mucin', type=float, default=None)
-    ap.add_argument('--n-cornea', type=float, default=None)
-    ap.add_argument('--n-lipid', type=float, default=None)
-    # --- Bead (nur planar) ---
-    ap.add_argument('--bead-diameter', type=float, default=0.5,
-                    help='Bead-Durchmesser in um (nur planar; 0/--no-bead = kein Bead)')
-    ap.add_argument('--bead-x', type=float, default=None,
-                    help='Bead-x-Position in um (Default Mitte)')
-    ap.add_argument('--bead-y-um', type=float, default=None,
-                    help='Bead-y-Position in um (Default: aufliegend unter WG bei -d/2; '
-                         '0..t_wg = im WG-Kern -> starke Streuung)')
-    ap.add_argument('--bead-material', choices=('polystyrol', 'pmma'),
-                    default='polystyrol')
-    ap.add_argument('--no-bead', action='store_true',
-                    help='planaren Lauf OHNE Bead (Referenz)')
-    # --- Stitch ---
-    ap.add_argument('--window-um', type=float, default=None,
-                    help='Fensterbreite in um (nur --method stitch)')
-    ap.add_argument('--slide-um', type=float, default=None,
-                    help='Schrittweite in um (nur --method stitch)')
-    ap.add_argument('--meep-modes', type=int, default=1, metavar='M',
-                    help='(engine meep, method stitch, handoff mode) Anzahl gefuehrter '
-                         'Moden im Handoff. 1 = Fundamentalmode; >1 erfasst '
-                         'Mode-Konversion (M Laeufe/Fenster).')
-    ap.add_argument('--meep-handoff', choices=('mode', 'field'), default='mode',
-                    help='(engine meep, method stitch) mode = Mode-Kaskade (geführte '
-                         'Moden; robust, empfohlen); field = VOLL-FELD (Ez+Hy per '
-                         'Aequivalenzprinzip, aufloesungsrobust NUR fuer gefuehrt-'
-                         'dominierte Felder - bricht bei starker Streuung, dann mode).')
-    # --- 3D-spezifisch ---
-    ap.add_argument('--lz-um', type=float, default=8.0, help='Tiefe z in um (nur 3D)')
-    ap.add_argument('--air', type=float, default=3.0, help='Luft ueber WG in um (nur 3D)')
-    ap.add_argument('--tear', type=float, default=8.0, help='Tear+Cornea unter WG um (nur 3D)')
-    ap.add_argument('--steps-factor', type=float, default=2.0, help='nur 3D full')
-    ap.add_argument('--wg-width', type=float, default=None,
-                    help='WG-Kernbreite in z (um) -> Rechteck-Kanal (nur 3D)')
-    ap.add_argument('--wg-clad-n', type=float, default=1.0,
-                    help='Brechzahl seitliches Cladding (nur 3D, Default Luft)')
-    ap.add_argument('--vol-dtype', choices=('float16', 'float32'), default='float32',
-                    help='Speicherformat der 3D-Volumina')
-    ap.add_argument('--pec-faces', default='',
-                    help='Komma-Liste PEC-Spiegelflaechen, z.B. "xmax" (nur 3D full)')
-    ap.add_argument('--end-facet', type=float, default=0.0,
-                    help='Luftzone am WG-Ende in um -> Fresnel (nur 3D full)')
-    ap.add_argument('--save-vector', action='store_true',
-                    help='Ex,Ey,Ez speichern (nur 3D full)')
-    ap.add_argument('--check-resources', action='store_true',
-                    help='vor dem Lauf VRAM/RAM pruefen (nur 3D full)')
-    ap.add_argument('--calibrate', type=int, default=0, metavar='N',
-                    help='nur N Steps messen + Laufzeit hochrechnen (nur 3D full)')
-    # --- Ablauf ---
-    ap.add_argument('--allow-large', action='store_true',
-                    help='(engine meep) den adaptiven Zellzahl-/RAM-Schutz umgehen '
-                         '(Risiko: OOM). Meep rechnet Full-Domain ohne Stitch.')
-    ap.add_argument('--no-save', action='store_true', help='nicht speichern')
-    ap.add_argument('--dry-run', action='store_true',
-                    help='nur die aufgeloeste Konfiguration zeigen, nicht rechnen')
+    # Argumente in benannte GRUPPEN -> dienen zugleich als Sektionen im GUI.
+    g_case = ap.add_argument_group('Fall-Auswahl')
+    g_case.add_argument('--engine', '-e', choices=('native', 'meep'), default='native',
+                        help='native = eigener NumPy/CuPy-Solver; meep = Meep-Toolbox '
+                             '(laeuft nur unter Linux/WSL, wird auf Windows automatisch '
+                             'nach WSL ausgelagert)')
+    g_case.add_argument('--geometry', '-g', default='planar',
+                        help='kontaktlinse/lens ODER planar/waveguide (Default: planar)')
+    g_case.add_argument('--dim', '-d', type=int, choices=(2, 3), default=3,
+                        help='Dimension: 2 oder 3 (Default: 3)')
+    g_case.add_argument('--method', '-m', choices=('full', 'sliding', 'stitch'),
+                        default='full', help='full | sliding (nur 2D) | stitch')
+    g_case.add_argument('--scenario', default='Gesund', choices=list(LENS_SCENARIOS),
+                        help='Trockenauge-Szenario (nur --geometry lens)')
+
+    g_basic = ap.add_argument_group('Grundeinstellungen')
+    g_basic.add_argument('--length-um', type=float, default=None,
+                         help='Propagationslaenge in um (Default geometrie-/dim-abhaengig)')
+    g_basic.add_argument('--resolution-nm', type=float, default=None,
+                         help='dx in nm (Default: 2D=20, 3D=50)')
+    g_basic.add_argument('--lambda-nm', type=float, default=850.0, help='Wellenlaenge in nm')
+    g_basic.add_argument('--polarization', choices=('s', 'p'), default='s',
+                         help='s=TE (Ez) | p=TM (Ey)')
+    g_basic.add_argument('--source-type', choices=('cw', 'pulse'), default='cw')
+    g_basic.add_argument('--snapshots', type=int, default=8, help='Anzahl gespeicherter Frames')
+    g_basic.add_argument('--input-gap', type=float, default=0.0,
+                         help='Einkoppelabstand Laser-zu-WG in um (Luftweg + Fresnel-Eintritt)')
+
+    g_mat = ap.add_argument_group('Material & Schichten')
+    g_mat.add_argument('--wg-material', choices=('pmma', 'polystyrol'), default='pmma',
+                       help='Waveguide-Material (Brechzahl aus Dispersion; --wg-n ueberschreibt)')
+    g_mat.add_argument('--wg-thickness-um', type=float, default=5.0,
+                       help='Waveguide-Dicke (nur planar; Linse nutzt fest 250um)')
+    g_mat.add_argument('--wg-n', type=float, default=None,
+                       help='Freie WG-Brechzahl (ueberschreibt --wg-material)')
+    g_mat.add_argument('--t-aqueous', type=float, default=None, help='Aqueous-Dicke um')
+    g_mat.add_argument('--t-mucin', type=float, default=None, help='Mucin-Dicke um')
+    g_mat.add_argument('--t-lipid', type=float, default=None, help='Lipid-Dicke um')
+    g_mat.add_argument('--n-aqueous', type=float, default=None, help='Freie Aqueous-Brechzahl')
+    g_mat.add_argument('--n-mucin', type=float, default=None, help='Freie Mucin-Brechzahl')
+    g_mat.add_argument('--n-cornea', type=float, default=None, help='Freie Cornea-Brechzahl')
+    g_mat.add_argument('--n-lipid', type=float, default=None, help='Freie Lipid-Brechzahl')
+
+    g_bead = ap.add_argument_group('Bead (nur planar)')
+    g_bead.add_argument('--bead-material', choices=('polystyrol', 'pmma'),
+                        default='polystyrol', help='Bead-Material (Brechzahl aus Dispersion)')
+    g_bead.add_argument('--bead-diameter', type=float, default=0.5,
+                        help='Bead-Durchmesser in um (0/--no-bead = kein Bead)')
+    g_bead.add_argument('--bead-x', type=float, default=None,
+                        help='Bead-x-Position in um (Default Mitte)')
+    g_bead.add_argument('--bead-y-um', type=float, default=None,
+                        help='Bead-y-Position in um (Default: unter WG bei -d/2; '
+                             '0..t_wg = im WG-Kern -> starke Streuung)')
+    g_bead.add_argument('--bead-n', type=float, default=None,
+                        help='Freie Bead-Brechzahl (ueberschreibt --bead-material)')
+    g_bead.add_argument('--no-bead', action='store_true',
+                        help='planaren Lauf OHNE Bead (Referenz)')
+
+    g_src = ap.add_argument_group('Quelle (VCSEL)')
+    g_src.add_argument('--vcsel-waist', type=float, default=2.0, help='Taille (y) in um')
+    g_src.add_argument('--vcsel-waist-z', type=float, default=2.0, help='Taille z in um (nur 3D)')
+    g_src.add_argument('--vcsel-tilt', type=float, default=0.0, help='Strahlneigung in Grad')
+    g_src.add_argument('--vcsel-offset', type=float, default=0.0,
+                       help='Spot-Versatz in y (um); in 3D = Offset y')
+    g_src.add_argument('--vcsel-offset-z', type=float, default=0.0,
+                       help='Spot-Versatz in z (um, nur 3D)')
+
+    g_3d = ap.add_argument_group('3D-spezifisch')
+    g_3d.add_argument('--lz-um', type=float, default=8.0, help='Domain-Tiefe z in um (nur 3D)')
+    g_3d.add_argument('--air', type=float, default=3.0, help='Luft ueber WG in um (nur 3D)')
+    g_3d.add_argument('--tear', type=float, default=8.0, help='Tear+Cornea unter WG um (nur 3D)')
+    g_3d.add_argument('--wg-width', type=float, default=None,
+                      help='WG-Kernbreite in z (um) -> Rechteck-Kanal, Fuehrung in y UND z '
+                           '(ohne Angabe: Slab, nur y-Fuehrung; nur 3D)')
+    g_3d.add_argument('--wg-clad-n', type=float, default=1.0,
+                      help='Brechzahl seitliches Cladding (nur 3D, Default Luft)')
+    g_3d.add_argument('--steps-factor', type=float, default=2.0, help='nur 3D full')
+    g_3d.add_argument('--vol-dtype', choices=('float16', 'float32'), default='float32',
+                      help='Speicherformat der 3D-Volumina')
+    g_3d.add_argument('--pec-faces', default='',
+                      help='Komma-Liste PEC-Spiegelflaechen, z.B. "xmax" (nur 3D full)')
+    g_3d.add_argument('--end-facet', type=float, default=0.0,
+                      help='Luftzone am WG-Ende in um -> Fresnel (nur 3D full)')
+    g_3d.add_argument('--save-vector', action='store_true',
+                      help='Ex,Ey,Ez speichern (nur 3D full)')
+    g_3d.add_argument('--check-resources', action='store_true',
+                      help='vor dem Lauf VRAM/RAM pruefen (nur 3D full)')
+    g_3d.add_argument('--calibrate', type=int, default=0, metavar='N',
+                      help='nur N Steps messen + Laufzeit hochrechnen (nur 3D full)')
+
+    g_stitch = ap.add_argument_group('Stitch / Meep')
+    g_stitch.add_argument('--window-um', type=float, default=None,
+                          help='Fensterbreite in um (nur --method stitch)')
+    g_stitch.add_argument('--slide-um', type=float, default=None,
+                          help='Schrittweite in um (nur --method stitch)')
+    g_stitch.add_argument('--meep-modes', type=int, default=1, metavar='M',
+                          help='(engine meep, stitch, handoff mode) Anzahl gefuehrter Moden '
+                               'im Handoff. 1=Fundamentalmode; >1 erfasst Mode-Konversion.')
+    g_stitch.add_argument('--meep-handoff', choices=('mode', 'field'), default='mode',
+                          help='(engine meep, stitch) mode = Mode-Kaskade (robust, empfohlen); '
+                               'field = VOLL-FELD (nur gefuehrt-dominiert; bricht bei starker '
+                               'Streuung).')
+
+    g_run = ap.add_argument_group('Ablauf')
+    g_run.add_argument('--allow-large', action='store_true',
+                       help='(engine meep) den adaptiven Zellzahl-/RAM-Schutz umgehen '
+                            '(Risiko: OOM).')
+    g_run.add_argument('--no-save', action='store_true', help='nicht speichern')
+    g_run.add_argument('--dry-run', action='store_true',
+                       help='nur die aufgeloeste Konfiguration zeigen, nicht rechnen')
     return ap
 
 
