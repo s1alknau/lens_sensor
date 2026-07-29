@@ -147,6 +147,55 @@ def slab_measure_native(n_core_mat='pmma', d_um=5.0, lam_nm=850.0, pol='s',
 
 
 # ----------------------------------------------------------------------------
+# 2b) NATIV 3D: derselbe Slab im vollen vektoriellen 3D-Solver (z-invariant).
+#     Muss dieselbe Slab-Mode/n_eff wie 2D + analytisch liefern.
+# ----------------------------------------------------------------------------
+def slab_neff_native_3d(d_um=5.0, lam_nm=850.0, pol='s', length_um=30.0,
+                        lz_um=4.0, dx_nm=50.0, wg_width_um=None):
+    """Nativer 3D-FDTD (uniformer Slab bzw. Kanal wenn wg_width_um), n_eff aus der
+    CW-Feldphase entlang x (bei Kern-y, z-Mitte)."""
+    import os
+    import sys
+    import tempfile
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for p in (os.path.join(_root, 'planar_3d'), _root):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    import fdtd3d_core as f3d
+    from common.physics import n_at
+    tear = 8.0
+    prev = os.getcwd()
+    tmp = tempfile.mkdtemp()
+    try:
+        os.chdir(tmp)
+        r = f3d.run_3d(
+            label='slab3d', wg_n=n_at('pmma', lam_nm), t_wg_um=d_um,
+            air_um=3.0, tear_um=tear, lz_um=lz_um, t_aq_um=tear, t_mu_um=2.0,
+            n_aq=n_at('aqueous', lam_nm), n_mu=n_at('mucin', lam_nm),
+            n_co=n_at('cornea', lam_nm), lam_nm=lam_nm, lx_um=length_um,
+            dx_nm=dx_nm, n_snapshots=8, source_type='cw', polarization=pol,
+            wg_width_um=wg_width_um, bead=None)
+        cw = r.get('cw_vol')
+        cw = np.asarray(cw) if cw is not None else None
+    finally:
+        os.chdir(prev)
+    if cw is None or cw.shape[0] < 2:
+        return float('nan')
+    nfr = cw.shape[0]
+    ez = cw[0].astype(np.float64) - 1j*cw[nfr//4 or 1].astype(np.float64)  # (Nx,Nj,Nk)
+    dx_um = dx_nm/1000.0
+    iy = int(round((d_um/2 + tear)/dx_um))               # y0 = -tear
+    iy = min(max(iy, 0), ez.shape[1]-1)
+    iz = ez.shape[2]//2
+    line = ez[:, iy, iz]
+    i0, i1 = int(0.35*len(line)), int(0.85*len(line))
+    ph = np.unwrap(np.angle(line[i0:i1]))
+    x = np.arange(len(ph))*dx_um
+    beta = abs(np.polyfit(x, ph, 1)[0])
+    return beta/(2*np.pi/(lam_nm*1e-3))
+
+
+# ----------------------------------------------------------------------------
 # 3) MEEP: Eigenmode-Solver (MPB). Laeuft nur unter Linux/WSL.
 # ----------------------------------------------------------------------------
 def slab_neff_meep(n_core=1.491, n_top=1.0, n_bot=1.336, d_um=5.0, lam_nm=850.0,
@@ -185,6 +234,22 @@ if __name__ == '__main__':
         na = slab_neff_analytic(1.491, 1.0, 1.336, d_um, lam_nm, pol)
         print(f'MEEPRESULT d={d_um} L={lam_nm:.0f} {pol}: meep={nm:.4f} '
               f'analytisch={na:.4f} Delta={nm-na:+.4f}')
+        sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == '3d':
+        # 3D-Slab-Check: analytisch vs nativ-2D vs nativ-3D (gleiches dx).
+        dx = float(sys.argv[2]) if len(sys.argv) > 2 else 50.0
+        print(f'3D-Slab-Check (dx={dx:g}nm)  '
+              f'[nativ3D ~ nativ2D = 3D-Solver konsistent zum Slab]')
+        print(f'{"Fall":<20}{"analyt":>9}{"nat2D":>9}{"nat3D":>9}{"3D-2D":>8}')
+        for c in (dict(d_um=5.0, lam_nm=850.0, pol='s'),
+                  dict(d_um=5.0, lam_nm=850.0, pol='p')):
+            na = slab_neff_analytic(1.491, 1.0, 1.336, c['d_um'], c['lam_nm'], c['pol'])
+            n2, _ = slab_measure_native(d_um=c['d_um'], lam_nm=c['lam_nm'],
+                                        pol=c['pol'], length_um=30.0, dx_nm=dx)
+            n3 = slab_neff_native_3d(d_um=c['d_um'], lam_nm=c['lam_nm'],
+                                     pol=c['pol'], length_um=30.0, dx_nm=dx)
+            tag = f"d={c['d_um']} L={c['lam_nm']:.0f} {c['pol']}"
+            print(f'{tag:<20}{na:>9.4f}{n2:>9.4f}{n3:>9.4f}{n3-n2:>+8.4f}')
         sys.exit(0)
     # PMMA-Kern / Luft oben / Aqueous unten
     N_CORE, N_TOP, N_BOT = 1.491, 1.000, 1.336
