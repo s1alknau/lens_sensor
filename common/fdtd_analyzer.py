@@ -178,11 +178,14 @@ class Analyzer:
         else:
             self.x_um = -5000.0
         self.mode = 'Field 2D'
-        # Evanescent-Fit User-Range (in um, relativ zu PS-Bot)
-        # fit_top = -0.05 (50 nm Abstand zur Material-Grenze)
-        # fit_depth = 1.5 (1.5 um Fit-Tiefe)
-        self.fit_top = -0.05
-        self.fit_depth = 1.5
+        # Evanescent-Fit-Fenster (fit_top/fit_depth, in um rel. WG-Unterkante) wird
+        # in load() -> _set_evan_defaults() delta-abhaengig gesetzt (Tiefe ~3*delta_min,
+        # Start ~1-2 Zellen unter der Grenzflaeche). Fallback, falls load() es nicht
+        # gesetzt hat:
+        if not hasattr(self, 'fit_top'):
+            self.fit_top = -0.05
+        if not hasattr(self, 'fit_depth'):
+            self.fit_depth = 1.5
         self.polys = get_detector_polygons()
         self.build_ui()
         # Debounce-Timer: Slider-Events triggern keinen sofortigen Redraw,
@@ -303,6 +306,7 @@ class Analyzer:
             self._build_views_2d(_Ez, self.meta, _ez_cw, _meta_cw, _cwonly, _hastr, _hascw, _vprim)
             self.frame_amps = compute_frame_amps(self.ezs)
         self.path_label = os.path.basename(path)
+        self._set_evan_defaults()      # delta-abhaengiges Fit-Fenster fuer Evanescent
         _kind = '3D-Volumen' if self.is3d else '2D-Frames'
         print(f'{len(self.ezs)} Frames {self.ezs.shape[1]}x{self.ezs.shape[2]} '
               f'[{_kind}] - berechne Statistiken ...', flush=True)
@@ -1114,6 +1118,58 @@ class Analyzer:
         """WG-Kerndicke in um (3D: aus Datei; 2D-Planar: PS_TOP-PS_BOT)."""
         return getattr(self, 't_wg_um', 0.0) or getattr(self, 'wg_top_um', PS_TOP - PS_BOT)
 
+    def _delta_min(self):
+        """Theoretische MINIMALE evaneszente Eindringtiefe delta_min (um) =
+        lam/(2 pi sqrt(n_core^2 - n_clad^2)) (grazing incidence)."""
+        try:
+            n_hi = float(self.mat_indices[0])
+            n_lo = float(self.mat_indices[2])
+            lam_um = float(self.lam_nm)/1000.0
+            return lam_um/(2*np.pi*max((n_hi**2 - n_lo**2)**0.5, 1e-6))
+        except Exception:
+            return 0.2
+
+    def _set_evan_defaults(self):
+        """Fit-Fenster fuer den Evanescent-Modus an die tatsaechliche Physik
+        koppeln: Tiefe ~3*delta_min (statt fixer 1.5 um, die bei delta~0.2 um fast
+        nur Rauschen fittet), Start ~1-2 Zellen UNTER der Grenzflaeche (weg vom
+        Interface-Sprung, wichtig fuer TM/Ey)."""
+        dmin = self._delta_min()
+        self._delta_min_um = dmin
+        dx = 0.02
+        try:
+            if not getattr(self, 'is3d', False) and self.ezs.ndim == 3:
+                y0, y1 = float(self.meta[0, 2]), float(self.meta[0, 3])
+                dx = abs(y1 - y0)/max(self.ezs.shape[2], 1)
+        except Exception:
+            pass
+        self.fit_depth = round(min(5.0, max(0.3, 3.0*dmin)), 2)
+        self.fit_top = -round(min(4.9, max(0.05, 1.5*dx)), 3)
+        for attr, val in (('s_fit_depth', self.fit_depth), ('s_fit_top', self.fit_top)):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    w.set_val(val)
+                except Exception:
+                    pass
+
+    def _cw_phase_stack(self):
+        """Eingeschwungener Phasen-Satz (nph, Nx, Nv) EINES x-Fensters + dessen
+        meta-Zeile, oder None. Nur wenn ein CW-Satz existiert und alle Frames
+        dasselbe x-Fenster teilen (voller Lauf) - dann ist die zeitgemittelte
+        Amplitude/Intensitaet knotenfrei und robust. Bei Stitch (unterschiedliche
+        Fenster) -> None (Aufrufer faellt auf Momentaufnahme zurueck)."""
+        v = getattr(self, '_views', {}).get('Eingeschwungen') if hasattr(self, '_views') else None
+        if not v or v[0] != '2d':
+            return None
+        arr = np.asarray(v[1])
+        meta = np.asarray(v[2])
+        if arr.ndim != 3 or arr.shape[0] < 2 or meta.shape[0] < 1:
+            return None
+        if not np.allclose(meta[:, :4], meta[0, :4]):
+            return None
+        return arr, meta[0]
+
     def _v_index(self, val, v0, v1, Nv):
         """Index auf der VERTIKALEN Anzeigeachse (y bzw. z) fuer Wert val."""
         if v1 == v0:
@@ -1220,15 +1276,35 @@ class Analyzer:
             t.set_color('#dddddd')
 
     def _draw_sensor(self):
-        """Sensor-Metrik aus den Steady-State-Frames: gefuehrte Leistung im Kern,
-        ausgekoppelte Leistung in den Tear-Film, K=P_tear/P_guided (Sensor-Signal)
-        und Transmission. Nur xy-Ebene / 2D (braucht y-Schichtstapel)."""
-        N = min(6, len(self.ezs))
-        fr = self.ezs[-N:].astype(np.float64)          # (N, Nx, Nv)
+        """Sensor-Metrik: zeitgemittelte Intensitaet <E^2> in Kern / Tear-Film /
+        Luft an einem Detektorfenster nahe dem Ausgang. K = I_tear/I_guided ist der
+        evaneszente Ueberlapp (= Sensor-Signal). Zusaetzlich, falls die komplexe
+        CW-Amplitude vorliegt, der gerichtete Poynting-Fluss Sx ~ Im(Ê dÊ*/dx) als
+        ECHTE gefuehrte Leistung (-> Poynting-Transmission). Bevorzugt den
+        eingeschwungenen Phasensatz (knotenfrei); sonst die letzten Transient-Frames."""
         x0, x1, y0, y1 = self.meta[0, :4]
-        _, Nx, Nv = fr.shape
         t_wg = self._t_wg_eff()
-        tear_depth = 2.0
+        # Tear-Band aus dem Schichtstapel (Aqueous unter dem Kern), nicht hartkodiert.
+        try:
+            t_aq_um = float(self.layers[1])*1e6
+        except Exception:
+            t_aq_um = 2.0
+        tear_depth = max(0.5, min(t_aq_um, 8.0))
+
+        # Datenquelle: eingeschwungener Phasensatz (zeitgemittelt) bevorzugt.
+        ps = self._cw_phase_stack()
+        Ehat = None
+        if ps is not None and np.allclose(ps[1][:4], self.meta[0, :4]):
+            arr = ps[0].astype(np.float64)              # (nph, Nx, Nv), eine Periode
+            intens = np.mean(arr**2, axis=0)            # <E^2> zeitgemittelt
+            q = arr.shape[0]//4 or 1
+            Ehat = arr[0] - 1j*arr[q]                   # komplexe Amplitude
+            src = f'CW-Amplitude ({arr.shape[0]} Phasen, zeitgemittelt)'
+        else:
+            N = min(6, len(self.ezs))
+            intens = np.mean(self.ezs[-N:].astype(np.float64)**2, axis=0)
+            src = f'{N} Transient-Frames (kein CW-Satz vorhanden)'
+        Nx, Nv = intens.shape
 
         def xr(frac):
             c = x0 + frac*(x1 - x0)
@@ -1244,54 +1320,64 @@ class Analyzer:
         iy_air_hi = min(Nv, self._v_index(y1, y0, y1, Nv))
         iy_tear_lo = max(0, self._v_index(-tear_depth, y0, y1, Nv))
 
-        def P(box, lo, hi):
-            if hi <= lo:
+        def bandI(field, cl, ch, ylo, yhi):
+            if yhi <= ylo or ch <= cl:
                 return 0.0
-            b = box[:, :, lo:hi]
-            return float(np.mean(np.sum(b*b, axis=(1, 2))))
+            return float(np.mean(np.sum(field[cl:ch, ylo:yhi], axis=1)))
 
-        det = fr[:, dl:dh, :]
-        inp = fr[:, il:ih, :]
-        P_guid = P(det, iy_wg_lo, iy_wg_hi)
-        P_guid_in = P(inp, iy_wg_lo, iy_wg_hi)
-        P_tear = P(det, iy_tear_lo, iy_wg_lo)
-        P_air = P(det, iy_wg_hi, iy_air_hi)
+        P_guid = bandI(intens, dl, dh, iy_wg_lo, iy_wg_hi)
+        P_guid_in = bandI(intens, il, ih, iy_wg_lo, iy_wg_hi)
+        P_tear = bandI(intens, dl, dh, iy_tear_lo, iy_wg_lo)
+        P_air = bandI(intens, dl, dh, iy_wg_hi, iy_air_hi)
         K = P_tear/P_guid if P_guid > 0 else 0.0
         atten = P_guid/P_guid_in if P_guid_in > 0 else 0.0
+
+        # Gerichteter Poynting-Fluss (Konstante egal fuer das Verhaeltnis).
+        trans_S = float('nan')
+        if Ehat is not None:
+            Sx = np.imag(Ehat*np.conj(np.gradient(Ehat, axis=0)))
+            S_det = bandI(Sx, dl, dh, iy_wg_lo, iy_wg_hi)
+            S_in = bandI(Sx, il, ih, iy_wg_lo, iy_wg_hi)
+            trans_S = S_det/S_in if abs(S_in) > 1e-30 else float('nan')
+
         xd = x0 + 0.8*(x1 - x0)
         xin = x0 + 0.2*(x1 - x0)
 
         self.ax.axis('off')
         lines = [
             f'SENSOR-METRIK   {self.scenario}',
+            f'Quelle: {src}',
             '',
-            f'Detektor-Fenster x = {xd:6.2f} um     Eingang x = {xin:6.2f} um   (je 10% Laenge)',
-            f'Kern y = 0..{t_wg:g} um    Tear y = -{tear_depth:g}..0 um    Luft y = {t_wg:g}..{y1:.1f} um',
+            f'Detektor x = {xd:6.2f} um     Eingang x = {xin:6.2f} um   (je 10% Laenge)',
+            f'Kern y = 0..{t_wg:g} um   Tear y = -{tear_depth:g}..0 um (Aqueous)   '
+            f'Luft y = {t_wg:g}..{y1:.1f} um',
             '',
-            f'P_guided (Kern,  Detektor) :  {P_guid:.3e}',
-            f'P_tear   (Tear,  Detektor) :  {P_tear:.3e}',
-            f'P_air    (Luft,  Detektor) :  {P_air:.3e}',
+            f'I_guided (Kern,  Detektor) :  {P_guid:.3e}',
+            f'I_tear   (Tear,  Detektor) :  {P_tear:.3e}',
+            f'I_air    (Luft,  Detektor) :  {P_air:.3e}',
             '',
-            f'K = P_tear / P_guided      :  {K:.4e}    (Auskoppel-Verhaeltnis = Sensor-Signal)',
-            f'Transmission (Det/Eingang) :  {atten:.3f}',
+            f'K = I_tear / I_guided      :  {K:.4e}   (evaneszenter Ueberlapp = Sensor-Signal)',
+            f'Transmission (Intensitaet) :  {atten:.3f}   (I_Det / I_Eingang, Kern)',
         ]
-        self.ax.text(0.03, 0.97, '\n'.join(lines), color='#e6e6e6', fontsize=11,
+        if np.isfinite(trans_S):
+            lines.append(f'Transmission (Poynting Sx) :  {trans_S:.3f}   '
+                         f'(echte gerichtete Leistung)')
+        self.ax.text(0.03, 0.97, '\n'.join(lines), color='#e6e6e6', fontsize=10.5,
                      family='monospace', va='top', ha='left',
                      transform=self.ax.transAxes)
-        # kleine Balken (auf max normiert) fuer die drei Leistungen
+        # kleine Balken (auf max normiert) fuer die drei Intensitaeten
         mx = max(P_guid, P_tear, P_air, 1e-30)
         for i, (v, l, c) in enumerate([(P_guid, 'Kern', '#FFD75E'),
                                        (P_tear, 'Tear', '#56C4FF'),
                                        (P_air, 'Luft', '#999999')]):
-            yb = 0.30 - i*0.08
+            yb = 0.28 - i*0.08
             w = 0.55*(v/mx)
             self.ax.add_patch(Rectangle((0.03, yb), w, 0.05, transform=self.ax.transAxes,
                                         facecolor=c, edgecolor='none'))
             self.ax.text(0.03 + w + 0.01, yb + 0.025, l, color='#bbbbbb',
                          fontsize=8, va='center', transform=self.ax.transAxes)
         _pl = f'  (Ebene {self.plane})' if getattr(self, 'is3d', False) else ''
-        self.ax.set_title(f'Sensor-Auswertung (letzte {N} Frames){_pl}',
-                          color='#ffffff', fontsize=10)
+        self.ax.set_title(f'Sensor-Auswertung{_pl}', color='#ffffff', fontsize=10)
 
     def _layer_lines(self, ax, x_start, x_end, y_start):
         t_lip = self.layers[0]*1e6
@@ -1754,35 +1840,41 @@ class Analyzer:
                 return
             sag = R_BEND - np.sqrt(R_BEND**2 - (self.x_um*1e-6)**2)
             y_lens_bot_um = (-sag - T_LENS/2)*1e6
-        best_i = -1
-        best_amp = 0.0
-        for i in range(len(self.ezs)):
-            xs0, xe0, ys0, ye0 = self.meta[i, :4]
-            if not (xs0 <= self.x_um <= xe0):
-                continue
-            if not (ys0 < y_lens_bot_um < ye0):
-                continue
-            Nx, Ny = self.ezs[i].shape
-            ix = int(round((self.x_um - xs0)/(xe0 - xs0)*Nx))
-            iy = int(round((y_lens_bot_um - ys0)/(ye0 - ys0)*Ny))
-            if 0 <= iy < Ny:
-                amp = abs(float(self.ezs[i, ix, iy]))
-                if amp > best_amp:
-                    best_amp = amp
-                    best_i = i
-        if best_i < 0:
+        # Anzuzeigendes Frame folgt dem FRAME-SLIDER; faellt auf ein x-abdeckendes
+        # Frame zurueck, falls das aktuelle Frame x / die WG-Unterkante nicht enthaelt
+        # (fuer Stitch-Daten, wo Frames unterschiedliche x-Fenster abdecken).
+        covering = [k for k in range(len(self.ezs))
+                    if self.meta[k, 0] <= self.x_um <= self.meta[k, 1]
+                    and self.meta[k, 2] < y_lens_bot_um < self.meta[k, 3]]
+        if not covering:
             self.ax.text(0.5, 0.5,
-                         f'Kein Frame mit x={self.x_um:.0f} und Lens-Bot im Bereich',
+                         f'Kein Frame mit x={self.x_um:.0f} und WG-Unterkante im Bereich',
                          color='#FFAA55', ha='center', va='center',
                          transform=self.ax.transAxes)
             return
-        i = best_i
+        i = (self.frame_idx if self.frame_idx in covering
+             else min(covering, key=lambda k: abs(k - self.frame_idx)))
         x_start, x_end, y_start, y_end = self.meta[i, :4]
         Nx, Ny = self.ezs[i].shape
         ix = int(round((self.x_um - x_start)/(x_end - x_start)*Nx))
+        ix = min(max(ix, 0), Nx - 1)
         y_um = np.linspace(y_start, y_end, Ny)
-        abs_ez = np.abs(self.ezs[i, ix, :])
+        abs_ez = np.abs(self.ezs[i, ix, :].astype(np.float64))   # Momentaufnahme (folgt Slider)
         max_amp = float(abs_ez.max())
+
+        # Robuste Fit-Groesse: knotenfreie CW-Amplituden-Einhuellende |Ê| aus dem
+        # eingeschwungenen Phasensatz desselben x-Fensters (|Ê| = sqrt(2<E^2>)),
+        # sonst die vom Slider gewaehlte Momentaufnahme.
+        fit_amp = abs_ez
+        self._evan_fit_src = f'Momentaufnahme (Frame {i+1})'
+        _ps = self._cw_phase_stack()
+        if _ps is not None:
+            _arr, _m0 = _ps
+            if _arr.shape[1] == Nx and np.allclose(_m0[:4], self.meta[i, :4]):
+                _env = np.sqrt(2.0*np.mean(_arr[:, ix, :].astype(np.float64)**2, axis=0))
+                if float(_env.max()) > 0:
+                    fit_amp = _env
+                    self._evan_fit_src = 'CW-Amplitude (knotenfrei)'
 
         # Auto-Zoom auf Lens/WG + Tear-Region
         y_aq_bot_z = y_lens_bot_um - self.layers[0]*1e6 - self.layers[1]*1e6
@@ -1861,9 +1953,9 @@ class Analyzer:
         # Theoretische min Decay (grazing incidence)
         d_min_um = lam_um / (2*np.pi*np.sqrt(max(n_high**2 - n_low**2, 1e-10)))
 
-        if mask.sum() >= 5 and abs_ez[mask].max() > max_amp*1e-5:
+        if mask.sum() >= 5 and fit_amp[mask].max() > fit_amp.max()*1e-5:
             y_fit = y_lens_bot_um - y_um[mask]   # Distanz unter PS-Bot
-            log_a = np.log(np.maximum(abs_ez[mask], 1e-30))
+            log_a = np.log(np.maximum(fit_amp[mask], 1e-30))
             sort_idx = np.argsort(y_fit)
             y_fit_s = y_fit[sort_idx]
             log_a_s = log_a[sort_idx]
@@ -1906,7 +1998,8 @@ class Analyzer:
                                  'r-', lw=2.0, alpha=0.95,
                                  label=(f'Eindringtiefe δ = {decay_label}\n'
                                         f'(theor. Minimum δ_min = {d_min_um:.3f} um)\n'
-                                        f'R²={r2:.3f}  Einfallswinkel θ = {angle_label}'))
+                                        f'R²={r2:.3f}   θ ≈ {angle_label} [Strahlmodell]\n'
+                                        f'Fit: {self._evan_fit_src}'))
                 # Fit-Bereich markieren
                 self.ax.axvspan(y_lens_bot_um - y_fit_s.max(),
                                 y_lens_bot_um - y_fit_s.min(),
