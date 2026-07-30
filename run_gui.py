@@ -158,6 +158,8 @@ class SimGUI:
         self.root = root
         self.parser = rs.build_parser()
         self.vars = {}          # dest -> tk Variable
+        self.widgets = {}       # dest -> Eingabe-Widget (fuer Enable/Disable)
+        self.labels = {}        # dest -> Label-Widget
         self.placeholders = {}  # dest -> Platzhaltertext (fuer None-Defaults)
         self.proc = None
         self.q = queue.Queue()
@@ -209,7 +211,32 @@ class SimGUI:
             for row, act in enumerate(acts):
                 self._add_field(sec, row, act)
 
+        # Bedingte Sichtbarkeit: Szenario nur bei Geometrie == lens aktiv.
+        if 'geometry' in self.vars and 'scenario' in self.widgets:
+            self.vars['geometry'].trace_add('write', self._apply_conditional)
+            self._apply_conditional()
+
         self._build_buttons_and_log()
+
+    def _resolved_geometry(self):
+        """Aufgeloeste Geometrie ('lens'/'planar') aus dem Freitext, oder None."""
+        key = str(self.vars['geometry'].get()).strip().lower()
+        return rs._GEOM_ALIASES.get(key)
+
+    def _apply_conditional(self, *_):
+        """Felder je nach Geometrie aktivieren/ausgrauen."""
+        self._set_enabled('scenario', self._resolved_geometry() == 'lens')
+
+    def _set_enabled(self, dest, on):
+        w = self.widgets.get(dest)
+        lbl = self.labels.get(dest)
+        if w is not None:
+            if isinstance(w, ttk.Combobox):
+                w.configure(state='readonly' if on else 'disabled')
+            else:
+                w.configure(state='normal' if on else 'disabled')
+        if lbl is not None:
+            lbl.configure(foreground='#333333' if on else '#a0a0a0')
 
     def _add_field(self, parent, row, act):
         """Eine Zeile: Klartext-Label (Tooltip: Flag+Hilfe) + passendes Widget."""
@@ -220,23 +247,27 @@ class SimGUI:
         _Tooltip(lbl, tip)
         if act.nargs == 0:                              # Flag -> Checkbox
             var = tk.BooleanVar(value=bool(act.default))
-            ttk.Checkbutton(parent, variable=var).grid(row=row, column=1, sticky='w')
+            w = ttk.Checkbutton(parent, variable=var)
+            w.grid(row=row, column=1, sticky='w')
         elif act.choices:                               # Auswahl -> Combobox
             var = tk.StringVar(value='' if act.default is None else str(act.default))
-            ttk.Combobox(parent, textvariable=var, state='readonly',
-                         values=[str(c) for c in act.choices]).grid(
-                             row=row, column=1, sticky='ew')
+            w = ttk.Combobox(parent, textvariable=var, state='readonly',
+                             values=[str(c) for c in act.choices])
+            w.grid(row=row, column=1, sticky='ew')
         elif act.default is None:                       # Freitext ohne festen Default
             ph = _auto_hint(act.dest)
             var = tk.StringVar(value=ph)
-            ent = ttk.Entry(parent, textvariable=var, foreground='grey')
-            ent.grid(row=row, column=1, sticky='ew')
+            w = ttk.Entry(parent, textvariable=var, foreground='grey')
+            w.grid(row=row, column=1, sticky='ew')
             self.placeholders[act.dest] = ph
-            self._bind_placeholder(ent, var, ph)
+            self._bind_placeholder(w, var, ph)
         else:                                           # Freitext mit Default
             var = tk.StringVar(value=str(act.default))
-            ttk.Entry(parent, textvariable=var).grid(row=row, column=1, sticky='ew')
+            w = ttk.Entry(parent, textvariable=var)
+            w.grid(row=row, column=1, sticky='ew')
         self.vars[act.dest] = var
+        self.widgets[act.dest] = w
+        self.labels[act.dest] = lbl
 
     def _init_style(self):
         style = ttk.Style()
@@ -292,9 +323,16 @@ class SimGUI:
 
     # ---- Aktionen ----
     def _values(self):
-        # Platzhaltertext == "nichts eingegeben" -> leer (Default gilt).
-        return {dest: ('' if v.get() == self.placeholders.get(dest) else v.get())
-                for dest, v in self.vars.items()}
+        out = {}
+        for dest, v in self.vars.items():
+            w = self.widgets.get(dest)
+            if w is not None and str(w.cget('state')) == 'disabled':
+                out[dest] = ''          # ausgegrautes Feld -> Default gilt, nicht senden
+                continue
+            val = v.get()
+            # Platzhaltertext == "nichts eingegeben" -> leer (Default gilt).
+            out[dest] = '' if val == self.placeholders.get(dest) else val
+        return out
 
     def on_dry_run(self):
         self._launch(collect_argv(self.parser, self._values(), force_dry_run=True))
