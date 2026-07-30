@@ -300,12 +300,16 @@ class SimGUI:
         yT, yB = 20, H - 12
         if geom == 'lens':
             self._sketch_lens(c, xL, xR, yT, yB)
+            # Propagation: vom Rand (VCSEL rechts) zum Apex -> nach links.
+            c.create_line(xL + 44, 10, xL, 10, fill='#14618c', width=2, arrow='last')
+            c.create_text(xL + 48, 10, anchor='w',
+                          text='x: Rand -> Apex (Propagation +x -> -x)',
+                          fill='#14618c', font=('Segoe UI', 7))
         else:
             self._sketch_planar(c, xL, xR, yT, yB)
-        # Propagationsrichtung
-        c.create_line(xL, 10, xL + 44, 10, fill='#14618c', width=2, arrow='last')
-        c.create_text(xL + 48, 10, anchor='w', text='x (Ausbreitung)',
-                      fill='#14618c', font=('Segoe UI', 7))
+            c.create_line(xL, 10, xL + 44, 10, fill='#14618c', width=2, arrow='last')
+            c.create_text(xL + 48, 10, anchor='w', text='x (Ausbreitung)',
+                          fill='#14618c', font=('Segoe UI', 7))
         # 3D-Badge
         if dim == 3:
             lz = self._sketch_val('lz_um', 8.0)
@@ -382,46 +386,78 @@ class SimGUI:
                               font=('Segoe UI', 6))
 
     def _sketch_lens(self, c, xL, xR, yT, yB):
+        """Kontaktlinse = gekruemmter Schalen-Waveguide KONSTANTER Dicke (250 um)
+        entlang der Augenkruemmung (R~8.3 mm); Traenenfilm zwischen Linse und Cornea.
+        Kruemmung ist fuer die Skizze uebertrieben (der reale Sim-Ausschnitt ist fast
+        flach)."""
         Ht = yB - yT
-        base = yB - 0.34*Ht          # Unterkante Linse / Oberkante Traenenfilm
-        # untere Schichten
-        for name, col, y0, y1 in (('Traenenfilm', '#bfe3ff', base, yB - 0.18*Ht),
-                                  ('Cornea', '#f8c9c9', yB - 0.18*Ht, yB)):
-            c.create_rectangle(xL, y0, xR, y1, fill=col, outline='#cfd8e0')
-            c.create_text(xR + 6, (y0 + y1)/2, anchor='w', text=name, fill='#444',
-                          font=('Segoe UI', 7))
-        # plan-konvexer Linsenkoerper
-        top = yT + 0.14*Ht
-        n = 48
-        pts = []
-        for k in range(n + 1):
-            t = k/n
+        n = 56
+        cur = 0.24*Ht                       # uebertriebene Woelbung (Dome nach oben)
+        # Kanten-Basislinien (an den Raendern; Mitte woelbt sich um 'cur' nach oben)
+        e_lens_top = yT + 0.30*Ht
+        e_lens_bot = yT + 0.52*Ht           # -> Linsendicke konstant ~250 um
+        e_tear_bot = yT + 0.63*Ht
+        e_cornea_bot = yB
+
+        def surf(edge):
+            return [(xL + (xR - xL)*k/n, edge - cur*(1 - (2*(k/n) - 1)**2))
+                    for k in range(n + 1)]
+
+        def band(et, eb, fill, name):
+            poly = surf(et) + surf(eb)[::-1]
+            c.create_polygon(*[v for xy in poly for v in xy], fill=fill,
+                             outline='#cfd8e0', smooth=True)
+            if name:
+                c.create_text(xL + 6, (et + eb)/2, anchor='w', text=name, fill='#333',
+                              font=('Segoe UI', 7))
+
+        c.create_text(xL + 6, yT + 0.10*Ht, anchor='w', text='Luft (Aussenseite)',
+                      fill='#6a8', font=('Segoe UI', 7))
+        band(e_tear_bot, e_cornea_bot, '#c9e8c9', 'Cornea (Auge)')                  # gruen
+        band(e_lens_bot, e_tear_bot, '#bfe3ff', 'Traenenfilm (Lipid/Aqu./Mucin)')  # blau
+        band(e_lens_top, e_lens_bot, '#ffe08a', '')                                # Linse gelb
+        xc = (xL + xR)/2
+        c.create_text(xc, (e_lens_top + e_lens_bot)/2 - cur,
+                      text='Kontaktlinse PMMA  d=250 um  R=8.3 mm', fill='#5a4600',
+                      font=('Segoe UI', 8, 'bold'))
+
+        # TIR-Zickzack im Glas (Fuehrung durch Totalreflexion, vom rechten Rand)
+        bounces = 8
+
+        def top_y(t):
+            return e_lens_top - cur*(1 - (2*t - 1)**2) + 3
+
+        def bot_y(t):
+            return e_lens_bot - cur*(1 - (2*t - 1)**2) - 3
+        zz = []
+        for j in range(bounces + 1):
+            t = j/bounces
+            zz += [xL + (xR - xL)*t, bot_y(t) if j % 2 else top_y(t)]
+        c.create_line(*zz, fill='#d33', width=1.4)
+        # evaneszente Pfeile an den unteren TIR-Punkten in den Traenenfilm
+        for j in range(1, bounces, 2):
+            t = j/bounces
             x = xL + (xR - xL)*t
-            y = base - (base - top)*(1 - (2*t - 1)**2)
-            pts += [x, y]
-        pts += [xR, base, xL, base]
-        c.create_polygon(*pts, fill='#ffe08a', outline='#c9a53a', smooth=True)
-        c.create_text((xL + xR)/2, (top + base)/2, text='Kontaktlinse (PMMA) ~250 um',
-                      fill='#5a4600', font=('Segoe UI', 8, 'bold'))
+            c.create_line(x, bot_y(t), x, bot_y(t) + 0.05*Ht, fill='#0a7', width=1.4,
+                          arrow='last', dash=(2, 2))
+        c.create_text(xc, e_tear_bot - cur + 0.03*Ht, text='evaneszent -> Traenenfilm',
+                      fill='#0a7', font=('Segoe UI', 6))
+
+        # Stirnflaeche (rechter Rand) + VCSEL Butt-Coupling (End-Fire nach links)
+        y_rim = (e_lens_top + e_lens_bot)/2
+        c.create_line(xR, e_lens_top, xR, e_lens_bot, fill='magenta', width=2)
+        c.create_rectangle(xR + 6, y_rim - 8, xR + 18, y_rim + 8, fill='#FF3333',
+                           outline='black')
+        c.create_line(xR + 6, y_rim, xR - 34, y_rim, fill='#e23', width=3, arrow='last')
+        c.create_text(xR + 22, y_rim, anchor='w',
+                      text='VCSEL\n(Butt-Coupling,\nStirnflaeche)', fill='#e23',
+                      font=('Segoe UI', 6))
         # Szenario (falls aktiv)
         sc = self.vars.get('scenario')
         w = self.widgets.get('scenario')
         if sc is not None and w is not None and str(w.cget('state')) != 'disabled':
-            c.create_text((xL + xR)/2, top - 6, text=f'Szenario: {sc.get()}',
+            c.create_text(xc, e_lens_top - cur - 9, text=f'Szenario: {sc.get()}',
                           fill='#14618c', font=('Segoe UI', 7, 'bold'))
-        ymid = (top + base)/2
-        self._wave(c, xL + 6, xR - 6, ymid, 6)
-        # Quelle
-        off = self._sketch_val('vcsel_offset', 0.0)
-        c.create_line(10, ymid - off*3.0, xL - 2, ymid, fill='#e23', width=3, arrow='last')
-        c.create_text(10, ymid - 12, anchor='w', text='VCSEL', fill='#e23',
-                      font=('Segoe UI', 7, 'bold'))
-        # evaneszent in den Traenenfilm
-        xa = xL + 0.6*(xR - xL)
-        c.create_line(xa, base, xa, base + 0.10*Ht, fill='#0a7', width=2,
-                      arrow='last', dash=(3, 2))
-        c.create_text(xa + 4, base + 0.06*Ht, anchor='w', text='evaneszent',
-                      fill='#0a7', font=('Segoe UI', 6))
 
     def _add_field(self, parent, row, act):
         """Eine Zeile: Klartext-Label (Tooltip: Flag+Hilfe) + passendes Widget."""
