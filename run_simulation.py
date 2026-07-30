@@ -298,8 +298,6 @@ def build_parser():
                          help='s=TE (Ez) | p=TM (Ey)')
     g_basic.add_argument('--source-type', choices=('cw', 'pulse'), default='cw')
     g_basic.add_argument('--snapshots', type=int, default=8, help='Anzahl gespeicherter Frames')
-    g_basic.add_argument('--input-gap', type=float, default=0.0,
-                         help='Einkoppelabstand Laser-zu-WG in um (Luftweg + Fresnel-Eintritt)')
 
     g_mat = ap.add_argument_group('Material & Schichten')
     g_mat.add_argument('--wg-material', choices=('pmma', 'polystyrol'), default='pmma',
@@ -339,6 +337,8 @@ def build_parser():
                        help='Spot-Versatz in y (um); in 3D = Offset y')
     g_src.add_argument('--vcsel-offset-z', type=float, default=0.0,
                        help='Spot-Versatz in z (um, nur 3D)')
+    g_src.add_argument('--input-gap', type=float, default=0.0,
+                       help='Einkoppelabstand Laser-zu-WG in um (Luftweg + Fresnel-Eintritt)')
 
     g_3d = ap.add_argument_group('3D-spezifisch')
     g_3d.add_argument('--lz-um', type=float, default=8.0, help='Domain-Tiefe z in um (nur 3D)')
