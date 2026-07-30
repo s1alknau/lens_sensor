@@ -127,11 +127,12 @@ def main(argv=None):
     # --- Full-Domain: adaptiver Zellzahl-/RAM-Schutz (Speicher ~ Zellzahl) ---
     res = cfg['resolution']
     ncells = cfg['lx']*res * cfg['ly']*res * (cfg['lz']*res if args.dim == 3 else 1)
-    # Realistischer Speicher pro Zelle. Meep-3D braucht weit mehr als die nackten
-    # Feld-Arrays: 6 Feldkomponenten KOMPLEX (force_complex_fields) + D/B + PML-
-    # Hilfsfelder + DFT-Monitore + die vollen 3D-Feld-Volumina fuers NPZ. Empirisch
-    # hat ~18M Zellen eine 15-GB-Box in OOM getrieben -> ~700 B/Zelle statt 260.
-    bpc = 700 if args.dim == 3 else 120
+    # Speicher pro Zelle, empirisch kalibriert: Meep-3D SERIELL ~394 B/Zelle
+    # (gemessen: 4.27M Zellen -> 1.68 GB Peak-RSS, --no-save). Mit Full-Field-NPZ
+    # + Reserve ~500. ACHTUNG: viele MPI-Raenge vervielfachen den Speicher (Overhead
+    # je Rang + Einsammeln des vollen Volumens auf Rang 0) -> auf kleinem RAM 3D
+    # SERIELL oder mit WENIGEN Raengen rechnen. (~18M Zellen mit -np 22 -> OOM.)
+    bpc = 500 if args.dim == 3 else 120
     try:
         import psutil
         avail = psutil.virtual_memory().available
@@ -145,6 +146,8 @@ def main(argv=None):
             f'[ABBRUCH] ~{ncells/1e6:.0f}M Zellen (~{ncells*bpc/1e9:.1f} GB) '
             f'> adaptives Limit ~{max_cells/1e6:.0f}M ({avail/1e9:.1f} GB frei).\n'
             f'  Meep rechnet FULL-DOMAIN (kein Stitch) - Optionen:\n'
+            f'   - 3D auf kleinem RAM SERIELL/wenige Raenge (--meep-np 1..4); viele '
+            f'Raenge vervielfachen den Speicher (OOM-Risiko)\n'
             f'   - groebere --resolution-nm / kuerzere --length-um '
             f'(3D auch kleinere --lz-um/--tear/--air)\n'
             f'   - lange/planare Domaene: Meep-Fenster-Stitch -> --method stitch\n'
