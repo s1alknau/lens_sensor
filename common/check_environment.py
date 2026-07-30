@@ -1,6 +1,6 @@
 """Diagnose-Skript: prueft alle Abhaengigkeiten und GPU-Verfuegbarkeit.
 
-Ausfuehren mit:  python check_environment.py
+Ausfuehren mit:  python common/check_environment.py   (vom Repo-Root)
 """
 import sys
 import importlib
@@ -75,19 +75,23 @@ if 'cupy' in versions:
 else:
     fail('CuPy fehlt - GPU nicht testbar')
 
-# Lokale Files
+# Lokale Files (relativ zum Repo-Root, unabhaengig vom Arbeitsverzeichnis)
 print('\n--- Lens-Sensor Files ---')
 import os
-needed_files = ['config.py', 'sliding_window_fdtd.py', 'plot_sliding_results.py']
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+needed_files = ['run_simulation.py', 'run_gui.py',
+                'common/fdtd_analyzer.py', 'planar_beads/fdtd2d_core.py',
+                'planar_3d/fdtd3d_core.py']
 for f in needed_files:
-    if os.path.exists(f):
+    if os.path.exists(os.path.join(_root, f)):
         ok(f'{f} vorhanden')
     else:
         fail(f'{f} NICHT vorhanden')
 
 # Output-Verzeichnis
-if not os.path.exists('results'):
-    os.makedirs('results')
+_results = os.path.join(_root, 'results')
+if not os.path.exists(_results):
+    os.makedirs(_results)
     ok('results/ Verzeichnis erstellt')
 else:
     ok('results/ Verzeichnis vorhanden')
@@ -112,7 +116,9 @@ if missing:
     sys.exit(1)
 else:
     print('ALLE CHECKS BESTANDEN — bereit fuer Simulation!')
-    print('\nNaechster Schritt (Test-Lauf, ~5-10 Min):')
-    print('  python sliding_window_fdtd.py --scenario Gesund --gpu \\')
-    print('         --resolution 500 --window-w 300 --window-h 1500 --slide 200')
+    print('\nNaechste Schritte:')
+    print('  GUI:  python run_gui.py')
+    print('  CLI:  python run_simulation.py --geometry planar --dim 2 --method full')
+    print('        python run_simulation.py --geometry lens   --dim 3 --scenario Gesund')
+    print('        python run_simulation.py --help          (alle Optionen)')
     sys.exit(0)
