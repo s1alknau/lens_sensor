@@ -208,37 +208,56 @@ def _to_wsl_path(win_path):
     return p
 
 
-def _strip_engine(raw):
-    """Entfernt --engine/-e (+ Wert) aus der Argumentliste fuer die Weitergabe."""
+def _strip_flags(raw, drop):
+    """Entfernt die genannten Optionen (+ ihren Wert) aus der Argumentliste.
+    'drop' ist ein Set von Optionsnamen (z.B. {'--engine','-e','--meep-np'})."""
     out = []
     skip = False
     for tok in raw:
         if skip:
             skip = False
             continue
-        if tok in ('--engine', '-e'):
-            skip = True
-            continue
-        if tok.startswith('--engine=') or tok.startswith('-e='):
+        key = tok.split('=', 1)[0]
+        if key in drop:
+            skip = ('=' not in tok)   # eigener Token = naechster ist der Wert
             continue
         out.append(tok)
     return out
 
 
-def _dispatch_meep(raw):
+def _mpi_prefix(np_ranks):
+    """Baut das mpirun-Praefix. Meep parallelisiert NUR ueber MPI (kein GPU).
+    N<=1 -> seriell (kein Praefix); N==0 -> alle Kerne ($(nproc)); sonst -np N."""
+    if np_ranks is None or np_ranks == 1:
+        return ''
+    n = '$(nproc)' if np_ranks == 0 else str(int(np_ranks))
+    return 'mpirun -np %s ' % n
+
+
+def _dispatch_meep(raw, np_ranks=1):
     """Startet den Meep-Treiber. Unter Windows via WSL (Meep-Only-Linux),
-    unter Linux direkt. Reicht die urspruenglichen Argumente (ohne --engine) durch."""
-    args_fwd = _strip_engine(raw)
+    unter Linux direkt. Reicht die urspruenglichen Argumente (ohne --engine/--meep-np)
+    durch. np_ranks>1 (oder 0=alle Kerne) startet via 'mpirun -np N'."""
+    args_fwd = _strip_flags(raw, {'--engine', '-e', '--meep-np'})
+    mpi = _mpi_prefix(np_ranks)
     if os.name == 'nt':
         wsl_repo = _to_wsl_path(_REPO_ROOT)
-        inner = ('cd "%s" && %s run -n %s python meep/run_meep.py %s'
-                 % (wsl_repo, WSL_CONDA, WSL_ENV, ' '.join(_q(a) for a in args_fwd)))
+        inner = ('cd "%s" && %s run -n %s %spython meep/run_meep.py %s'
+                 % (wsl_repo, WSL_CONDA, WSL_ENV, mpi,
+                    ' '.join(_q(a) for a in args_fwd)))
         cmd = ['wsl', '-d', WSL_DISTRO, '-u', 'root', 'bash', '-lc', inner]
         print(f'[engine=meep] Windows erkannt -> Auslagerung nach WSL ({WSL_DISTRO})')
+        if mpi:
+            print(f'  MPI: {mpi.strip()} (Meep nutzt nur CPU-Kerne, kein GPU)')
         print('  ' + ' '.join(cmd[:6]) + ' ...')
     else:
-        cmd = [sys.executable, os.path.join(_REPO_ROOT, 'meep', 'run_meep.py')] + args_fwd
-        print('[engine=meep] Linux -> Meep direkt')
+        base = [sys.executable, os.path.join(_REPO_ROOT, 'meep', 'run_meep.py')] + args_fwd
+        if mpi:
+            n = str(os.cpu_count() or 1) if np_ranks == 0 else str(int(np_ranks))
+            cmd = ['mpirun', '-np', n] + base
+        else:
+            cmd = base
+        print('[engine=meep] Linux -> Meep direkt' + (f' (mpirun -np {n})' if mpi else ''))
     try:
         return subprocess.call(cmd)
     except FileNotFoundError as e:
@@ -356,6 +375,11 @@ def build_parser():
                           help='(engine meep, stitch) mode = Mode-Kaskade (robust, empfohlen); '
                                'field = VOLL-FELD (nur gefuehrt-dominiert; bricht bei starker '
                                'Streuung).')
+    g_stitch.add_argument('--meep-np', type=int, default=1, metavar='N',
+                          help='(engine meep) Anzahl MPI-Prozesse. Meep hat KEINEN GPU-Support '
+                               'und parallelisiert nur ueber MPI (CPU-Kerne). 1=seriell; '
+                               '>1 startet den Lauf via "mpirun -np N" (setzt den MPI-Build von '
+                               'pymeep voraus). 0=alle verfuegbaren Kerne.')
 
     g_run = ap.add_argument_group('Ablauf')
     g_run.add_argument('--allow-large', action='store_true',
@@ -406,7 +430,7 @@ def main(argv=None):
 
     # Engine-Weiche: Meep laeuft nur unter Linux/WSL. Auf Windows nach WSL auslagern.
     if args.engine == 'meep':
-        return _dispatch_meep(raw)
+        return _dispatch_meep(raw, np_ranks=args.meep_np)
 
     layers = resolve_args(args)
 

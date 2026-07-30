@@ -47,10 +47,16 @@ Meep ist das primäre Ziel und wird zuerst installiert (CPU-Deps inklusive):
 ```bash
 wsl -d Ubuntu-24.04 -u root bash -lc '
   /opt/conda/bin/conda create -y -n lens_sensor -c conda-forge \
-    python=3.11 pymeep pymeep-extras \
-    numpy scipy matplotlib imageio scikit-image psutil packaging
+    "pymeep=*=mpi_mpich_*" pymeep-extras mpi4py \
+    python=3.11 numpy scipy matplotlib imageio scikit-image psutil packaging
 '
 ```
+
+> **MPI-Build:** `pymeep=*=mpi_mpich_*` (statt des `nompi`-Standards) zieht die
+> **parallele** Variante inkl. `mpich`/`mpi4py`. Meep hat **keinen GPU-Support**
+> und skaliert ausschließlich über **MPI (CPU-Kerne)** — der MPI-Build ist daher
+> für 3D-Läufe faktisch Pflicht. Ein bereits vorhandener serieller Env lässt sich
+> nachrüsten: `conda install -n lens_sensor -c conda-forge "pymeep=*=mpi_mpich_*" mpi4py`.
 
 **Wichtig — MKL-Soname-Fix:** pymeep 1.30 ist gegen `libmkl_rt.so.2` gebaut, der
 conda-Solve zieht aber das brandneue `mkl 2026` (nur `libmkl_rt.so.3`) →
@@ -126,6 +132,21 @@ wsl -d Ubuntu-24.04 -u root bash -lc '
 
 Der eigene Solver läuft damit in WSL (GPU, falls CuPy installiert), Ergebnisse
 landen in `results/` — sichtbar auch für den Windows-Analyzer.
+
+### Meep über mehrere CPU-Kerne (`--meep-np`)
+
+Meep parallelisiert nur über **MPI**. `run_simulation.py --engine meep --meep-np N`
+startet den Lauf via `mpirun -np N` (Gebietszerlegung über N Ränge). `N=0` nutzt
+alle Kerne (`$(nproc)`), `N=1` (Default) läuft seriell. Beispiel — 3D-Meep auf 8 Kernen:
+
+```powershell
+python run_simulation.py --engine meep --geometry planar --dim 3 --method full `
+  --length-um 6 --meep-np 8
+```
+
+Von Windows wird das automatisch nach WSL ausgelagert und dort als
+`mpirun -np 8 python meep/run_meep.py ...` gestartet. Für die Cross-Validierung
+gilt dasselbe Muster: `mpirun -np N python tests/crossval.py meepfdtd ...`.
 
 ## 7. GUI (tkinter) via WSLg
 
