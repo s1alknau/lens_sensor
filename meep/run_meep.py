@@ -127,13 +127,17 @@ def main(argv=None):
     # --- Full-Domain: adaptiver Zellzahl-/RAM-Schutz (Speicher ~ Zellzahl) ---
     res = cfg['resolution']
     ncells = cfg['lx']*res * cfg['ly']*res * (cfg['lz']*res if args.dim == 3 else 1)
-    bpc = 260 if args.dim == 3 else 120
+    # Realistischer Speicher pro Zelle. Meep-3D braucht weit mehr als die nackten
+    # Feld-Arrays: 6 Feldkomponenten KOMPLEX (force_complex_fields) + D/B + PML-
+    # Hilfsfelder + DFT-Monitore + die vollen 3D-Feld-Volumina fuers NPZ. Empirisch
+    # hat ~18M Zellen eine 15-GB-Box in OOM getrieben -> ~700 B/Zelle statt 260.
+    bpc = 700 if args.dim == 3 else 120
     try:
         import psutil
         avail = psutil.virtual_memory().available
     except Exception:
         avail = 8e9
-    max_cells = 0.6*avail/bpc
+    max_cells = (0.5 if args.dim == 3 else 0.6)*avail/bpc
     print(f'  Gitter    : ~{ncells/1e6:.1f}M Zellen  (~{ncells*bpc/1e9:.1f} GB; '
           f'adaptives Limit ~{max_cells/1e6:.0f}M bei {avail/1e9:.1f} GB frei)')
     if ncells > max_cells and not args.dry_run and not getattr(args, 'allow_large', False):
