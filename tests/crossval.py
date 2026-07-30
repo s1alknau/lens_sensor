@@ -224,6 +224,35 @@ def slab_neff_meep(n_core=1.491, n_top=1.0, n_bot=1.336, d_um=5.0, lam_nm=850.0,
     return abs(em.k.x)/f0
 
 
+def channel_neff_meep(d_um=5.0, w_um=3.0, lam_nm=850.0, n_core=1.491,
+                      n_top=1.0, n_bot=1.336, n_side=1.0, res=30):
+    """Meep-MPB: n_eff der Fundamentalmode eines RECHTECK-KANALS (Kern endlich in
+    y UND z) - die 2D-Querschnittsmode, geloest in einem 3D-Setup. Grundwahrheit
+    fuer den nativen 3D-Kanal (analytisch gibt es dafuer keine geschlossene Formel)."""
+    import meep as mp
+    air, tear = 3.0, 6.0
+    ly = d_um + air + tear
+    lz = w_um + 6.0                    # Kernbreite + seitliches Cladding/PML
+    y_top = d_um + air; y_bot = -tear; cy = 0.5*(y_top + y_bot)
+    cell = mp.Vector3(2.0, ly, lz)
+    geom = [
+        mp.Block(mp.Vector3(mp.inf, tear, mp.inf),        # Aqueous-Substrat (volle Tiefe)
+                 center=mp.Vector3(0, -0.5*tear - cy, 0), material=mp.Medium(index=n_bot)),
+        mp.Block(mp.Vector3(mp.inf, d_um, w_um),          # PMMA-Kern: endlich in y UND z
+                 center=mp.Vector3(0, 0.5*d_um - cy, 0), material=mp.Medium(index=n_core)),
+    ]
+    sim = mp.Simulation(cell_size=cell, resolution=res, geometry=geom,
+                        default_material=mp.Medium(index=n_top),
+                        boundary_layers=[mp.PML(1.0, direction=mp.Y),
+                                         mp.PML(1.0, direction=mp.Z)])
+    sim.init_sim()
+    f0 = 1000.0/lam_nm
+    em = sim.get_eigenmode(
+        f0, mp.X, mp.Volume(center=mp.Vector3(), size=mp.Vector3(0, ly, lz)),
+        1, mp.Vector3(f0*0.5*(n_core + max(n_top, n_bot)), 0, 0), parity=mp.NO_PARITY)
+    return abs(em.k.x)/f0
+
+
 # ----------------------------------------------------------------------------
 if __name__ == '__main__':
     import sys
@@ -234,6 +263,23 @@ if __name__ == '__main__':
         na = slab_neff_analytic(1.491, 1.0, 1.336, d_um, lam_nm, pol)
         print(f'MEEPRESULT d={d_um} L={lam_nm:.0f} {pol}: meep={nm:.4f} '
               f'analytisch={na:.4f} Delta={nm-na:+.4f}')
+        sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == 'meepchannel':
+        # In WSL: python crossval.py meepchannel <d_um> <w_um> <lam_nm>
+        d_um, w_um, lam_nm = float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+        nm = channel_neff_meep(d_um, w_um, lam_nm)
+        print(f'MEEPCHANNEL d={d_um} w={w_um} L={lam_nm:.0f}: meep-MPB n_eff={nm:.4f}')
+        sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == 'natchannel':
+        # Windows/GPU: python crossval.py natchannel <d_um> <w_um> <lam_nm> <pol> <dx_nm>
+        d_um, w_um = float(sys.argv[2]), float(sys.argv[3])
+        lam_nm, pol = float(sys.argv[4]), sys.argv[5]
+        dx = float(sys.argv[6]) if len(sys.argv) > 6 else 40.0
+        # kompakte Domaene, damit feineres dx auf 4-GB-GPU passt
+        n3 = slab_neff_native_3d(d_um=d_um, lam_nm=lam_nm, pol=pol, length_um=20.0,
+                                 lz_um=w_um + 4.0, dx_nm=dx, wg_width_um=w_um)
+        print(f'NATCHANNEL d={d_um} w={w_um} L={lam_nm:.0f} {pol} dx={dx:g}: '
+              f'nativ-3D n_eff={n3:.4f}')
         sys.exit(0)
     if len(sys.argv) > 1 and sys.argv[1] == '3d':
         # 3D-Slab-Check: analytisch vs nativ-2D vs nativ-3D (gleiches dx).
