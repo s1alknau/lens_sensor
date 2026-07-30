@@ -25,6 +25,20 @@ import run_simulation as rs
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
+# Kurzhinweise fuer Felder ohne festen Default: diese werden erst in
+# run_simulation.resolve_args aus Geometrie/Dimension bzw. Materialdispersion
+# aufgeloest. Als grauer Platzhalter im Feld sichtbar (nicht mitgesendet).
+_AUTO_HINTS = {
+    'resolution_nm': 'auto: 20 nm (2D) / 50 nm (3D)',
+    'length_um': 'auto: je Geometrie & Dimension',
+    'window_um': 'auto: 350 (2D) / 20 (3D)',
+    'slide_um': 'auto: 150 (2D) / 12 (3D)',
+}
+
+
+def _auto_hint(dest):
+    return _AUTO_HINTS.get(dest, 'auto (Default des Solvers)')
+
 
 # ---------------------------------------------------------------------------
 # Reine Logik (ohne tkinter -> headless testbar): Werte-Dict -> argv-Liste.
@@ -90,6 +104,7 @@ class SimGUI:
         self.root = root
         self.parser = rs.build_parser()
         self.vars = {}          # dest -> tk Variable
+        self.placeholders = {}  # dest -> Platzhaltertext (fuer None-Defaults)
         self.proc = None
         self.q = queue.Queue()
         root.title('Lens-Sensor FDTD - Einstieg')
@@ -149,8 +164,15 @@ class SimGUI:
                     ttk.Combobox(form, textvariable=var, width=28, state='readonly',
                                  values=[str(c) for c in act.choices]).grid(
                                      row=row, column=1, sticky='w')
-                else:                                       # Freitext -> Entry
-                    var = tk.StringVar(value='' if act.default is None else str(act.default))
+                elif act.default is None:                   # Freitext ohne festen Default
+                    ph = _auto_hint(act.dest)               # grauer Platzhalter
+                    var = tk.StringVar(value=ph)
+                    ent = ttk.Entry(form, textvariable=var, width=30, foreground='grey')
+                    ent.grid(row=row, column=1, sticky='w')
+                    self.placeholders[act.dest] = ph
+                    self._bind_placeholder(ent, var, ph)
+                else:                                       # Freitext mit Default
+                    var = tk.StringVar(value=str(act.default))
                     ttk.Entry(form, textvariable=var, width=30).grid(
                         row=row, column=1, sticky='w')
                 self.vars[act.dest] = var
@@ -176,9 +198,22 @@ class SimGUI:
                                              font=('Consolas', 9))
         self.log.pack(fill='both', expand=False, padx=8, pady=(0, 8))
 
+    def _bind_placeholder(self, ent, var, ph):
+        """Grauer Platzhalter: bei Fokus leeren, bei leerem Verlassen zurueck."""
+        def on_in(_e=None):
+            if var.get() == ph:
+                var.set(''); ent.configure(foreground='black')
+        def on_out(_e=None):
+            if var.get().strip() == '':
+                var.set(ph); ent.configure(foreground='grey')
+        ent.bind('<FocusIn>', on_in)
+        ent.bind('<FocusOut>', on_out)
+
     # ---- Aktionen ----
     def _values(self):
-        return {dest: v.get() for dest, v in self.vars.items()}
+        # Platzhaltertext == "nichts eingegeben" -> leer (Default gilt).
+        return {dest: ('' if v.get() == self.placeholders.get(dest) else v.get())
+                for dest, v in self.vars.items()}
 
     def on_dry_run(self):
         self._launch(collect_argv(self.parser, self._values(), force_dry_run=True))
