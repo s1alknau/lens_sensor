@@ -14,6 +14,7 @@ Stitch) steckt in run_simulation.py; die entsprechenden Hinweise erscheinen im L
 import os
 import sys
 import glob
+import math
 import queue
 import threading
 import subprocess
@@ -164,7 +165,7 @@ class SimGUI:
         self.proc = None
         self.q = queue.Queue()
         root.title('Lens-Sensor FDTD - Einstieg')
-        root.geometry('880x720')
+        root.geometry('880x860')
         self._build()
         self.root.after(100, self._drain_log)
 
@@ -180,6 +181,13 @@ class SimGUI:
                   'ohne zu rechnen.',
                   style='Sub.TLabel', wraplength=840, justify='left').pack(anchor='w',
                                                                           pady=(2, 0))
+
+        # Uebersichts-Skizze der gewaehlten Geometrie (Querschnitt x-y).
+        skf = ttk.LabelFrame(self.root, text='  Uebersicht: gewaehlte Geometrie  ',
+                             style='Section.TLabelframe', padding=(6, 4))
+        skf.pack(fill='x', padx=10, pady=(6, 0))
+        self.sketch = tk.Canvas(skf, height=165, highlightthickness=0, background='white')
+        self.sketch.pack(fill='x', expand=True)
 
         # Scrollbarer Formularbereich
         mid = ttk.Frame(self.root)
@@ -216,6 +224,18 @@ class SimGUI:
             self.vars['geometry'].trace_add('write', self._apply_conditional)
             self._apply_conditional()
 
+        # Uebersichts-Skizze bei Aenderung relevanter Felder neu zeichnen.
+        for dest in ('geometry', 'dim', 'wg_material', 'wg_thickness_um', 'bead_diameter',
+                     'bead_x', 'bead_y_um', 'no_bead', 'vcsel_offset', 'vcsel_tilt',
+                     'input_gap', 'length_um', 'wg_width', 'lz_um', 'scenario'):
+            v = self.vars.get(dest)
+            if v is not None:
+                try:
+                    v.trace_add('write', self._draw_sketch)
+                except Exception:
+                    pass
+        self.sketch.bind('<Configure>', self._draw_sketch)
+
         self._build_buttons_and_log()
 
     def _resolved_geometry(self):
@@ -237,6 +257,171 @@ class SimGUI:
                 w.configure(state='normal' if on else 'disabled')
         if lbl is not None:
             lbl.configure(foreground='#333333' if on else '#a0a0a0')
+
+    # ---- Uebersichts-Skizze -------------------------------------------------
+    def _sketch_val(self, dest, default):
+        """Numerischer Feldwert; Platzhalter/leer/ungueltig -> default."""
+        v = self.vars.get(dest)
+        if v is None:
+            return default
+        s = v.get()
+        if s == self.placeholders.get(dest) or str(s).strip() == '':
+            return default
+        try:
+            return float(s)
+        except Exception:
+            return default
+
+    def _wave(self, c, x0, x1, yc, amp, cycles=6, color='#c58a00'):
+        n = 60
+        pts = []
+        for k in range(n + 1):
+            x = x0 + (x1 - x0)*k/n
+            pts += [x, yc - amp*math.sin(2*math.pi*cycles*k/n)]
+        c.create_line(*pts, fill=color, width=1)
+
+    def _draw_sketch(self, *_):
+        c = getattr(self, 'sketch', None)
+        if c is None:
+            return
+        c.delete('all')
+        W = c.winfo_width()
+        H = c.winfo_height()
+        if W < 50:
+            W = 820
+        if H < 40:
+            H = 165
+        geom = self._resolved_geometry() or 'planar'
+        try:
+            dim = int(float(self.vars['dim'].get()))
+        except Exception:
+            dim = 3
+        xL, xR = 74, W - 150            # links Quelle, rechts Legende
+        yT, yB = 20, H - 12
+        if geom == 'lens':
+            self._sketch_lens(c, xL, xR, yT, yB)
+        else:
+            self._sketch_planar(c, xL, xR, yT, yB)
+        # Propagationsrichtung
+        c.create_line(xL, 10, xL + 44, 10, fill='#14618c', width=2, arrow='last')
+        c.create_text(xL + 48, 10, anchor='w', text='x (Ausbreitung)',
+                      fill='#14618c', font=('Segoe UI', 7))
+        # 3D-Badge
+        if dim == 3:
+            lz = self._sketch_val('lz_um', 8.0)
+            ww = self.vars.get('wg_width')
+            is_chan = bool(ww is not None and ww.get().strip()
+                           and ww.get() != self.placeholders.get('wg_width'))
+            c.create_text(W - 6, H - 4, anchor='se',
+                          text=f'3D · z-Tiefe {lz:g} µm · {"Kanal" if is_chan else "Slab"}',
+                          fill='#14618c', font=('Segoe UI', 7, 'bold'))
+        else:
+            c.create_text(W - 6, H - 4, anchor='se', text='2D (z invariant)',
+                          fill='#14618c', font=('Segoe UI', 7, 'bold'))
+
+    def _sketch_planar(self, c, xL, xR, yT, yB):
+        Ht = yB - yT
+        bands = [('Luft (n=1.0)', '#eaf4ff', 0.17),
+                 ('Lipid', '#fff2cc', 0.07),
+                 ('WG-Kern', '#ffd75e', 0.17),
+                 ('Traenenfilm (Aqueous)', '#bfe3ff', 0.27),
+                 ('Mucin', '#e2d1f4', 0.11),
+                 ('Cornea', '#f8c9c9', 0.21)]
+        y = yT
+        ycore = core_h = 0
+        wg_mat = (self.vars['wg_material'].get() if 'wg_material' in self.vars else 'pmma')
+        for name, col, frac in bands:
+            h = frac*Ht
+            c.create_rectangle(xL, y, xR, y + h, fill=col, outline='#cfd8e0')
+            c.create_text(xR + 6, y + h/2, anchor='w', text=name, fill='#444',
+                          font=('Segoe UI', 7))
+            if name == 'WG-Kern':
+                ycore, core_h = y, h
+                d = self._sketch_val('wg_thickness_um', 5.0)
+                c.create_text((xL + xR)/2, y + h/2,
+                              text=f'{wg_mat.upper()}  d={d:g} um', fill='#5a4600',
+                              font=('Segoe UI', 8, 'bold'))
+            y += h
+        ycm = ycore + core_h/2
+        # gefuehrte Welle im Kern
+        self._wave(c, xL + 4, xR - 4, ycm, core_h*0.30)
+        # Quelle (VCSEL) links, mit Offset/Neigung
+        off = self._sketch_val('vcsel_offset', 0.0)
+        tilt = max(-45.0, min(45.0, self._sketch_val('vcsel_tilt', 0.0)))
+        gap = self._sketch_val('input_gap', 0.0)
+        ysrc = ycm - off*3.0
+        dy = math.tan(math.radians(tilt))*(xL - 12)
+        c.create_line(10, ysrc - dy, xL - 2, ysrc, fill='#e23', width=3, arrow='last')
+        c.create_text(10, ysrc - 12, anchor='w', text='VCSEL', fill='#e23',
+                      font=('Segoe UI', 7, 'bold'))
+        if gap > 0:
+            c.create_line(xL, yT, xL, yB, fill='#e23', dash=(2, 2))
+            c.create_text(xL + 3, yB - 6, anchor='w', text=f'gap {gap:g}um',
+                          fill='#e23', font=('Segoe UI', 6))
+        # evaneszenter Pfeil in den Traenenfilm
+        xa = xL + 0.62*(xR - xL)
+        c.create_line(xa, ycore + core_h, xa, ycore + core_h + 0.16*Ht,
+                      fill='#0a7', width=2, arrow='last', dash=(3, 2))
+        c.create_text(xa + 4, ycore + core_h + 0.09*Ht, anchor='w', text='evaneszent',
+                      fill='#0a7', font=('Segoe UI', 6))
+        # Bead (nur wenn nicht --no-bead und Durchmesser > 0)
+        nb = self.vars.get('no_bead')
+        if not (nb is not None and bool(nb.get())):
+            bd = self._sketch_val('bead_diameter', 0.5)
+            if bd > 0:
+                length = self._sketch_val('length_um', 0.0)
+                bx = self._sketch_val('bead_x', float('nan'))
+                fx = 0.5 if (length <= 0 or math.isnan(bx)) else max(0.05, min(0.95, bx/length))
+                by = self._sketch_val('bead_y_um', float('nan'))
+                cyb = (ycore + core_h + 0.05*Ht) if math.isnan(by) else (ycm - by*3.0)
+                r = max(4, min(14, bd*6))
+                cxb = xL + fx*(xR - xL)
+                c.create_oval(cxb - r, cyb - r, cxb + r, cyb + r,
+                              fill='#ff7043', outline='#a33')
+                c.create_text(cxb, cyb - r - 6, text=f'Bead {bd:g}um', fill='#a33',
+                              font=('Segoe UI', 6))
+
+    def _sketch_lens(self, c, xL, xR, yT, yB):
+        Ht = yB - yT
+        base = yB - 0.34*Ht          # Unterkante Linse / Oberkante Traenenfilm
+        # untere Schichten
+        for name, col, y0, y1 in (('Traenenfilm', '#bfe3ff', base, yB - 0.18*Ht),
+                                  ('Cornea', '#f8c9c9', yB - 0.18*Ht, yB)):
+            c.create_rectangle(xL, y0, xR, y1, fill=col, outline='#cfd8e0')
+            c.create_text(xR + 6, (y0 + y1)/2, anchor='w', text=name, fill='#444',
+                          font=('Segoe UI', 7))
+        # plan-konvexer Linsenkoerper
+        top = yT + 0.14*Ht
+        n = 48
+        pts = []
+        for k in range(n + 1):
+            t = k/n
+            x = xL + (xR - xL)*t
+            y = base - (base - top)*(1 - (2*t - 1)**2)
+            pts += [x, y]
+        pts += [xR, base, xL, base]
+        c.create_polygon(*pts, fill='#ffe08a', outline='#c9a53a', smooth=True)
+        c.create_text((xL + xR)/2, (top + base)/2, text='Kontaktlinse (PMMA) ~250 um',
+                      fill='#5a4600', font=('Segoe UI', 8, 'bold'))
+        # Szenario (falls aktiv)
+        sc = self.vars.get('scenario')
+        w = self.widgets.get('scenario')
+        if sc is not None and w is not None and str(w.cget('state')) != 'disabled':
+            c.create_text((xL + xR)/2, top - 6, text=f'Szenario: {sc.get()}',
+                          fill='#14618c', font=('Segoe UI', 7, 'bold'))
+        ymid = (top + base)/2
+        self._wave(c, xL + 6, xR - 6, ymid, 6)
+        # Quelle
+        off = self._sketch_val('vcsel_offset', 0.0)
+        c.create_line(10, ymid - off*3.0, xL - 2, ymid, fill='#e23', width=3, arrow='last')
+        c.create_text(10, ymid - 12, anchor='w', text='VCSEL', fill='#e23',
+                      font=('Segoe UI', 7, 'bold'))
+        # evaneszent in den Traenenfilm
+        xa = xL + 0.6*(xR - xL)
+        c.create_line(xa, base, xa, base + 0.10*Ht, fill='#0a7', width=2,
+                      arrow='last', dash=(3, 2))
+        c.create_text(xa + 4, base + 0.06*Ht, anchor='w', text='evaneszent',
+                      fill='#0a7', font=('Segoe UI', 6))
 
     def _add_field(self, parent, row, act):
         """Eine Zeile: Klartext-Label (Tooltip: Flag+Hilfe) + passendes Widget."""
