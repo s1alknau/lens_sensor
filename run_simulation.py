@@ -358,10 +358,6 @@ def build_parser():
                       help='Luftzone am WG-Ende in um -> Fresnel (nur 3D full)')
     g_3d.add_argument('--save-vector', action='store_true',
                       help='Ex,Ey,Ez speichern (nur 3D full)')
-    g_3d.add_argument('--check-resources', action='store_true',
-                      help='vor dem Lauf VRAM/RAM pruefen (nur 3D full)')
-    g_3d.add_argument('--calibrate', type=int, default=0, metavar='N',
-                      help='nur N Steps messen + Laufzeit hochrechnen (nur 3D full)')
 
     g_stitch = ap.add_argument_group('Stitch / Meep')
     g_stitch.add_argument('--window-um', type=float, default=None,
@@ -386,8 +382,16 @@ def build_parser():
                        help='(engine meep) den adaptiven Zellzahl-/RAM-Schutz umgehen '
                             '(Risiko: OOM).')
     g_run.add_argument('--no-save', action='store_true', help='nicht speichern')
-    g_run.add_argument('--dry-run', action='store_true',
-                       help='nur die aufgeloeste Konfiguration zeigen, nicht rechnen')
+
+    # Alle Parameter, die NICHT (voll) rechnen: Vorschau, Ressourcen-Check,
+    # Kurz-Kalibrierung. Geordnet von "gar nicht rechnen" zu "kurz messen".
+    g_prep = ap.add_argument_group('Kalibrierung & Vorschau')
+    g_prep.add_argument('--dry-run', action='store_true',
+                        help='nur die aufgeloeste Konfiguration zeigen, NICHT rechnen')
+    g_prep.add_argument('--check-resources', action='store_true',
+                        help='vor dem Lauf VRAM/RAM pruefen (nur 3D full)')
+    g_prep.add_argument('--calibrate', type=int, default=0, metavar='N',
+                        help='nur N Steps messen + Gesamtlaufzeit hochrechnen (nur 3D full)')
     return ap
 
 
