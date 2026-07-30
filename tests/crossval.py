@@ -224,6 +224,46 @@ def slab_neff_meep(n_core=1.491, n_top=1.0, n_bot=1.336, d_um=5.0, lam_nm=850.0,
     return abs(em.k.x)/f0
 
 
+def slab_neff_meep_fdtd(d_um=5.0, lam_nm=850.0, pol='s', length_um=12.0,
+                        lz_um=6.0, res=20, n_core=1.491, n_top=1.0, n_bot=1.336):
+    """Meep im ZEITBEREICH (die FDTD-Engine hinter run_meep --dim 3): 3D-Slab,
+    EigenModeSource treibt die Mode, n_eff aus der Phase des CW-DFT-Feldes entlang
+    x. Schliesst die Luecke 'Meep-3D-FDTD' (mit eigener Numerik-Dispersion)."""
+    import meep as mp
+    air, tear = 3.0, 6.0
+    ly = d_um + air + tear
+    y_top = d_um + air; y_bot = -tear; cy = 0.5*(y_top + y_bot)
+    dpml = 1.0
+    cell = mp.Vector3(length_um, ly, lz_um)
+    geom = [
+        mp.Block(mp.Vector3(mp.inf, tear, mp.inf), center=mp.Vector3(0, -0.5*tear - cy, 0),
+                 material=mp.Medium(index=n_bot)),
+        mp.Block(mp.Vector3(mp.inf, d_um, mp.inf), center=mp.Vector3(0, 0.5*d_um - cy, 0),
+                 material=mp.Medium(index=n_core)),
+    ]
+    f0 = 1000.0/lam_nm
+    parity = mp.ODD_Z if pol == 's' else mp.EVEN_Z
+    comp = mp.Ez if pol == 's' else mp.Ey
+    src = mp.EigenModeSource(
+        src=mp.ContinuousSource(frequency=f0),
+        center=mp.Vector3(-length_um/2 + dpml + 0.3, 0.5*d_um - cy, 0),
+        size=mp.Vector3(0, ly, lz_um), eig_band=1, direction=mp.X,
+        eig_match_freq=True, eig_parity=parity)
+    sim = mp.Simulation(cell_size=cell, resolution=res, geometry=geom, sources=[src],
+                        default_material=mp.Medium(index=n_top),
+                        boundary_layers=[mp.PML(dpml)], force_complex_fields=True)
+    dft = sim.add_dft_fields([comp], f0, 0, 1,
+                             center=mp.Vector3(0, 0.5*d_um - cy, 0),
+                             size=mp.Vector3(length_um, 0, 0), yee_grid=False)
+    sim.run(until=3.0*length_um*n_core + 40)          # bis eingeschwungen
+    line = np.asarray(sim.get_dft_array(dft, comp, 0))   # entlang x bei (WG-Mitte, z=0)
+    i0, i1 = int(0.35*len(line)), int(0.85*len(line))
+    ph = np.unwrap(np.angle(line[i0:i1]))
+    x = (np.arange(len(ph))/res)
+    beta = abs(np.polyfit(x, ph, 1)[0])
+    return beta/(2*np.pi/(lam_nm*1e-3))
+
+
 def channel_neff_meep(d_um=5.0, w_um=3.0, lam_nm=850.0, n_core=1.491,
                       n_top=1.0, n_bot=1.336, n_side=1.0, res=30):
     """Meep-MPB: n_eff der Fundamentalmode eines RECHTECK-KANALS (Kern endlich in
@@ -263,6 +303,14 @@ if __name__ == '__main__':
         na = slab_neff_analytic(1.491, 1.0, 1.336, d_um, lam_nm, pol)
         print(f'MEEPRESULT d={d_um} L={lam_nm:.0f} {pol}: meep={nm:.4f} '
               f'analytisch={na:.4f} Delta={nm-na:+.4f}')
+        sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == 'meepfdtd':
+        # In WSL: python crossval.py meepfdtd <d_um> <lam_nm> <pol>
+        d_um, lam_nm, pol = float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+        nf = slab_neff_meep_fdtd(d_um=d_um, lam_nm=lam_nm, pol=pol)
+        nmpb = slab_neff_meep(1.491, 1.0, 1.336, d_um, lam_nm, pol)
+        print(f'MEEPFDTD d={d_um} L={lam_nm:.0f} {pol}: meep-FDTD n_eff={nf:.4f} '
+              f'meep-MPB={nmpb:.4f} Delta={nf-nmpb:+.4f}')
         sys.exit(0)
     if len(sys.argv) > 1 and sys.argv[1] == 'meepchannel':
         # In WSL: python crossval.py meepchannel <d_um> <w_um> <lam_nm>
