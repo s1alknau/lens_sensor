@@ -70,7 +70,8 @@ R_BEND = 8.3e-3
 D_LENS = 14e-3
 T_BUF  = 20e-6
 D1_LEN = 500e-6
-D1_H   = 50e-6
+D1_H   = 50e-6            # Detektor-DICKE normal zur Linse (= D1_DICKE)
+L_DET_UM = 100.0         # tangentiale Detektor-Laenge im 2D-Fenster (wie plot_geometry Panel B)
 D3_LEN = 50e-6
 D3_QUERSCHN = 200e-6
 
@@ -138,7 +139,7 @@ def build_window_materials(x_start_um, x_end_um, y_start_um, y_end_um,
 
     # D1/D2 (tangential rotiert, normal-versetzt)
     x_d1_global_um = (D1_S_CENTER - D_LENS/2)*1e6
-    L_2D = 100.0
+    L_2D = L_DET_UM
     H_um = D1_H*1e6
     BUF_um = T_BUF*1e6
 
@@ -199,7 +200,7 @@ def get_detector_polygons():
     slope = -(x_d1_um*1e-6)/np.sqrt(R_BEND**2 - (x_d1_um*1e-6)**2)
     theta = np.arctan(slope)
     ct, st = np.cos(theta), np.sin(theta)
-    L_2D = 100.0
+    L_2D = L_DET_UM
     H_um = D1_H*1e6
     max_y_shift = L_2D/2*abs(st) + H_um/2*abs(ct)
     d_norm = max(max_y_shift/abs(ct), 50)
@@ -731,7 +732,7 @@ def main():
     # global muss VOR jedem Lesezugriff stehen (Python-Syntax-Regel),
     # weil argparse-Defaults sonst lokale Lookups erzeugen wuerden.
     global N_PMMA, N_LIPID, N_MUCIN, N_CORNEA, T_LENS, LAM
-    global R_BEND, D_LENS, D1_S_CENTER, D3_S_CENTER, D1_H, D3_LEN
+    global R_BEND, D_LENS, D1_S_CENTER, D3_S_CENTER, D1_H, D3_LEN, L_DET_UM
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -769,7 +770,8 @@ def main():
     ap.add_argument('--lens-diameter', type=float, default=14.0)
     ap.add_argument('--d1-position', type=float, default=2.0)
     ap.add_argument('--d3-position', type=float, default=1.8)
-    ap.add_argument('--d1-length', type=float, default=500.0)
+    ap.add_argument('--d1-length', type=float, default=100.0,
+                    help='tangentiale Detektor-Laenge L_2D in um (Dicke fest = D1_DICKE=50um)')
     ap.add_argument('--d3-length', type=float, default=50.0)
     ap.add_argument('--no-frames', action='store_true',
                     help='Keine Frame-NPZ/GIF speichern')
@@ -786,7 +788,11 @@ def main():
     D_LENS = args.lens_diameter*1e-3
     D1_S_CENTER = args.d1_position*1e-3
     D3_S_CENTER = args.d3_position*1e-3
-    D1_H = args.d1_length*1e-6
+    # --d1-length steuert die TANGENTIALE Detektor-Laenge (L_2D), NICHT die Dicke!
+    # (Frueher faelschlich D1_H=args.d1_length -> 500um dicke Detektoren weit ausserhalb
+    # der Linse. D1_H bleibt die Dicke = D1_DICKE.)
+    L_DET_UM = args.d1_length
+    D1_H = D1_DICKE
     D3_LEN = args.d3_length*1e-6
 
     if args.scenario == 'Custom':
