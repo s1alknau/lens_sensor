@@ -300,10 +300,10 @@ class SimGUI:
         yT, yB = 20, H - 12
         if geom == 'lens':
             self._sketch_lens(c, xL, xR, yT, yB)
-            # Propagation: vom Rand (VCSEL rechts) zum Apex -> nach links.
-            c.create_line(xL + 44, 10, xL, 10, fill='#14618c', width=2, arrow='last')
+            # Propagation: Rand (VCSEL links) -> Apex, links->rechts (wie planar).
+            c.create_line(xL, 10, xL + 44, 10, fill='#14618c', width=2, arrow='last')
             c.create_text(xL + 48, 10, anchor='w',
-                          text='x: Rand -> Apex (Propagation +x -> -x)',
+                          text='x: Rand -> Apex (Propagation, wie planar)',
                           fill='#14618c', font=('Segoe UI', 7))
         else:
             self._sketch_planar(c, xL, xR, yT, yB)
@@ -408,10 +408,10 @@ class SimGUI:
             c.create_polygon(*[v for xy in poly for v in xy], fill=fill,
                              outline='#cfd8e0', smooth=True)
             if name:
-                c.create_text(xL + 6, (et + eb)/2, anchor='w', text=name, fill='#333',
+                c.create_text(xR + 6, (et + eb)/2, anchor='w', text=name, fill='#333',
                               font=('Segoe UI', 7))
 
-        c.create_text(xL + 6, yT + 0.10*Ht, anchor='w', text='Luft (Aussenseite)',
+        c.create_text(xR + 6, yT + 0.10*Ht, anchor='w', text='Luft (Aussenseite)',
                       fill='#6a8', font=('Segoe UI', 7))
         band(e_tear_bot, e_cornea_bot, '#c9e8c9', 'Cornea (Auge)')                  # gruen
         band(e_lens_bot, e_tear_bot, '#bfe3ff', 'Traenenfilm (Lipid/Aqu./Mucin)')  # blau
@@ -443,15 +443,15 @@ class SimGUI:
         c.create_text(xc, e_tear_bot - cur + 0.03*Ht, text='evaneszent -> Traenenfilm',
                       fill='#0a7', font=('Segoe UI', 6))
 
-        # Stirnflaeche (rechter Rand) + VCSEL Butt-Coupling (End-Fire nach links)
+        # Stirnflaeche (LINKER Rand) + VCSEL Butt-Coupling, End-Fire nach RECHTS
+        # (Propagation links->rechts, konsistent mit dem planaren Waveguide)
         y_rim = (e_lens_top + e_lens_bot)/2
-        c.create_line(xR, e_lens_top, xR, e_lens_bot, fill='magenta', width=2)
-        c.create_rectangle(xR + 6, y_rim - 8, xR + 18, y_rim + 8, fill='#FF3333',
+        c.create_line(xL, e_lens_top, xL, e_lens_bot, fill='magenta', width=2)
+        c.create_rectangle(xL - 16, y_rim - 8, xL - 4, y_rim + 8, fill='#FF3333',
                            outline='black')
-        c.create_line(xR + 6, y_rim, xR - 34, y_rim, fill='#e23', width=3, arrow='last')
-        c.create_text(xR + 22, y_rim, anchor='w',
-                      text='VCSEL\n(Butt-Coupling,\nStirnflaeche)', fill='#e23',
-                      font=('Segoe UI', 6))
+        c.create_line(10, y_rim, xL - 2, y_rim, fill='#e23', width=3, arrow='last')
+        c.create_text(10, y_rim - 12, anchor='w', text='VCSEL', fill='#e23',
+                      font=('Segoe UI', 7, 'bold'))
         # Szenario (falls aktiv)
         sc = self.vars.get('scenario')
         w = self.widgets.get('scenario')
