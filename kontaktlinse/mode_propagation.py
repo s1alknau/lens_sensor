@@ -93,25 +93,49 @@ def sensor_R(y, profiles, a, betas_um, L_um, d1_y_um, d2_y_um):
 
 
 def run_scenario(name, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
-                 offset_um, waist_um, verbose=False):
+                 offset_um, waist_um, alpha_tear_permm=0.0, verbose=False):
+    """ATR-Sensor: Traenenfilm-Absorption daempft das totalreflektierte (gefuehrte)
+    Licht. Pro Mode: Confinement im Aqueous Gamma_m -> modaler Verlust
+    alpha_m = alpha_tear*Gamma_m -> ueberlebendes TIR-Licht P_surv (D3) = Sum
+    |a_m|^2 exp(-alpha_m L). Sensor-Signal = ATR-Daempfung (dB)."""
     core = T_LENS*1e6
     y, n = build_index_profile(t_lip, t_aq, t_mu, n_aq, dy_um)
+    dy = y[1] - y[0]
     neff, prof = solve_te_modes(y, n, lam_um)
     k0 = 2*np.pi/lam_um
     betas = neff*k0
-    # Einkopplung: VCSEL in Kernmitte + Offset
     a = couple(y, prof, core/2 + offset_um, waist_um)
-    # Detektoren: D1 Tear-seitig (25 um ueber Unterkante), D2 Luft-seitig (25 um unter Oberkante)
-    d1_y = 25.0
-    d2_y = core - 25.0
-    R, I1, I2, _ = sensor_R(y, prof, a, betas, L_um, d1_y, d2_y)
-    eta = float(np.sum(np.abs(a)**2))                 # in gefuehrte Moden gekoppelte Leistung
+    P = np.abs(a)**2
+    eta = float(P.sum())
+    # --- ATR: modaler Verlust durch Absorption im Aqueous (Traenenfilm-Analyt) ---
+    aq_mask = (y <= -t_lip) & (y > -(t_lip + t_aq))    # Aqueous-Schicht unter dem Kern
+    Gamma = (prof[aq_mask, :]**2).sum(axis=0)*dy        # Leistungs-Confinement je Mode
+    alpha_um = (alpha_tear_permm/1000.0)*Gamma          # modaler Verlust (1/um)
+    P_surv = float(np.sum(P*np.exp(-alpha_um*L_um)))     # ueberlebendes TIR-Licht -> D3
+    ATR_dB = -10*np.log10(max(P_surv/max(eta, 1e-30), 1e-30))
+    Gamma_eff = float(np.sum(P*Gamma)/max(eta, 1e-30))   # gewichtetes Aqueous-Confinement
+    # --- DIREKTE Bestimmung des evaneszenten Feldes im Traenenfilm ---
+    R, _, _, E = sensor_R(y, prof, a, betas, L_um, 25.0, core - 25.0)
+    Ie = np.abs(E)**2
+    i_surf = int(np.argmin(np.abs(y)))                   # Kern-Unterkante y=0
+    I_surf = float(Ie[i_surf])                            # evan. Intensitaet an der Oberflaeche
+    I_evan_aq = float(Ie[aq_mask].sum()*dy)              # integriertes evan. Feld im Aqueous
+    I_core = float(Ie[(y >= 0) & (y <= core)].sum()*dy)   # Kern-Leistung (Referenz)
+    evan_ratio = I_evan_aq/max(I_core, 1e-30)            # direkter evan. Anteil (Tear/Kern)
+    # Eindringtiefe delta aus |E| direkt unter der Oberflaeche (im Aqueous)
+    below = (y < -t_lip) & (y > -(t_lip + min(t_aq, 1.0)))
+    if below.sum() >= 4:
+        g = np.polyfit(-y[below], np.log(np.maximum(np.abs(E[below]), 1e-30)), 1)[0]
+        delta_um = 1.0/abs(g) if g else float('nan')
+    else:
+        delta_um = float('nan')
     if verbose:
-        print(f'  Moden: {len(neff)}  n_eff [{neff.min():.4f}..{neff.max():.4f}]  '
-              f'Kopplung in gefuehrt eta={eta:.3f}')
+        print(f'  Moden {len(neff)}  eta={eta:.3f}  Gamma_aq={Gamma_eff:.3e}  '
+              f'evan_ratio={evan_ratio:.3e}  delta={delta_um:.3f}um')
     return dict(name=name, n_modes=len(neff), neff_max=float(neff.max()),
-                neff_min=float(neff.min()), eta=eta, R_tear=float(R),
-                I1=float(I1), I2=float(I2))
+                eta=eta, R_tear=float(R), Gamma_aq=Gamma_eff, ATR_dB=float(ATR_dB),
+                P_surv=P_surv, evan_ratio=evan_ratio, I_surf=I_surf,
+                I_evan_aq=I_evan_aq, delta_um=float(delta_um))
 
 
 def main():
@@ -124,6 +148,9 @@ def main():
                     help='Propagationslaenge Rand->Detektor in mm (Default aus Geometrie)')
     ap.add_argument('--offset-um', type=float, default=0.0, help='VCSEL-y-Offset (0=Kernmitte)')
     ap.add_argument('--waist-um', type=float, default=2.0, help='VCSEL-Taille (um)')
+    ap.add_argument('--alpha-tear-permm', type=float, default=10.0,
+                    help='Absorptions-/Streukoeff. des Traenenfilm-Analyten (1/mm) fuer die '
+                         'ATR-Daempfung. Relative Szenario-Unterschiede sind ~alpha-unabhaengig.')
     args = ap.parse_args()
 
     lam_um = args.lambda_nm/1000.0
@@ -136,20 +163,24 @@ def main():
           f'offset={args.offset_um:g}um')
     print('  (brute-force-Stitching bleibt erhalten: sliding_window_fdtd.py / full_domain_fdtd.py)')
 
+    print(f'  ATR: Traenenfilm-Absorption alpha={args.alpha_tear_permm:g}/mm '
+          f'(-> D3 = ueberlebendes TIR-Licht; Signal = ATR-Daempfung)')
     scen = _scenarios_dict()
     names = [args.scenario] if args.scenario else list(scen.keys())
-    print(f'\n{"Szenario":<15} {"Moden":>6} {"n_eff_max":>10} {"eta_kopp":>9} {"R_tear":>10}')
-    print('-'*54)
+    print(f'\n{"Szenario":<14} {"evan_ratio":>11} {"delta[um]":>10} {"ATR[dB]":>9} '
+          f'{"evan-Signal":>12}')
+    print('  (evan_ratio = DIREKT bestimmtes evan. Feld Tear/Kern; ATR = messbare Daempfung)')
+    print('-'*60)
     base = None
     for nm in names:
         t_lip, t_aq, t_mu, n_aq = scen[nm]
         r = run_scenario(nm, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
-                         args.offset_um, args.waist_um)
+                         args.offset_um, args.waist_um, args.alpha_tear_permm)
         if base is None:
-            base = r['R_tear']
-        dR = 100*(r['R_tear'] - base)/max(base, 1e-30)
-        print(f'{nm:<15} {r["n_modes"]:>6} {r["neff_max"]:>10.4f} {r["eta"]:>9.3f} '
-              f'{r["R_tear"]:>10.4e}  ({dR:+.1f}% vs {names[0]})')
+            base = r['evan_ratio']
+        dE = 100*(r['evan_ratio'] - base)/max(abs(base), 1e-30)
+        print(f'{nm:<14} {r["evan_ratio"]:>11.4e} {r["delta_um"]:>10.3f} '
+              f'{r["ATR_dB"]:>9.4f} {dE:>+10.1f}%')
 
 
 if __name__ == '__main__':
