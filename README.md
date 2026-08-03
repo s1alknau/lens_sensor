@@ -216,6 +216,15 @@ python tests/benchmark_engines.py mpb
 python tests/benchmark_engines.py report
 ```
 
+## Documentation
+
+- [`docs/sensor_model.md`](docs/sensor_model.md) — contact-lens sensor: principle
+  (TIR guiding, evanescent/ATR sensing, D1/D2/D3 detectors), physics, the two
+  compute paths (brute-force FDTD vs native mode propagation
+  `kontaktlinse/mode_propagation.py`), coordinates/coupling, feasibility limits,
+  and CLI usage.
+- [`docs/meep_setup_wsl.md`](docs/meep_setup_wsl.md) — Meep in WSL (MPI build, run).
+
 ## Notes
 
 - **Result files** (`results/`, `*.npz`, `*.npy`, `*.gif`, …) are excluded via
