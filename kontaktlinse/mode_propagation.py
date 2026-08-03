@@ -83,6 +83,71 @@ def couple(y, profiles, y0_um, waist_um):
     return a
 
 
+def project_field(y, profiles, y_src, E_src):
+    """Projiziert ein (FDTD-)Feld E_src(y_src) auf die Moden -> Amplituden a_m
+    (a_m = <phi_m|E>, phi reell). y_src/E_src werden auf das Modengitter interpoliert."""
+    E = (np.interp(y, y_src, np.real(E_src), left=0.0, right=0.0)
+         + 1j*np.interp(y, y_src, np.imag(E_src), left=0.0, right=0.0))
+    dy = y[1] - y[0]
+    return (profiles*E[:, None]).sum(axis=0)*dy
+
+
+def fdtd_coupling_field(lam_nm, offset_um, waist_um, dx_nm=50.0, length_um=30.0):
+    """Lokales FDTD am Rand: VCSEL koppelt in den 250-um-Kern; Rueckgabe des
+    komplexen CW-Feldes an einem Querschnitt NACH der Einkoppelzone (y so, dass
+    Kern=[0,core]). Das ersetzt den analytischen Gauss-Overlap durch die reale
+    Einkopplungs-Physik (Fresnel, Nahfeld) -> realistische Moden-Verteilung."""
+    import os
+    import sys
+    import tempfile
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    p = os.path.join(root, 'planar_beads')
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    import fdtd2d_core as f2d
+    core = T_LENS*1e6
+    prev = os.getcwd(); tmp = tempfile.mkdtemp()
+    try:
+        os.chdir(tmp)
+        r = f2d.run_beads(wg_mat='pmma', bead_mat='polystyrol', bead_d_um=0.0,
+                          dx_nm=dx_nm, save_frames=True, n_snapshots=8,
+                          wg_thickness_um=core, lambda_nm=lam_nm, vcsel_waist=waist_um,
+                          vcsel_offset=offset_um, method='full', place_bead=False,
+                          length_um=length_um, polarization='s',
+                          t_aqueous_um=8.0, t_mucin_um=2.0)
+        cwm = r['cw_frames_memmap']; cwf = r['cw_frames'] or []
+        arr = np.asarray(np.load(cwm, mmap_mode='r')[:len(cwf)])
+    finally:
+        os.chdir(prev)
+    nfr, Nx, Ny = arr.shape
+    E = arr[0].astype(np.float64) - 1j*arr[nfr//4 or 1].astype(np.float64)
+    tear = f2d.TEAR_BUFFER*1e6
+    y_src = -tear + np.arange(Ny)*(dx_nm/1000.0)
+    return y_src, E[int(0.6*Nx), :]        # Querschnitt in der eingeschwungenen Zone
+
+
+def validate_solver(lam_um, dy_um=0.005):
+    """Eigenloeser gegen analytische asymm. Slab-Formel (crossval) an einem DUENNEN
+    (few-mode) Slab, wo n_eff eindeutig unter n_core liegt."""
+    import os
+    import sys
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for pp in (os.path.join(root, 'tests'), root):
+        if pp not in sys.path:
+            sys.path.insert(0, pp)
+    import crossval as cv
+    d = 5.0
+    y, n = build_index_profile(0.0, 8.0, 2.0, 1.336, dy_um, core_um=d,
+                               air_um=6.0, cornea_um=6.0)
+    neff, _ = solve_te_modes(y, n, lam_um)
+    n_num = float(neff.max())
+    n_ana = cv.slab_neff_analytic(N_PMMA, N_AIR, 1.336, d, lam_um*1000, 's', 0)
+    dd = abs(n_num - n_ana)
+    print(f'[Validierung] duenner Slab d={d:g}um: Eigenloeser n_eff={n_num:.5f}  '
+          f'analytisch={n_ana:.5f}  Delta={dd:.2e}  -> {"OK" if dd < 2e-3 else "PRUEFEN"}')
+    return dd
+
+
 def sensor_R(y, profiles, a, betas_um, L_um, d1_y_um, d2_y_um):
     """Feld nach Propagation um L, R_tear = |E(D1)|^2/|E(D2)|^2 (D1 Tear-, D2 Luft-seitig)."""
     E = (profiles*(a*np.exp(1j*betas_um*L_um))[None, :]).sum(axis=1)
@@ -93,7 +158,7 @@ def sensor_R(y, profiles, a, betas_um, L_um, d1_y_um, d2_y_um):
 
 
 def run_scenario(name, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
-                 offset_um, waist_um, alpha_tear_permm=0.0, verbose=False):
+                 offset_um, waist_um, alpha_tear_permm=0.0, coupling=None, verbose=False):
     """ATR-Sensor: Traenenfilm-Absorption daempft das totalreflektierte (gefuehrte)
     Licht. Pro Mode: Confinement im Aqueous Gamma_m -> modaler Verlust
     alpha_m = alpha_tear*Gamma_m -> ueberlebendes TIR-Licht P_surv (D3) = Sum
@@ -104,7 +169,11 @@ def run_scenario(name, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
     neff, prof = solve_te_modes(y, n, lam_um)
     k0 = 2*np.pi/lam_um
     betas = neff*k0
-    a = couple(y, prof, core/2 + offset_um, waist_um)
+    if coupling is not None:                              # reale FDTD-Einkopplung -> Projektion
+        a = project_field(y, prof, coupling[0], coupling[1])
+        a = a/np.sqrt(max(np.sum(np.abs(a)**2), 1e-30))  # auf Einheitsleistung normiert
+    else:                                                 # analytischer Gauss-Overlap
+        a = couple(y, prof, core/2 + offset_um, waist_um)
     P = np.abs(a)**2
     eta = float(P.sum())
     # --- ATR: modaler Verlust durch Absorption im Aqueous (Traenenfilm-Analyt) ---
@@ -151,10 +220,19 @@ def main():
     ap.add_argument('--alpha-tear-permm', type=float, default=10.0,
                     help='Absorptions-/Streukoeff. des Traenenfilm-Analyten (1/mm) fuer die '
                          'ATR-Daempfung. Relative Szenario-Unterschiede sind ~alpha-unabhaengig.')
+    ap.add_argument('--couple', choices=('analytic', 'fdtd'), default='analytic',
+                    help='analytic = Gauss-Overlap; fdtd = lokales FDTD am Rand -> Moden-Projektion')
+    ap.add_argument('--validate', action='store_true',
+                    help='Eigenloeser gegen analytische Slab-Formel pruefen und beenden')
+    ap.add_argument('--offset-scan', default='',
+                    help='Komma-Liste VCSEL-Offsets (um), z.B. "-120,-60,0" -> evan/ATR vs Offset (Gesund)')
     args = ap.parse_args()
 
     lam_um = args.lambda_nm/1000.0
     dy_um = args.dy_nm/1000.0
+    if args.validate:
+        validate_solver(lam_um, dy_um)
+        return
     # Bogenlaenge Rand (s=0) -> Detektor D1 (s=D1_S_CENTER): L = D_LENS/2 - x_d1, x_d1<0
     x_d1_mm = (D1_S_CENTER - D_LENS/2)*1e3
     L_um = (args.L_mm*1000.0) if args.L_mm is not None else (D_LENS/2*1e6 - x_d1_mm*1e3)
@@ -164,8 +242,29 @@ def main():
     print('  (brute-force-Stitching bleibt erhalten: sliding_window_fdtd.py / full_domain_fdtd.py)')
 
     print(f'  ATR: Traenenfilm-Absorption alpha={args.alpha_tear_permm:g}/mm '
-          f'(-> D3 = ueberlebendes TIR-Licht; Signal = ATR-Daempfung)')
+          f'(-> D3 = ueberlebendes TIR-Licht; Signal = ATR-Daempfung)  Kopplung={args.couple}')
     scen = _scenarios_dict()
+
+    # (C) Offset-Studie: Kopplungs-Abhaengigkeit des Signals (Gesund)
+    if args.offset_scan.strip():
+        offs = [float(s) for s in args.offset_scan.split(',')]
+        t_lip, t_aq, t_mu, n_aq = scen.get('Gesund', list(scen.values())[0])
+        print(f'\nOffset-Studie (Gesund):')
+        print(f'{"offset[um]":>11} {"evan_ratio":>11} {"delta[um]":>10} {"ATR[dB]":>9}')
+        print('-'*44)
+        for off in offs:
+            cf = fdtd_coupling_field(args.lambda_nm, off, args.waist_um) if args.couple == 'fdtd' else None
+            r = run_scenario('Gesund', t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
+                             off, args.waist_um, args.alpha_tear_permm, coupling=cf)
+            print(f'{off:>11.0f} {r["evan_ratio"]:>11.4e} {r["delta_um"]:>10.3f} {r["ATR_dB"]:>9.4f}')
+        return
+
+    # (B) FDTD-Kopplung: Einkoppelfeld EINMAL am Rand rechnen, auf alle Szenarien projizieren
+    coupling = None
+    if args.couple == 'fdtd':
+        print('  [FDTD-Kopplung] lokaler Rand-Lauf (VCSEL Butt-Coupling) ...', flush=True)
+        coupling = fdtd_coupling_field(args.lambda_nm, args.offset_um, args.waist_um)
+
     names = [args.scenario] if args.scenario else list(scen.keys())
     print(f'\n{"Szenario":<14} {"evan_ratio":>11} {"delta[um]":>10} {"ATR[dB]":>9} '
           f'{"evan-Signal":>12}')
@@ -175,7 +274,7 @@ def main():
     for nm in names:
         t_lip, t_aq, t_mu, n_aq = scen[nm]
         r = run_scenario(nm, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
-                         args.offset_um, args.waist_um, args.alpha_tear_permm)
+                         args.offset_um, args.waist_um, args.alpha_tear_permm, coupling=coupling)
         if base is None:
             base = r['evan_ratio']
         dE = 100*(r['evan_ratio'] - base)/max(abs(base), 1e-30)
