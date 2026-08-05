@@ -72,9 +72,16 @@ def estimate_vram_gb(Nx, Ny, n_arrays=5):
 
 
 def build_flat_materials(Nx, Ny, dx, y_offset_um, layers, n_aqueous,
-                          n_pmma, n_lipid, n_mucin, n_cornea, t_lens_m):
+                          n_pmma, n_lipid, n_mucin, n_cornea, t_lens_m,
+                          curved=False):
     """Flattened material map: lens bei y_rel ∈ [-T/2, +T/2], Tear darunter, Air drueber.
     y_offset_um: y_rel bei iy=0 (in um)
+
+    curved=True: echte Kruemmung via KONFORMER ABBILDUNG des gebogenen Wellenleiters
+    auf einen geraden mit aequivalentem Index n_eq(u) = n(u)*(1 + u/R). u = y_rel ist
+    der radiale Versatz von der Linsenmitte (Radius R_BEND); u>0 = aussen (Luftseite,
+    groesserer Radius). eps_eq = eps*(1 + y_rel/R)^2. Erfasst Modenversatz nach aussen
+    + Biegeverlust (1. Ordnung) - ohne Sliding-Window (ganze Linse in einem Lauf).
     """
     eps_r = np.ones((Nx, Ny), dtype=np.float32)
     sig = np.zeros((Nx, Ny), dtype=np.float32)
@@ -99,6 +106,10 @@ def build_flat_materials(Nx, Ny, dx, y_offset_um, layers, n_aqueous,
     eps_r[:, mask_aq] = n_aqueous**2
     eps_r[:, mask_mu] = n_mucin**2
     eps_r[:, mask_cornea] = n_cornea**2
+    if curved:
+        # konforme Abbildung: eps_eq = eps * (1 + y_rel/R)^2  (R = R_BEND, y_rel in um)
+        metric = (1.0 + y_um_arr/(R_BEND*1e6)).astype(np.float32)**2
+        eps_r = eps_r*metric[None, :]
     return eps_r, sig
 
 
@@ -106,7 +117,7 @@ def run_full_domain_lens(scenario_name, dx_nm=300, window_h_um=600.0,
                          save_frames=True, n_frames=20, save_stride=4,
                          vcsel_waist=2e-6, vcsel_tilt=0.0,
                          vcsel_mode='single', vcsel_offset=0.0,
-                         source_type='cw'):
+                         source_type='cw', curved=False):
     t_total = time.time()
     layers = SCENARIOS[scenario_name]
     print(f'\n========== Full-Domain-FDTD (Flattened): {scenario_name} ==========')
@@ -131,7 +142,7 @@ def run_full_domain_lens(scenario_name, dx_nm=300, window_h_um=600.0,
     t_mat = time.time()
     eps_r_np, sig_np = build_flat_materials(
         Nx, Ny, dx, y_offset_um, layers, layers[3],
-        N_PMMA, N_LIPID, N_MUCIN, N_CORNEA, T_LENS)
+        N_PMMA, N_LIPID, N_MUCIN, N_CORNEA, T_LENS, curved=curved)
     # Austritts-Facet: Linse->Luft am linken Rand (Fresnel-Reflex), Mur dahinter
     _ig = int(round(40e-6/dx))
     if 0 < _ig < Nx:
@@ -379,6 +390,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--scenario', default='Gesund')
     ap.add_argument('--gpu', action='store_true')
+    ap.add_argument('--curved', action='store_true',
+                    help='echte Kruemmung via konformer Abbildung (eps*(1+y_rel/R)^2); '
+                         'ohne Flag: flattened (Kruemmung vernachlaessigt)')
     ap.add_argument('--resolution', type=float, default=300)
     ap.add_argument('--window-h', type=float, default=600.0)
     ap.add_argument('--lambda-nm', type=float, default=850.0)
@@ -467,7 +481,7 @@ def main():
         vcsel_waist=args.vcsel_waist*1e-6,
         vcsel_tilt=args.vcsel_tilt,
         vcsel_offset=args.vcsel_offset*1e-6,
-        source_type=args.source_type)
+        source_type=args.source_type, curved=args.curved)
     result['material_names'] = [args.name_lens, args.name_lipid,
                                  args.name_aqueous, args.name_mucin,
                                  args.name_cornea]
