@@ -58,7 +58,7 @@ X_OUT_UM = 900.0
 def build_materials(Nx, Ny, dx, wg_n, bead_n, wg_top, bead_x_um, bead_d_um, x_start_um=0.0, place_bead=True,
                     n_aq=N_AQ, n_mucin=N_MUCIN, n_cornea=N_CORNEA, t_aq_um=None,
                     t_mu_um=None, t_lip_um=0.0, n_lip=N_LIPID, input_gap_um=0.0,
-                    length_um=None, bead_y_um=None):
+                    length_um=None, bead_y_um=None, curved=False, r_bend_m=8.3e-3):
     """Flache Schichten. AQUEOUS grenzt an den WG (y=0), feste Dicke (t_aq_um).
     Optional Lipidschicht (t_lip_um) direkt unter dem WG; freie Mucin-Dicke
     (t_mu_um). Bead liegt in der Aqueous (Default Oberkante an y=0). Optionaler
@@ -112,6 +112,13 @@ def build_materials(Nx, Ny, dx, wg_n, bead_n, wg_top, bead_x_um, bead_d_um, x_st
                 dy = np.sqrt(max(0.0, r*r - dxx*dxx))
                 mask = (ys >= yc - dy) & (ys <= yc + dy)
                 eps[i, mask] = bead_n**2
+    if curved:
+        # Echte Kruemmung der Kontaktlinse via KONFORMER ABBILDUNG des gebogenen
+        # Wellenleiters auf einen geraden: n_eq = n*(1 + u/R), u = y - Kernmitte
+        # (Radius R_BEND); u>0 = aussen (Luftseite). eps_eq = eps*(1 + u/R)^2.
+        u = ys - wg_top/2.0                          # radialer Versatz von der Kernmitte (m)
+        metric = (1.0 + u/r_bend_m).astype(np.float32)**2
+        eps = eps*metric[None, :]
     return xp.asarray(eps), xp.asarray(sig)
 
 
@@ -171,7 +178,7 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
               window_w_um=350.0, slide_um=150.0, place_bead=True, t_aqueous_um=None,
               t_mucin_um=None, t_lipid_um=0.0, input_gap_um=0.0, length_um=None,
               bead_x_um=None, wg_n=None, bead_n=None, n_aqueous=None, n_mucin=None,
-              n_cornea=None, n_lipid=None, polarization='s'):
+              n_cornea=None, n_lipid=None, polarization='s', curved=False):
     if method == 'sliding':
         return run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapshots,
                                  wg_thickness_um, lambda_nm, vcsel_waist, vcsel_tilt,
@@ -180,7 +187,7 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
                                  input_gap_um=input_gap_um, length_um=length_um,
                                  bead_x_um=bead_x_um, wg_n=wg_n, bead_n=bead_n,
                                  n_aqueous=n_aqueous, n_mucin=n_mucin, n_cornea=n_cornea,
-                                 n_lipid=n_lipid, polarization=polarization)
+                                 n_lipid=n_lipid, polarization=polarization, curved=curved)
     if method == 'stitch':
         return run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapshots,
                                   wg_thickness_um, lambda_nm, vcsel_waist, vcsel_tilt,
@@ -189,7 +196,7 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
                                   input_gap_um=input_gap_um, length_um=length_um,
                                   bead_x_um=bead_x_um, wg_n=wg_n, bead_n=bead_n,
                                   n_aqueous=n_aqueous, n_mucin=n_mucin, n_cornea=n_cornea,
-                                  n_lipid=n_lipid, polarization=polarization)
+                                  n_lipid=n_lipid, polarization=polarization, curved=curved)
     _pol = 'p' if str(polarization).lower() in ('p', 'tm') else 's'
     t_aq_um = t_aqueous_um if t_aqueous_um is not None else T_AQ*1e6   # feste Aqueous-Dicke
     t_total = time.time()
@@ -216,7 +223,7 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
     eps_r, sig = build_materials(Nx, Ny, dx, wg_n, bead_n, T_WG, bx_um, bead_d_um, 0.0, place_bead,
                                  n_aq=n_aq_l, n_mucin=n_mu_l, n_cornea=n_co_l, t_aq_um=t_aq_um,
                                  t_mu_um=t_mucin_um, t_lip_um=t_lipid_um, n_lip=n_lip_l,
-                                 input_gap_um=input_gap_um, length_um=length_um)
+                                 input_gap_um=input_gap_um, length_um=length_um, curved=curved)
     Ce_E, Ce_H = _coeffs(eps_r, sig, dt, dx)
     if _pol == 'p':                                  # TM-Koeffizienten aus eps_r
         Ca_ex, Ca_ey, Ch_tm = _tm_coeffs(eps_r, dt, dx)
@@ -357,7 +364,7 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
                       t_aqueous_um=None, t_mucin_um=None, t_lipid_um=0.0, input_gap_um=0.0,
                       length_um=None, bead_x_um=None, wg_n=None, bead_n=None,
                       n_aqueous=None, n_mucin=None, n_cornea=None, n_lipid=None,
-                      polarization='s'):
+                      polarization='s', curved=False):
     _pol = 'p' if str(polarization).lower() in ('p', 'tm') else 's'
     t_total = time.time()
     t_aq_um = t_aqueous_um if t_aqueous_um is not None else T_AQ*1e6   # feste Aqueous-Dicke
@@ -415,7 +422,7 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
         eps_r, sig = build_materials(Nx, Ny, dx, wg_n, bead_n, T_WG, bx_um, bead_d_um, x_start_um, place_bead,
                                      n_aq=n_aq_l, n_mucin=n_mu_l, n_cornea=n_co_l, t_aq_um=t_aq_um,
                                      t_mu_um=t_mucin_um, t_lip_um=t_lipid_um, n_lip=n_lip_l,
-                                     input_gap_um=input_gap_um, length_um=length_um)
+                                     input_gap_um=input_gap_um, length_um=length_um, curved=curved)
         Ce_E, Ce_H = _coeffs(eps_r, sig, dt, dx)
         if _pol == 'p':
             Ca_ex, Ca_ey, Ch_tm = _tm_coeffs(eps_r, dt, dx)
@@ -512,7 +519,7 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                        t_aqueous_um=None, t_mucin_um=None, t_lipid_um=0.0, input_gap_um=0.0,
                        length_um=None, bead_x_um=None, wg_n=None, bead_n=None,
                        n_aqueous=None, n_mucin=None, n_cornea=None, n_lipid=None,
-                       polarization='s'):
+                       polarization='s', curved=False):
     """Voller gefuellter CW-Waveguide per GEBIETS-ZERLEGUNG (Hard-Overlap-Handoff).
     Jedes Fenster wird bis zum Steady-State gerechnet; im Ueberlappbereich wird das
     zeitharmonische Feld (komplexe Amplitude, DFT bei f0) des Vorgaengers hart
@@ -578,7 +585,7 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                                      x_start_um, place_bead, n_aq=n_aq_l, n_mucin=n_mu_l,
                                      n_cornea=n_co_l, t_aq_um=t_aq_um, t_mu_um=t_mucin_um,
                                      t_lip_um=t_lipid_um, n_lip=n_lip_l,
-                                     input_gap_um=input_gap_um, length_um=length_um)
+                                     input_gap_um=input_gap_um, length_um=length_um, curved=curved)
         Ce_E, Ce_H = _coeffs(eps_r, sig, dt, dx)
         if _pol == 'p':
             Ca_ex, Ca_ey, Ch_tm = _tm_coeffs(eps_r, dt, dx)

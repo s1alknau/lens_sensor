@@ -147,7 +147,8 @@ def _run_2d(args, layers):
         bead_x_um=args.bead_x, wg_n=layers['wg_n'], bead_n=args.bead_n,
         n_aqueous=layers['n_aq'], n_mucin=layers['n_mu'],
         n_cornea=layers['n_co'], n_lipid=layers['n_lip'],
-        polarization=args.polarization)
+        polarization=args.polarization,
+        curved=(args.curved and args.geometry == 'lens'))
     if not args.no_save:
         d2.save_results(result, out_dir=os.path.join(_REPO_ROOT, 'results'))
     return result
@@ -287,6 +288,9 @@ def build_parser():
                         default='full', help='full | sliding (nur 2D) | stitch')
     g_case.add_argument('--scenario', default='Gesund', choices=list(LENS_SCENARIOS),
                         help='Trockenauge-Szenario (nur --geometry lens)')
+    g_case.add_argument('--curved', action='store_true',
+                        help='(nur lens, 2D) ECHTE Kruemmung via konformer Abbildung '
+                             'eps*(1+u/R)^2 statt flattened. Wirkt in TE UND TM.')
 
     g_basic = ap.add_argument_group('Grundeinstellungen')
     g_basic.add_argument('--length-um', type=float, default=None,
