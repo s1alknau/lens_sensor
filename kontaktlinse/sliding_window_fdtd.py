@@ -295,32 +295,44 @@ def run_sliding_fdtd(scenario_name, dx_nm=250.0, window_w_um=1000,
         ez_mm = np.lib.format.open_memmap(mm_path, mode='w+', dtype=np.float32,
                                           shape=(max(1, n_slides*N_INTRA_FRAMES + 2), _sx, _sy))
 
+    y_start_prev = None
+    dxu_shift = dx_nm/1000.0
     for slide_i in range(n_slides):
         x_end_global_um = x_vcsel_global_um + 50 - slide_i*slide_um
         x_start_global_um = x_end_global_um - window_w_um
         x_center_global_um = (x_start_global_um + x_end_global_um)/2
         if abs(x_center_global_um*1e-6) > R_BEND - 1e-6:
             break
-
-        # === Co-Moving Field-Shift ===
-        # Vor Slide n+1: schiebe Ez/Hx/Hy um N_shift in +ix, damit Welle bei
-        # ihrer globalen Lab-Position bleibt. Eingangsrand mit 0 fuellen.
-        if slide_i > 0 and N_shift > 0 and N_shift < Nx:
-            Ez = xp.roll(Ez, N_shift, axis=0)
-            Ez[:N_shift, :] = 0
-            Hx = xp.roll(Hx, N_shift, axis=0)
-            Hx[:N_shift, :] = 0
-            Hy = xp.roll(Hy, N_shift, axis=0)
-            Hy[:min(N_shift, Hy.shape[0]), :] = 0
-        elif slide_i > 0 and N_shift >= Nx:
-            # Kein Ueberlapp -> Felder werden komplett geloescht (alte Logik)
-            Ez[:] = 0
-            Hx[:] = 0
-            Hy[:] = 0
+        # y-Zentrum folgt der Kruemmung - VOR dem Shift berechnen (fuer y-Tracking)
         sag_c = R_BEND - np.sqrt(R_BEND**2 - (x_center_global_um*1e-6)**2)
         y_center_global_um = -sag_c*1e6
         y_start_global_um = y_center_global_um - window_h_um/2
         y_end_global_um = y_center_global_um + window_h_um/2
+
+        # === Co-Moving Field-Shift (x UND y) ===
+        # Das Fenster folgt der gekruemmten Linse in BEIDEN Achsen. Frueher wurde
+        # das Feld nur in x gerollt; die y-Wanderung des Fensters (Kruemmung!) fehlte
+        # -> der gefuehrte Strahl fiel aus dem Linsenband -> Amplituden-Kollaps.
+        if slide_i > 0 and N_shift > 0 and N_shift < Nx:
+            Ez = xp.roll(Ez, N_shift, axis=0); Ez[:N_shift, :] = 0
+            Hx = xp.roll(Hx, N_shift, axis=0); Hx[:N_shift, :] = 0
+            Hy = xp.roll(Hy, N_shift, axis=0); Hy[:min(N_shift, Hy.shape[0]), :] = 0
+            diy = int(round((y_start_prev - y_start_global_um)/dxu_shift)) if y_start_prev is not None else 0
+            if diy != 0:                                   # Fenster-Mitte in y verschoben -> Feld mitrollen
+                Ez = xp.roll(Ez, diy, axis=1)
+                Hx = xp.roll(Hx, diy, axis=1)
+                Hy = xp.roll(Hy, diy, axis=1)
+                if diy > 0:
+                    Ez[:, :diy] = 0
+                    Hx[:, :min(diy, Hx.shape[1])] = 0
+                    Hy[:, :min(diy, Hy.shape[1])] = 0
+                else:
+                    Ez[:, diy:] = 0
+                    Hx[:, diy:] = 0
+                    Hy[:, diy:] = 0
+        elif slide_i > 0 and N_shift >= Nx:
+            Ez[:] = 0; Hx[:] = 0; Hy[:] = 0
+        y_start_prev = y_start_global_um
 
         print(f'\n[Slide {slide_i+1}/{n_slides}]  '
               f'x=[{x_start_global_um:.0f}, {x_end_global_um:.0f}] um  '
@@ -338,29 +350,37 @@ def run_sliding_fdtd(scenario_name, dx_nm=250.0, window_w_um=1000,
         Ch = xp.float32(dt/(MU0*dx))
 
         src_active = (slide_i == 0)
+        f0 = C0/LAM
+        sigma_t = 4/(2*np.pi*f0)
         if src_active:
-            x_apex = D_LENS*1e6/2
-            slope_apex = -x_apex*1e-6/np.sqrt(R_BEND**2 - (x_apex*1e-6)**2)
-            theta_apex = np.arctan(slope_apex)
-            ct_a, st_a = np.cos(theta_apex), np.sin(theta_apex)
-            x_src_global_um = x_apex - 5*ct_a
-            src_ix_local = int(round((x_src_global_um - x_start_global_um)*1e-6/dx))
-            src_ix_local = max(5, min(Nx - 5, src_ix_local))
-            y_lens_mid_local_um = y_vcsel_global_um - y_start_global_um + vcsel_offset
-            iy_lens_mid = int(round(y_lens_mid_local_um/(dx_nm/1000)))
-            waist_pixels = max(2, int(round(vcsel_waist*1e-6/dx)))
-            ys_local = xp.arange(Ny, dtype=xp.float32)
-            src_p = xp.exp(-((ys_local - iy_lens_mid)/waist_pixels)**2)
-            src_p *= np.sqrt(1 - 0.162)   # Fresnel @ PMMA/GaAs
-            # Tilt: y-abhaengige Phase
-            tilt_rad = np.radians(vcsel_tilt)
-            f0 = C0/LAM
-            sigma_t = 4/(2*np.pi*f0)
-            k0 = 2*np.pi/LAM
-            y_pix_offset_m = (ys_local - iy_lens_mid)*dx
-            phase_y = float(np.sin(tilt_rad))*k0*y_pix_offset_m
-            print(f'  Source: waist={vcsel_waist}um mode={vcsel_mode} '
-                  f'tilt={vcsel_tilt}deg offset={vcsel_offset}um type={source_type}')
+            # TANGENTIAL orientierte Quelle: Injektion IN-PHASE auf der zur Linse
+            # ORTHOGONALEN Flaeche (senkrecht zur lokalen Tangente) -> die Wellenfront
+            # laeuft entlang der Tangente in den gekruemmten Kern. Ersetzt die alte
+            # vertikale Spalte, die am ~57deg-geneigten Rand fehlangepasst war (Kollaps).
+            dxu = dx_nm/1000.0
+            x_rim = D_LENS*1e6/2
+            slope = -x_rim*1e-6/np.sqrt(R_BEND**2 - (x_rim*1e-6)**2)
+            theta = np.arctan(slope)                         # Tangentenwinkel am Rand
+            ct, st = np.cos(theta), np.sin(theta)
+            x_src = x_rim - 6*ct                             # knapp innerhalb der Stirnflaeche
+            y_mid_src = -(R_BEND - np.sqrt(R_BEND**2 - (x_src*1e-6)**2))*1e6
+            fdx, fdy = -st, ct                              # Flaechenrichtung (normal zur Tangente)
+            core_um = T_LENS*1e6
+            nface = max(8, int(round(1.6*core_um/dxu)))
+            vspan = np.linspace(-0.8*core_um, 0.8*core_um, nface)   # quer ueber die Dicke (um)
+            amp_face = np.exp(-((vspan - vcsel_offset)/vcsel_waist)**2)*np.sqrt(1 - 0.162)
+            ixf = np.round((x_src + vspan*fdx - x_start_global_um)/dxu).astype(int)
+            iyf = np.round((y_mid_src + vspan*fdy - y_start_global_um)/dxu).astype(int)
+            ok = (ixf >= 1) & (ixf < Nx - 1) & (iyf >= 1) & (iyf < Ny - 1)
+            ixf, iyf, amp_face = ixf[ok], iyf[ok], amp_face[ok]
+            flat = ixf*Ny + iyf                            # doppelte Zellen zusammenfassen
+            uflat, inv = np.unique(flat, return_inverse=True)
+            amp_u = np.zeros(len(uflat), dtype=np.float32); np.add.at(amp_u, inv, amp_face)
+            src_ix = to_xp((uflat // Ny).astype(np.int64))
+            src_iy = to_xp((uflat % Ny).astype(np.int64))
+            src_amp = to_xp(amp_u)
+            print(f'  Source: TANGENTIAL theta={np.degrees(theta):.0f}deg waist={vcsel_waist}um '
+                  f'offset={vcsel_offset}um {len(uflat)} Flaechenzellen type={source_type}')
 
         mur = xp.float32((C0*dt - dx)/(C0*dt + dx))
 
@@ -395,13 +415,8 @@ def run_sliding_fdtd(scenario_name, dx_nm=250.0, window_w_um=1000,
                     envelope = float(np.exp(-((t_phys - t_center)/sigma_p)**2))
                 else:  # cw
                     envelope = float(1 - np.exp(-((t_phys/(2*sigma_t))**2)))
-                omega_t = -2*np.pi*f0*t_phys
-                if vcsel_tilt != 0.0:
-                    src_wave = xp.sin(omega_t + phase_y)
-                    Ez[src_ix_local, :] += envelope * src_wave * src_p
-                else:
-                    amp = envelope * float(np.sin(omega_t))
-                    Ez[src_ix_local, :] += amp * src_p
+                amp = envelope * float(np.sin(-2*np.pi*f0*t_phys))
+                Ez[src_ix, src_iy] += amp * src_amp        # in-Phase auf der orthogonalen Flaeche
             # Mur 1. Ordnung mit Ez^n der Innen-Nachbarn (ex1/ey1, vor E-Update
             # kopiert) - frueher wurde ein um 1 Step veralteter Wert benutzt.
             Ez[0, :]  = ex1 + mur*(Ez[1, :]  - Ez[0, :])
@@ -790,9 +805,9 @@ def main():
     D3_S_CENTER = args.d3_position*1e-3
     # --d1-length steuert die TANGENTIALE Detektor-Laenge (L_2D), NICHT die Dicke!
     # (Frueher faelschlich D1_H=args.d1_length -> 500um dicke Detektoren weit ausserhalb
-    # der Linse. D1_H bleibt die Dicke = D1_DICKE.)
+    # der Linse.) D1_H bleibt die Detektor-DICKE = 50 um.
     L_DET_UM = args.d1_length
-    D1_H = D1_DICKE
+    D1_H = 50e-6
     D3_LEN = args.d3_length*1e-6
 
     if args.scenario == 'Custom':
