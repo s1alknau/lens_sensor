@@ -34,9 +34,15 @@ def _scenarios_dict():
 
 
 def build_index_profile(t_lip_um, t_aq_um, t_mu_um, n_aq, dy_um,
-                        core_um=None, air_um=8.0, cornea_um=15.0):
+                        core_um=None, air_um=8.0, cornea_um=15.0, r_bend_um=None):
     """n(y) des Schichtstapels. y=0 = Kern-UNTERKANTE; Kern nach oben [0, core].
-    Reihenfolge (wie im Solver): Cornea | Mucin | Aqueous | Lipid | KERN | Luft."""
+    Reihenfolge (wie im Solver): Cornea | Mucin | Aqueous | Lipid | KERN | Luft.
+
+    r_bend_um: Biegeradius (um). None/inf = gerader Guide. Sonst ECHTE Kruemmung
+    via konformer Abbildung des gebogenen Wellenleiters -> aequivalenter Index
+    n_eq(u) = n(u)*(1 + u/R), u = y - Kernmitte (u>0 = aussen/Luftseite, groesserer
+    Radius). Rigoros fuer einen Kreisbogen; erfasst Modenversatz nach aussen +
+    Biege-/Strahlungsverlust (via Kaustik). -> Bent-Mode-Solver."""
     core_um = core_um if core_um is not None else T_LENS*1e6
     below = t_lip_um + t_aq_um + t_mu_um + cornea_um   # unter dem Kern
     y_lo = -below
@@ -50,6 +56,9 @@ def build_index_profile(t_lip_um, t_aq_um, t_mu_um, n_aq, dy_um,
     n[y < -(t_lip_um + t_aq_um)] = N_MUCIN            # Mucin
     n[y < -(t_lip_um + t_aq_um + t_mu_um)] = N_CORNEA  # Cornea
     n[y >= core_um] = N_AIR                            # Luft ueber dem Kern
+    if r_bend_um is not None and np.isfinite(r_bend_um) and r_bend_um > 0:
+        u = y - core_um/2.0                            # radialer Versatz von der Kernmitte
+        n = n*(1.0 + u/r_bend_um)                      # konforme Abbildung (echte Kruemmung)
     return y, n
 
 
@@ -158,13 +167,14 @@ def sensor_R(y, profiles, a, betas_um, L_um, d1_y_um, d2_y_um):
 
 
 def run_scenario(name, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
-                 offset_um, waist_um, alpha_tear_permm=0.0, coupling=None, verbose=False):
-    """ATR-Sensor: Traenenfilm-Absorption daempft das totalreflektierte (gefuehrte)
-    Licht. Pro Mode: Confinement im Aqueous Gamma_m -> modaler Verlust
-    alpha_m = alpha_tear*Gamma_m -> ueberlebendes TIR-Licht P_surv (D3) = Sum
-    |a_m|^2 exp(-alpha_m L). Sensor-Signal = ATR-Daempfung (dB)."""
+                 offset_um, waist_um, alpha_tear_permm=0.0, coupling=None,
+                 r_bend_um=None, verbose=False):
+    """ATR-Sensor + (optional) echte Kruemmung. Traenenfilm-Absorption daempft das
+    totalreflektierte Licht (alpha_m = alpha_tear*Gamma_m -> ueberlebendes TIR-Licht).
+    r_bend_um: Biegeradius -> Bent-Mode via konformer Abbildung; zusaetzlich wird der
+    Biege-/Strahlungsverlust ueber die Strahlungs-Kaustik abgeschaetzt (-> Durchsatz)."""
     core = T_LENS*1e6
-    y, n = build_index_profile(t_lip, t_aq, t_mu, n_aq, dy_um)
+    y, n = build_index_profile(t_lip, t_aq, t_mu, n_aq, dy_um, r_bend_um=r_bend_um)
     dy = y[1] - y[0]
     neff, prof = solve_te_modes(y, n, lam_um)
     k0 = 2*np.pi/lam_um
@@ -198,19 +208,35 @@ def run_scenario(name, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
         delta_um = 1.0/abs(g) if g else float('nan')
     else:
         delta_um = float('nan')
+    # --- Biege-/Strahlungsverlust (nur gekruemmt): ueber die Strahlungs-Kaustik ---
+    neff_max = float(neff.max())
+    bend_loss_perum = 0.0; u_caustic_um = float('inf')
+    if r_bend_um is not None and np.isfinite(r_bend_um) and r_bend_um > 0:
+        n_out = N_AIR                                    # Strahlung nach aussen (Luftseite)
+        u_caustic_um = r_bend_um*(neff_max/n_out - 1.0)  # n_eq(u)=n_eff -> Kaustik
+        gam = k0*np.sqrt(max(neff_max**2 - n_out**2, 1e-9))   # evan. Abfall in Luft (1/um)
+        log_bend = -2.0*gam*max(u_caustic_um, 0.0)       # ln(alpha_bend/gam), Underflow-sicher
+        bend_loss_perum = float(gam*np.exp(log_bend)) if log_bend > -700 else 0.0
+    throughput_bend = float(np.exp(-bend_loss_perum*L_um))   # ueberlebt Biegung ueber L
     if verbose:
         print(f'  Moden {len(neff)}  eta={eta:.3f}  Gamma_aq={Gamma_eff:.3e}  '
-              f'evan_ratio={evan_ratio:.3e}  delta={delta_um:.3f}um')
-    return dict(name=name, n_modes=len(neff), neff_max=float(neff.max()),
+              f'evan_ratio={evan_ratio:.3e}  delta={delta_um:.3f}um  '
+              f'bend_loss={bend_loss_perum:.2e}/um  T_bend={throughput_bend:.3f}')
+    return dict(name=name, n_modes=len(neff), neff_max=neff_max,
                 eta=eta, R_tear=float(R), Gamma_aq=Gamma_eff, ATR_dB=float(ATR_dB),
                 P_surv=P_surv, evan_ratio=evan_ratio, I_surf=I_surf,
-                I_evan_aq=I_evan_aq, delta_um=float(delta_um))
+                I_evan_aq=I_evan_aq, delta_um=float(delta_um),
+                bend_loss_perum=bend_loss_perum, u_caustic_um=float(u_caustic_um),
+                throughput_bend=throughput_bend)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--scenario', default=None, help='nur dieses Szenario (sonst alle)')
+    ap.add_argument('--r-bend-mm', type=float, default=0.0,
+                    help='Biegeradius in mm fuer ECHTE Kruemmung (Bent-Mode, konforme '
+                         'Abbildung). 0 = gerader Guide. Kontaktlinse: 8.3')
     ap.add_argument('--lambda-nm', type=float, default=LAM*1e9)
     ap.add_argument('--dy-nm', type=float, default=10.0, help='transversale Aufloesung (nm)')
     ap.add_argument('--L-mm', type=float, default=None,
@@ -241,8 +267,9 @@ def main():
           f'offset={args.offset_um:g}um')
     print('  (brute-force-Stitching bleibt erhalten: sliding_window_fdtd.py / full_domain_fdtd.py)')
 
-    print(f'  ATR: Traenenfilm-Absorption alpha={args.alpha_tear_permm:g}/mm '
-          f'(-> D3 = ueberlebendes TIR-Licht; Signal = ATR-Daempfung)  Kopplung={args.couple}')
+    r_bend_um = args.r_bend_mm*1000.0 if args.r_bend_mm > 0 else None
+    print(f'  ATR: Traenenfilm-Absorption alpha={args.alpha_tear_permm:g}/mm  Kopplung={args.couple}'
+          f'  Kruemmung={"R=%.1fmm (Bent-Mode)" % args.r_bend_mm if r_bend_um else "gerade"}')
     scen = _scenarios_dict()
 
     # (C) Offset-Studie: Kopplungs-Abhaengigkeit des Signals (Gesund)
@@ -266,20 +293,23 @@ def main():
         coupling = fdtd_coupling_field(args.lambda_nm, args.offset_um, args.waist_um)
 
     names = [args.scenario] if args.scenario else list(scen.keys())
-    print(f'\n{"Szenario":<14} {"evan_ratio":>11} {"delta[um]":>10} {"ATR[dB]":>9} '
-          f'{"evan-Signal":>12}')
-    print('  (evan_ratio = DIREKT bestimmtes evan. Feld Tear/Kern; ATR = messbare Daempfung)')
-    print('-'*60)
-    base = None
+    print(f'\n{"Szenario":<14} {"n_eff":>8} {"evan_ratio":>11} {"delta[um]":>10} '
+          f'{"T_bend":>8} {"ATR[dB]":>9}')
+    print('  (evan_ratio = DIREKT bestimmtes evan. Feld Tear/Kern; T_bend = Biege-Durchsatz; '
+          'ATR = messbare Daempfung)')
+    print('-'*64)
     for nm in names:
         t_lip, t_aq, t_mu, n_aq = scen[nm]
         r = run_scenario(nm, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
-                         args.offset_um, args.waist_um, args.alpha_tear_permm, coupling=coupling)
-        if base is None:
-            base = r['evan_ratio']
-        dE = 100*(r['evan_ratio'] - base)/max(abs(base), 1e-30)
-        print(f'{nm:<14} {r["evan_ratio"]:>11.4e} {r["delta_um"]:>10.3f} '
-              f'{r["ATR_dB"]:>9.4f} {dE:>+10.1f}%')
+                         args.offset_um, args.waist_um, args.alpha_tear_permm,
+                         coupling=coupling, r_bend_um=r_bend_um)
+        print(f'{nm:<14} {r["neff_max"]:>8.4f} {r["evan_ratio"]:>11.4e} {r["delta_um"]:>10.3f} '
+              f'{r["throughput_bend"]:>8.4f} {r["ATR_dB"]:>9.4f}')
+    if r_bend_um:
+        print(f'\nBiege-Analyse (R={args.r_bend_mm}mm): Strahlungs-Kaustik ~{r["u_caustic_um"]/1000:.2f}mm '
+              f'oberhalb des Kerns -> Biegeverlust {r["bend_loss_perum"]:.2e}/um.')
+        print(f'  Durchsatz durch die Linse (Biege-limitiert, L={L_um/1000:.1f}mm): '
+              f'T_bend={r["throughput_bend"]:.4f}.')
 
 
 if __name__ == '__main__':
