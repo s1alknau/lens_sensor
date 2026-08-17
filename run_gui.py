@@ -326,8 +326,8 @@ class SimGUI:
     def _sketch_planar(self, c, xL, xR, yT, yB):
         Ht = yB - yT
         bands = [('Luft (n=1.0)', '#eaf4ff', 0.17),
-                 ('Lipid', '#fff2cc', 0.07),
                  ('WG-Kern', '#ffd75e', 0.17),
+                 ('Lipid', '#fff2cc', 0.07),
                  ('Traenenfilm (Aqueous)', '#bfe3ff', 0.27),
                  ('Mucin', '#e2d1f4', 0.11),
                  ('Cornea', '#f8c9c9', 0.21)]
