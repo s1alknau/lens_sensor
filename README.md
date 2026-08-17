@@ -188,10 +188,12 @@ is amortized over more cells).
   - `full` — all four edges (`mur1`/`mur2`/`cpml`).
   - `sliding` — all four edges; the CPML ψ-fields co-move with the window and
     the Mur-2 history resets on each slide.
-  - `stitch` — absorber on the (static) transverse **y-edges** only; the x-edges
-    stay Mur/handoff (source facet + hard-overlap CW handoff). `mur2` is
-    numerically incompatible with the hard handoff drive (late-time instability,
-    esp. TM), so on `stitch` it auto-upgrades to `cpml` (stable, stronger).
+  - `stitch` — absorber on the transverse **y-edges** and on the **two real
+    device x-ends** (window 0 = entry facet, last window = exit facet). The
+    *internal* window seams stay handoff/Mur, because the CPML lossy layer would
+    otherwise eat into the assembled field (no guard region between seams). `mur2`
+    is numerically incompatible with the hard handoff drive (late-time
+    instability, esp. TM), so on `stitch` it auto-upgrades to `cpml`.
 - No subpixel averaging → grid-staircasing of curved/oblique material interfaces.
 - Coarse-resolution n_eff bias (numerical dispersion); needs finer dx for < 0.001 accuracy.
 - 4 GB GPU caps full-domain 3D and the large contact lens → use `--method stitch`.

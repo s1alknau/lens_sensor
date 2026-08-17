@@ -650,10 +650,12 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
     phase_y = float(np.sin(np.radians(vcsel_tilt)))*k0*(ys_idx - iy_src)*dx
     src_p_ey = 0.5*(src_p[:-1] + src_p[1:])
     phase_y_ey = 0.5*(phase_y[:-1] + phase_y[1:])
-    src_ix = 5
+    NPML_ST = 10
+    src_ix = (NPML_ST + 2) if _is_cpml_st else 5          # Quelle nicht in die x-PML
     _Nyc = (Ny-1) if _pol == 'p' else Ny                  # y-Groesse der Hauptkomp.
     print(f'Polarisation: {_pol}-Pol ({"TM/Ey" if _pol=="p" else "TE/Ez"})'
-          + (f'  Rand: {_bnd_kind} (y) + Mur (x/Handoff)' if _use_bnd_st else '  Rand: Mur 1. Ordnung'))
+          + (f'  Rand: {_bnd_kind} (y + echte x-Enden) + Mur/Handoff (innere Naehte)'
+             if _use_bnd_st else '  Rand: Mur 1. Ordnung'))
     # v2: weiche cosinus-getaperte Einpraegung des Overlaps (1 an linker Kante ->
     # 0 an Innenkante) statt hartem Dirichlet -> vermeidet Naht/Reflexion am
     # Uebergang zur frei gerechneten Region.
@@ -682,9 +684,14 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
         Ex_t = xp.zeros((Nx_win-1, Ny), dtype=xp.float32)
         Ey_t = xp.zeros((Nx_win, Ny-1), dtype=xp.float32)
         Hz_t = xp.zeros((Nx_win-1, Ny-1), dtype=xp.float32)
-        # Rand nur an den (statischen) y-Raendern; x bleibt Mur/Handoff.
+        # CPML an den y-Raendern (immer) und an den ECHTEN x-Bauteilenden: Fenster 0
+        # links (Eintritt), letztes Fenster rechts (Austritt). Innere x-Naehte
+        # (npml=0) bleiben Handoff/Mur -> die PML-Schicht frisst kein Nutzfeld.
+        _pml_l = _is_cpml_st and (w == 0)                # echtes linkes Bauteilende
+        _pml_r = _is_cpml_st and (w == n_win - 1)        # echtes rechtes Bauteilende
         bnd = (make_boundary(_bnd_kind, _pol, Nx_win, Ny, dx, dt,
-                             npml_x=0, npml_y=10, sides='y') if _use_bnd_st else None)
+                             npml_x=(NPML_ST if _pml_l else 0, NPML_ST if _pml_r else 0),
+                             npml_y=NPML_ST) if _use_bnd_st else None)
         acc = np.zeros((Nx_win, _Nyc), dtype=np.complex64); acc_n = 0
         _drive = xp.asarray(Ehand.astype(np.complex64)) if (w > 0 and Ehand is not None) else None
         for n in range(steps_win):
@@ -696,8 +703,6 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                     bnd.update_H(Ex_t, Ey_t, Hz_t, Ch_tm)
                 else:
                     Hz_t += -Ch_tm*((Ey_t[1:, :] - Ey_t[:-1, :]) - (Ex_t[:, 1:] - Ex_t[:, :-1]))
-                if _use_bnd_st and not _is_cpml_st:
-                    bnd.capture(Ex_t, Ey_t)          # Mur-2 (nur y-Kanten)
                 ey_r = Ey_t[-2, :].copy(); ey_l = Ey_t[1, :].copy()
                 ex_b = Ex_t[:, 1].copy(); ex_tp = Ex_t[:, -2].copy()
                 if _is_cpml_st:
@@ -710,15 +715,15 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                         Ey_t[src_ix, :] += env*xp.sin(2*np.pi*f0*t_phys + phase_y_ey)*src_p_ey
                     else:
                         Ey_t[src_ix, :] += env*float(np.sin(2*np.pi*f0*t_phys))*src_p_ey
-                    Ey_t[0, :] = ey_l + mur*(Ey_t[1, :] - Ey_t[0, :])
+                    if not _pml_l:                   # linkes Ende: Mur, ausser echtes CPML-Ende
+                        Ey_t[0, :] = ey_l + mur*(Ey_t[1, :] - Ey_t[0, :])
                 else:
                     _din = env*xp.real(_drive*np.exp(1j*omega*t_phys))
                     Ey_t[:O_cells, :] = _wtap*_din + (1.0 - _wtap)*Ey_t[:O_cells, :]
-                Ey_t[-1, :] = ey_r + mur*(Ey_t[-2, :] - Ey_t[-1, :])
+                if not _pml_r:                       # rechtes Ende: Mur, ausser echtes CPML-Ende
+                    Ey_t[-1, :] = ey_r + mur*(Ey_t[-2, :] - Ey_t[-1, :])
                 if _is_cpml_st:
-                    bnd.terminate(Ex_t, Ey_t)        # y-PEC hinter der PML (x bleibt Mur)
-                elif _use_bnd_st:
-                    bnd.apply(Ex_t, Ey_t)            # Mur-2 an den y-Kanten
+                    bnd.terminate(Ex_t, Ey_t)        # PEC an y- und aktiven x-Enden
                 else:
                     Ex_t[:, 0] = ex_b + mur*(Ex_t[:, 1] - Ex_t[:, 0])
                     Ex_t[:, -1] = ex_tp + mur*(Ex_t[:, -2] - Ex_t[:, -1])
@@ -732,8 +737,6 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                 else:
                     Hx -= Ch*(Ez[:, 1:] - Ez[:, :-1])
                     Hy += Ch*(Ez[1:, :] - Ez[:-1, :])
-                if _use_bnd_st and not _is_cpml_st:
-                    bnd.capture(Ez)                  # Mur-2 (nur y-Kanten)
                 ex2 = Ez[-2, :].copy(); ey1 = Ez[:, 1].copy(); ey2 = Ez[:, -2].copy()
                 ex1 = Ez[1, :].copy()
                 if _is_cpml_st:
@@ -747,15 +750,15 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                         Ez[src_ix, :] += env*xp.sin(2*np.pi*f0*t_phys + phase_y)*src_p
                     else:
                         Ez[src_ix, :] += env*float(np.sin(2*np.pi*f0*t_phys))*src_p
-                    Ez[0, :] = ex1 + mur*(Ez[1, :] - Ez[0, :])    # linker Mur nur Fenster 0
+                    if not _pml_l:                   # linkes Ende: Mur, ausser echtes CPML-Ende
+                        Ez[0, :] = ex1 + mur*(Ez[1, :] - Ez[0, :])
                 else:
                     _din = env*xp.real(_drive*np.exp(1j*omega*t_phys))
                     Ez[:O_cells, :] = _wtap*_din + (1.0 - _wtap)*Ez[:O_cells, :]
-                Ez[-1, :] = ex2 + mur*(Ez[-2, :] - Ez[-1, :])
+                if not _pml_r:                       # rechtes Ende: Mur, ausser echtes CPML-Ende
+                    Ez[-1, :] = ex2 + mur*(Ez[-2, :] - Ez[-1, :])
                 if _is_cpml_st:
-                    bnd.terminate(Ez)                # y-PEC hinter der PML (x bleibt Mur)
-                elif _use_bnd_st:
-                    bnd.apply(Ez)                    # Mur-2 an den y-Kanten
+                    bnd.terminate(Ez)                # PEC an y- und aktiven x-Enden
                 else:
                     Ez[:, 0] = ey1 + mur*(Ez[:, 1] - Ez[:, 0])
                     Ez[:, -1] = ey2 + mur*(Ez[:, -2] - Ez[:, -1])

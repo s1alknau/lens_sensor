@@ -304,8 +304,8 @@ def build_parser():
     g_basic.add_argument('--boundary', choices=('mur1', 'mur2', 'cpml'), default='mur1',
                          help='Absorbierender Rand (alle 2D-Methoden): mur1 (Default) | '
                               'mur2 (besser schraeg) | cpml (beste Absorption). '
-                              'full/sliding: alle Kanten; stitch: y-Kanten '
-                              '(mur2->cpml wg. Handoff-Stabilitaet)')
+                              'full/sliding: alle Kanten; stitch: y-Kanten + echte '
+                              'x-Bauteilenden (mur2->cpml wg. Handoff-Stabilitaet)')
     g_basic.add_argument('--source-type', choices=('cw', 'pulse'), default='cw')
     g_basic.add_argument('--snapshots', type=int, default=8, help='Anzahl gespeicherter Frames')
 

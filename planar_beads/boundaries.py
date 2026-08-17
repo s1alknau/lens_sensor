@@ -29,30 +29,37 @@ def mur1_coeff(dx, dt):
 # ======================================================================
 # CPML-Profile (Roden-Gedney, Taflove Kap. 7)
 # ======================================================================
-def _cpml_profiles(N, npml, dx, dt, m=3, kappa_max=7.0, a_max=0.05, R0=1e-6):
-    """1D-Leitfaehigkeits-/Streck-Profile fuer eine Koordinate mit npml Zellen
-    an JEDEM Ende. Rueckgabe an Ganzzahl-Knoten (E) und Halbzahl-Knoten (H):
+def _cpml_profiles(N, npml_lo, npml_hi, dx, dt, m=3, kappa_max=7.0, a_max=0.05, R0=1e-6):
+    """1D-Leitfaehigkeits-/Streck-Profile fuer eine Koordinate mit npml_lo Zellen
+    am unteren (Index 0) und npml_hi am oberen (Index N-1) Ende. Rueckgabe an
+    Ganzzahl-Knoten (E) und Halbzahl-Knoten (H):
       (kappa_e, b_e, c_e)  Laenge N     an i
       (kappa_h, b_h, c_h)  Laenge N-1   an i+1/2
-    Ausserhalb der PML: sigma=0, kappa=1, a=0 -> b=1, c=0 (psi bleibt 0).
-    npml=0 -> triviale Profile (kappa=1,b=1,c=0): diese Richtung ist kein PML
-    (z.B. stitch: nur y-PML, x bleibt Mur/Handoff)."""
-    if npml <= 0:
+    Ausserhalb der PML: sigma=0, kappa=1, a=0 -> b=1, c=0 (psi bleibt 0). Ein
+    Ende mit npml=0 ist kein PML (z.B. innere Handoff-Naht bei stitch)."""
+    if npml_lo <= 0 and npml_hi <= 0:                # kein PML in dieser Richtung
         one_e = xp.ones(N, dtype=xp.float32); zero_e = xp.zeros(N, dtype=xp.float32)
         one_h = xp.ones(N - 1, dtype=xp.float32); zero_h = xp.zeros(N - 1, dtype=xp.float32)
         return (one_e, one_e, zero_e), (one_h, one_h, zero_h)
     eta0 = np.sqrt(4e-7*np.pi/EPS0)                  # ~376.73 Ohm
-    d_pml = npml*dx
-    sigma_max = -(m + 1)*np.log(R0)/(2.0*eta0*d_pml)
+
+    def _smax(npml):
+        return (-(m + 1)*np.log(R0)/(2.0*eta0*npml*dx)) if npml > 0 else 0.0
+    smx_lo = _smax(npml_lo); smx_hi = _smax(npml_hi)
 
     def build(pos):                                  # pos: Knotenpositionen (Zellen)
         depth = np.zeros_like(pos, dtype=np.float64)
-        left = pos < npml
-        depth[left] = (npml - pos[left])/npml
-        right = pos > (N - 1 - npml)
-        depth[right] = (pos[right] - (N - 1 - npml))/npml
+        sgmax = np.zeros_like(pos, dtype=np.float64)
+        if npml_lo > 0:
+            lo = pos < npml_lo
+            depth[lo] = (npml_lo - pos[lo])/npml_lo
+            sgmax[lo] = smx_lo
+        if npml_hi > 0:
+            hi = pos > (N - 1 - npml_hi)
+            depth[hi] = (pos[hi] - (N - 1 - npml_hi))/npml_hi
+            sgmax[hi] = smx_hi
         depth = np.clip(depth, 0.0, 1.0)
-        sigma = sigma_max*depth**m
+        sigma = sgmax*depth**m
         kappa = 1.0 + (kappa_max - 1.0)*depth**m
         a = np.where(depth > 0.0, a_max*(1.0 - depth), 0.0)
         b = np.exp(-(sigma/kappa + a)*dt/EPS0)
@@ -69,20 +76,32 @@ def _cpml_profiles(N, npml, dx, dt, m=3, kappa_max=7.0, a_max=0.05, R0=1e-6):
     return (ke, be, ce), (kh, bh, ch)
 
 
+def _pml_pair(v, default):
+    """npml-Angabe -> (lo, hi). Skalar = beide Enden gleich; (lo,hi) = getrennt;
+    None = default."""
+    if v is None:
+        v = default
+    if isinstance(v, (tuple, list)):
+        return int(v[0]), int(v[1])
+    return int(v), int(v)
+
+
 class CPML_TE:
     """CPML fuer TE (Ez, Hx, Hy). psi-Felder ueber die volle Domain (fuer das
     'full'-Fenster ausreichend; PML nur an den 4 Raendern nichttrivial). Der
     aeussere E-Rand wird als PEC (Ez=0) abgeschlossen.
 
-    npml_x/npml_y erlauben richtungsselektives PML (Default beide = npml).
-    npml_x=0 -> nur y-PML (stitch: x bleibt Mur/Handoff)."""
+    npml_x/npml_y erlauben richtungsselektives PML (Default beide = npml). Jeder
+    Wert ist Skalar (beide Enden) oder (lo,hi) fuer getrennte Enden -> so kann
+    stitch CPML nur an den ECHTEN Bauteilenden setzen (Fenster 0 links, letztes
+    Fenster rechts) und die inneren Handoff-Naehte auf 0 lassen."""
     def __init__(self, Nx, Ny, dx, dt, npml=10, npml_x=None, npml_y=None, **kw):
-        self.npml_x = npml if npml_x is None else npml_x
-        self.npml_y = npml if npml_y is None else npml_y
+        self.npx_lo, self.npx_hi = _pml_pair(npml_x, npml)
+        self.npy_lo, self.npy_hi = _pml_pair(npml_y, npml)
         (self.kex, self.bex, self.cex), (self.khx, self.bhx, self.chx) = \
-            _cpml_profiles(Nx, self.npml_x, dx, dt, **kw)
+            _cpml_profiles(Nx, self.npx_lo, self.npx_hi, dx, dt, **kw)
         (self.key, self.bey, self.cey), (self.khy, self.bhy, self.chy) = \
-            _cpml_profiles(Ny, self.npml_y, dx, dt, **kw)
+            _cpml_profiles(Ny, self.npy_lo, self.npy_hi, dx, dt, **kw)
         z = xp.zeros
         self.psi_Hxy = z((Nx, Ny - 1), dtype=xp.float32)
         self.psi_Hyx = z((Nx - 1, Ny), dtype=xp.float32)
@@ -106,11 +125,15 @@ class CPML_TE:
                           + Ce_H[1:-1, 1:-1]*(dHy/self.kex[1:-1, None] + self.psi_Ezx
                                               - dHx/self.key[None, 1:-1] - self.psi_Ezy))
 
-    def terminate(self, Ez):                         # PEC-Abschluss (nur PML-Seiten)
-        if self.npml_x > 0:
-            Ez[0, :] = 0.0; Ez[-1, :] = 0.0
-        if self.npml_y > 0:
-            Ez[:, 0] = 0.0; Ez[:, -1] = 0.0
+    def terminate(self, Ez):                         # PEC-Abschluss (nur PML-Enden)
+        if self.npx_lo > 0:
+            Ez[0, :] = 0.0
+        if self.npx_hi > 0:
+            Ez[-1, :] = 0.0
+        if self.npy_lo > 0:
+            Ez[:, 0] = 0.0
+        if self.npy_hi > 0:
+            Ez[:, -1] = 0.0
 
     def roll(self, n_shift):                          # Co-Moving (sliding): psi mitziehen
         for nm in ('psi_Hxy', 'psi_Hyx', 'psi_Ezx', 'psi_Ezy'):
@@ -121,14 +144,14 @@ class CPML_TE:
 
 class CPML_TM:
     """CPML fuer TM (Hz, Ex, Ey). Aeusserer E-Rand PEC (tangentiales E=0:
-    Ey an x-Raendern, Ex an y-Raendern). npml_x=0 -> nur y-PML (stitch)."""
+    Ey an x-Raendern, Ex an y-Raendern). npml_x/npml_y: Skalar oder (lo,hi)."""
     def __init__(self, Nx, Ny, dx, dt, npml=10, npml_x=None, npml_y=None, **kw):
-        self.npml_x = npml if npml_x is None else npml_x
-        self.npml_y = npml if npml_y is None else npml_y
+        self.npx_lo, self.npx_hi = _pml_pair(npml_x, npml)
+        self.npy_lo, self.npy_hi = _pml_pair(npml_y, npml)
         (self.kex, self.bex, self.cex), (self.khx, self.bhx, self.chx) = \
-            _cpml_profiles(Nx, self.npml_x, dx, dt, **kw)
+            _cpml_profiles(Nx, self.npx_lo, self.npx_hi, dx, dt, **kw)
         (self.key, self.bey, self.cey), (self.khy, self.bhy, self.chy) = \
-            _cpml_profiles(Ny, self.npml_y, dx, dt, **kw)
+            _cpml_profiles(Ny, self.npy_lo, self.npy_hi, dx, dt, **kw)
         z = xp.zeros
         self.psi_Hzx = z((Nx - 1, Ny - 1), dtype=xp.float32)
         self.psi_Hzy = z((Nx - 1, Ny - 1), dtype=xp.float32)
@@ -151,11 +174,15 @@ class CPML_TM:
         self.psi_Eyx = self.bex[1:-1, None]*self.psi_Eyx + self.cex[1:-1, None]*dHzx
         Ey[1:-1, :] += -Ca_ey[1:-1, :]*(dHzx/self.kex[1:-1, None] + self.psi_Eyx)
 
-    def terminate(self, Ex, Ey):                     # PEC (nur PML-Seiten)
-        if self.npml_x > 0:
-            Ey[0, :] = 0.0; Ey[-1, :] = 0.0
-        if self.npml_y > 0:
-            Ex[:, 0] = 0.0; Ex[:, -1] = 0.0
+    def terminate(self, Ex, Ey):                     # PEC (nur PML-Enden)
+        if self.npx_lo > 0:
+            Ey[0, :] = 0.0
+        if self.npx_hi > 0:
+            Ey[-1, :] = 0.0
+        if self.npy_lo > 0:
+            Ex[:, 0] = 0.0
+        if self.npy_hi > 0:
+            Ex[:, -1] = 0.0
 
     def roll(self, n_shift):                          # Co-Moving (sliding): psi mitziehen
         for nm in ('psi_Hzx', 'psi_Hzy', 'psi_Exy', 'psi_Eyx'):
