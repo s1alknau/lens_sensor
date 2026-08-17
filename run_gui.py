@@ -26,6 +26,17 @@ import run_simulation as rs
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
+# Zweites Werkzeug: Moden-Propagation (Kontaktlinse). Liegt in kontaktlinse/ und
+# nutzt "from config import ...", daher dessen Ordner auf den Pfad legen und dann
+# importieren. Faellt es aus, bleibt das GUI ein reines FDTD-Frontend.
+_KL_DIR = os.path.join(_REPO_ROOT, 'kontaktlinse')
+if _KL_DIR not in sys.path:
+    sys.path.insert(0, _KL_DIR)
+try:
+    import mode_propagation as mp
+except Exception:
+    mp = None
+
 # Kurzhinweise fuer Felder ohne festen Default: diese werden erst in
 # run_simulation.resolve_args aus Geometrie/Dimension bzw. Materialdispersion
 # aufgeloest. Als grauer Platzhalter im Feld sichtbar (nicht mitgesendet).
@@ -86,6 +97,13 @@ _LABELS = {
     # Kalibrierung & Vorschau
     'dry_run': 'Nur Konfiguration zeigen (Dry-Run)',
     'check_resources': 'VRAM/RAM vor Lauf pruefen', 'calibrate': 'Kalibrieren: nur N Steps messen',
+    # Moden-Propagation (Kontaktlinse)
+    'r_bend_mm': 'Biegeradius R (mm; 0=gerade, Linse=8.3)', 'offset_um': 'VCSEL-Versatz y (um)',
+    'waist_um': 'VCSEL-Taille (um)', 'couple': 'Einkoppel-Methode',
+    'offset_scan': 'Offset-Scan (um-Liste, z.B. -120,-60,0)',
+    't_lipid_nm': 'Lipiddicke (nm; leer=Szenario)', 'alpha_tear_permm': 'Traenen-Absorption (1/mm)',
+    'dy_nm': 'Transversale Aufloesung dy (nm)', 'L_mm': 'Propagationslaenge (mm; leer=auto)',
+    'validate': 'Eigenloeser validieren (und beenden)',
 }
 
 
@@ -158,14 +176,22 @@ class _Tooltip:
 class SimGUI:
     def __init__(self, root):
         self.root = root
-        self.parser = rs.build_parser()
+        # Werkzeuge: key -> (Label, Parser, Skript-relpfad). FDTD immer; Moden nur
+        # wenn importierbar.
+        self.tools = {'fdtd': ('FDTD-Simulation', rs.build_parser(), 'run_simulation.py')}
+        if mp is not None:
+            self.tools['modes'] = ('Moden-Propagation (Kontaktlinse)', mp.build_parser(),
+                                   os.path.join('kontaktlinse', 'mode_propagation.py'))
+        self.tool = 'fdtd'
+        self.parser = self.tools['fdtd'][1]
+        self.script = self.tools['fdtd'][2]
         self.vars = {}          # dest -> tk Variable
         self.widgets = {}       # dest -> Eingabe-Widget (fuer Enable/Disable)
         self.labels = {}        # dest -> Label-Widget
         self.placeholders = {}  # dest -> Platzhaltertext (fuer None-Defaults)
         self.proc = None
         self.q = queue.Queue()
-        root.title('Lens-Sensor FDTD - Einstieg')
+        root.title('Lens-Sensor - Einstieg')
         root.geometry('880x860')
         self._build()
         self.root.after(100, self._drain_log)
@@ -175,30 +201,40 @@ class SimGUI:
         self._init_style()
         top = ttk.Frame(self.root, padding=(12, 10, 12, 6), style='Head.TFrame')
         top.pack(fill='x')
-        ttk.Label(top, text='FDTD-Simulation starten', style='Title.TLabel').pack(anchor='w')
+        self.title_lbl = ttk.Label(top, text='FDTD-Simulation starten', style='Title.TLabel')
+        self.title_lbl.pack(anchor='w')
         ttk.Label(top, text='Nach Sektionen gruppiert; oben die wichtigsten Auswahlen. '
                   'Graues Feld = automatischer Default. Maus ueber die Beschriftung zeigt '
-                  'CLI-Flag und Hilfe. "Konfiguration pruefen" zeigt die aufgeloeste Config, '
-                  'ohne zu rechnen.',
+                  'CLI-Flag und Hilfe.',
                   style='Sub.TLabel', wraplength=840, justify='left').pack(anchor='w',
                                                                           pady=(2, 0))
 
-        # Uebersichts-Skizze der gewaehlten Geometrie (Querschnitt x-y).
-        skf = ttk.LabelFrame(self.root, text='  Uebersicht: gewaehlte Geometrie  ',
-                             style='Section.TLabelframe', padding=(6, 4))
-        skf.pack(fill='x', padx=10, pady=(6, 0))
-        self.sketch = tk.Canvas(skf, height=165, highlightthickness=0, background='white')
+        # Werkzeug-Auswahl (nur wenn Moden-Propagation verfuegbar).
+        if len(self.tools) > 1:
+            self.tool_var = tk.StringVar(value=self.tool)
+            tf = ttk.Frame(self.root, padding=(12, 6, 12, 0))
+            tf.pack(fill='x')
+            ttk.Label(tf, text='Werkzeug:', style='Sub.TLabel').pack(side='left')
+            for key, (label, _p, _s) in self.tools.items():
+                ttk.Radiobutton(tf, text=label, value=key, variable=self.tool_var,
+                                command=self._on_tool_change).pack(side='left', padx=(8, 0))
+
+        # Uebersichts-Skizze der gewaehlten Geometrie (nur FDTD).
+        self.skf = ttk.LabelFrame(self.root, text='  Uebersicht: gewaehlte Geometrie  ',
+                                  style='Section.TLabelframe', padding=(6, 4))
+        self.skf.pack(fill='x', padx=10, pady=(6, 0))
+        self.sketch = tk.Canvas(self.skf, height=165, highlightthickness=0, background='white')
         self.sketch.pack(fill='x', expand=True)
 
-        # Scrollbarer Formularbereich
-        mid = ttk.Frame(self.root)
-        mid.pack(fill='both', expand=True, padx=10, pady=(6, 0))
-        canvas = tk.Canvas(mid, highlightthickness=0, background=self._bg)
-        vsb = ttk.Scrollbar(mid, orient='vertical', command=canvas.yview)
-        form = ttk.Frame(canvas, padding=(0, 0, 8, 0))
-        form.bind('<Configure>',
-                  lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
-        win = canvas.create_window((0, 0), window=form, anchor='nw')
+        # Scrollbarer Formularbereich (Container bleibt; Inhalt je Werkzeug neu).
+        self.mid = ttk.Frame(self.root)
+        self.mid.pack(fill='both', expand=True, padx=10, pady=(6, 0))
+        canvas = tk.Canvas(self.mid, highlightthickness=0, background=self._bg)
+        vsb = ttk.Scrollbar(self.mid, orient='vertical', command=canvas.yview)
+        self.form = ttk.Frame(canvas, padding=(0, 0, 8, 0))
+        self.form.bind('<Configure>',
+                       lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        win = canvas.create_window((0, 0), window=self.form, anchor='nw')
         # Formularbreite an die Canvas-Breite koppeln, damit die LabelFrames fuellen.
         canvas.bind('<Configure>', lambda e: canvas.itemconfigure(win, width=e.width))
         canvas.configure(yscrollcommand=vsb.set)
@@ -206,38 +242,65 @@ class SimGUI:
         vsb.pack(side='right', fill='y')
         canvas.bind_all('<MouseWheel>',
                         lambda e: canvas.yview_scroll(int(-e.delta/120), 'units'))
+        self.sketch.bind('<Configure>', self._draw_sketch)
 
-        # Je argparse-Gruppe eine gerahmte, betitelte Sektion (LabelFrame).
+        self._build_buttons_and_log()
+        self._populate_form()
+
+    def _on_tool_change(self):
+        key = self.tool_var.get()
+        if key == self.tool:
+            return
+        self.tool = key
+        self.parser = self.tools[key][1]
+        self.script = self.tools[key][2]
+        self._populate_form()
+
+    def _populate_form(self):
+        """Formular fuer das aktive Werkzeug (self.parser) neu aufbauen."""
+        for w in self.form.winfo_children():
+            w.destroy()
+        self.vars.clear(); self.widgets.clear(); self.labels.clear(); self.placeholders.clear()
         for grp in self.parser._action_groups:
             acts = [a for a in grp._group_actions
                     if a.option_strings and a.dest != 'help']
             if not acts:
                 continue
-            sec = ttk.LabelFrame(form, text='  ' + (grp.title or '') + '  ',
+            sec = ttk.LabelFrame(self.form, text='  ' + (grp.title or '') + '  ',
                                  style='Section.TLabelframe', padding=(12, 8, 12, 10))
             sec.pack(fill='x', expand=True, pady=(0, 10), padx=2)
             sec.columnconfigure(1, weight=1)
             for row, act in enumerate(acts):
                 self._add_field(sec, row, act)
 
-        # Bedingte Sichtbarkeit: Szenario nur bei Geometrie == lens aktiv.
-        if 'geometry' in self.vars and 'scenario' in self.widgets:
-            self.vars['geometry'].trace_add('write', self._apply_conditional)
-            self._apply_conditional()
+        if self.tool == 'fdtd':
+            # Bedingte Sichtbarkeit: Szenario nur bei Geometrie == lens aktiv.
+            if 'geometry' in self.vars and 'scenario' in self.widgets:
+                self.vars['geometry'].trace_add('write', self._apply_conditional)
+                self._apply_conditional()
+            # Skizze bei Aenderung relevanter Felder neu zeichnen.
+            for dest in ('geometry', 'dim', 'wg_material', 'wg_thickness_um', 'bead_diameter',
+                         'bead_x', 'bead_y_um', 'no_bead', 'vcsel_offset', 'vcsel_tilt',
+                         'input_gap', 'length_um', 'wg_width', 'lz_um', 'scenario'):
+                v = self.vars.get(dest)
+                if v is not None:
+                    try:
+                        v.trace_add('write', self._draw_sketch)
+                    except Exception:
+                        pass
 
-        # Uebersichts-Skizze bei Aenderung relevanter Felder neu zeichnen.
-        for dest in ('geometry', 'dim', 'wg_material', 'wg_thickness_um', 'bead_diameter',
-                     'bead_x', 'bead_y_um', 'no_bead', 'vcsel_offset', 'vcsel_tilt',
-                     'input_gap', 'length_um', 'wg_width', 'lz_um', 'scenario'):
-            v = self.vars.get(dest)
-            if v is not None:
-                try:
-                    v.trace_add('write', self._draw_sketch)
-                except Exception:
-                    pass
-        self.sketch.bind('<Configure>', self._draw_sketch)
-
-        self._build_buttons_and_log()
+        # Titel, Skizze und Dry-Run-Button je Werkzeug.
+        self.title_lbl.configure(
+            text='Moden-Propagation (Kontaktlinse) starten' if self.tool == 'modes'
+            else 'FDTD-Simulation starten')
+        if self.tool == 'fdtd':
+            if not self.skf.winfo_ismapped():
+                self.skf.pack(fill='x', padx=10, pady=(6, 0), before=self.mid)
+            self._draw_sketch()
+        else:
+            self.skf.pack_forget()
+        if hasattr(self, 'btn_dry'):                 # Moden-Solver hat kein --dry-run
+            self.btn_dry.configure(state='disabled' if self.tool == 'modes' else 'normal')
 
     def _resolved_geometry(self):
         """Aufgeloeste Geometrie ('lens'/'planar') aus dem Freitext, oder None."""
@@ -282,6 +345,8 @@ class SimGUI:
         c.create_line(*pts, fill=color, width=1)
 
     def _draw_sketch(self, *_):
+        if getattr(self, 'tool', 'fdtd') != 'fdtd':      # Skizze nur fuer FDTD
+            return
         c = getattr(self, 'sketch', None)
         if c is None:
             return
@@ -583,8 +648,8 @@ class SimGUI:
         if self.proc is not None:
             messagebox.showinfo('Laeuft bereits', 'Es laeuft bereits eine Rechnung.')
             return
-        cmd = [sys.executable, '-u', os.path.join(_REPO_ROOT, 'run_simulation.py')] + argv
-        self._append('$ python run_simulation.py ' + ' '.join(argv) + '\n')
+        cmd = [sys.executable, '-u', os.path.join(_REPO_ROOT, self.script)] + argv
+        self._append('$ python ' + self.script.replace('\\', '/') + ' ' + ' '.join(argv) + '\n')
         try:
             self.proc = subprocess.Popen(
                 cmd, cwd=_REPO_ROOT, stdout=subprocess.PIPE,

@@ -8,7 +8,10 @@ Focus: guided modes, evanescent field into the tear film (sensing), bead scatter
 ## Structure
 
 - `run_simulation.py` — **unified entry point**: contact-lens | planar geometry, in 2D | 3D, method full/sliding/stitch. Drives the solvers below.
-- `run_gui.py`     — **graphical front-end** (tkinter): auto-generates a field for every `run_simulation.py` option, assembles the command, runs it and streams the log
+- `run_gui.py`     — **graphical front-end** (tkinter): a tool selector switches
+  between **FDTD-Simulation** (`run_simulation.py`) and **Moden-Propagation**
+  (`kontaktlinse/mode_propagation.py`); for the chosen tool it auto-generates a
+  field for every CLI option, assembles the command, runs it and streams the log
 - `run_FDTD.bat`  — thin Windows launcher (activates the conda env, forwards all args to `run_simulation.py`); `run_GUI.bat` launches the GUI
 - `planar_beads/` — **2D** FDTD solver core (`fdtd2d_core.py`), waveguide + optional bead
 - `planar_3d/`    — **3D** FDTD core (`fdtd3d_core.py`)
