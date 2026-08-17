@@ -83,6 +83,43 @@ def solve_te_modes(y, n, lam_um):
     return neff, v
 
 
+def solve_tm_modes(y, n, lam_um):
+    """Gefuehrte TM-Moden: eps*d/dy(1/eps*dHz/dy) + k0^2*eps*Hz = beta^2*Hz.
+    Der (1/eps)-gewichtete Operator wird symmetrisch transformiert (A = D_sqrt(eps)
+    * (L_w + k0^2) * D_sqrt(eps), Hz = sqrt(eps)*psi) -> gleiche tridiagonale
+    Eigenwertloesung wie TE. Rueckgabe (n_eff[absteigend], Hz-Profile normiert)."""
+    dy = y[1] - y[0]
+    k0 = 2*np.pi/lam_um
+    eps = n**2
+    eps_h = 0.5*(eps[:-1] + eps[1:])                   # eps an Halbknoten j+1/2
+    P = 1.0/eps_h                                      # (1/eps)-Gewicht, Laenge N-1
+    inv = 1.0/dy**2
+    # symmetrischer, (1/eps)-gewichteter Laplace L_w (Rand: gespiegelt P_{-1/2}=P_{1/2})
+    Ld = np.empty(len(y))
+    Ld[1:-1] = -(P[1:] + P[:-1])*inv
+    Ld[0] = -2.0*P[0]*inv; Ld[-1] = -2.0*P[-1]*inv
+    Lo = P*inv                                         # Nebendiagonale von L_w (Laenge N-1)
+    sq = np.sqrt(eps)
+    A_diag = eps*(Ld + k0*k0)                          # eps*(L_w + k0^2)
+    A_off = sq[:-1]*sq[1:]*Lo                          # sqrt(eps_j eps_{j+1}) * P/dy^2
+    n_core = n.max(); n_clad_out = max(n[0], n[-1])
+    lo = (k0*n_clad_out)**2 + 1e-6
+    hi = (k0*n_core)**2 - 1e-6
+    w, psi = eigh_tridiagonal(A_diag, A_off, select='v', select_range=(lo, hi))
+    order = np.argsort(w)[::-1]
+    w = w[order]; psi = psi[:, order]
+    neff = np.sqrt(np.clip(w, 0, None))/k0
+    Hz = sq[:, None]*psi                               # Ruecktransformation Hz = sqrt(eps)*psi
+    Hz = Hz/np.sqrt(np.sum(Hz**2, axis=0)*dy)          # Norm: int |Hz|^2 dy = 1
+    return neff, Hz
+
+
+def solve_modes(y, n, lam_um, pol='s'):
+    """TE ('s', Ez) oder TM ('p', Hz) je nach Polarisation."""
+    return solve_tm_modes(y, n, lam_um) if str(pol).lower() in ('p', 'tm') \
+        else solve_te_modes(y, n, lam_um)
+
+
 def couple(y, profiles, y0_um, waist_um):
     """VCSEL-Gauss (Taille waist, Zentrum y0) -> Moden-Amplituden a_m = <phi_m|g>."""
     dy = y[1] - y[0]
@@ -168,7 +205,7 @@ def sensor_R(y, profiles, a, betas_um, L_um, d1_y_um, d2_y_um):
 
 def run_scenario(name, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
                  offset_um, waist_um, alpha_tear_permm=0.0, coupling=None,
-                 r_bend_um=None, verbose=False):
+                 r_bend_um=None, pol='s', verbose=False):
     """ATR-Sensor + (optional) echte Kruemmung. Traenenfilm-Absorption daempft das
     totalreflektierte Licht (alpha_m = alpha_tear*Gamma_m -> ueberlebendes TIR-Licht).
     r_bend_um: Biegeradius -> Bent-Mode via konformer Abbildung; zusaetzlich wird der
@@ -176,7 +213,7 @@ def run_scenario(name, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
     core = T_LENS*1e6
     y, n = build_index_profile(t_lip, t_aq, t_mu, n_aq, dy_um, r_bend_um=r_bend_um)
     dy = y[1] - y[0]
-    neff, prof = solve_te_modes(y, n, lam_um)
+    neff, prof = solve_modes(y, n, lam_um, pol)
     k0 = 2*np.pi/lam_um
     betas = neff*k0
     if coupling is not None:                              # reale FDTD-Einkopplung -> Projektion
@@ -230,30 +267,47 @@ def run_scenario(name, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
                 throughput_bend=throughput_bend)
 
 
-def main():
+def build_parser():
+    """Argparse-Parser (auch vom GUI genutzt, um die Felder zu erzeugen)."""
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--scenario', default=None, help='nur dieses Szenario (sonst alle)')
-    ap.add_argument('--r-bend-mm', type=float, default=0.0,
-                    help='Biegeradius in mm fuer ECHTE Kruemmung (Bent-Mode, konforme '
-                         'Abbildung). 0 = gerader Guide. Kontaktlinse: 8.3')
-    ap.add_argument('--lambda-nm', type=float, default=LAM*1e9)
-    ap.add_argument('--dy-nm', type=float, default=10.0, help='transversale Aufloesung (nm)')
-    ap.add_argument('--L-mm', type=float, default=None,
-                    help='Propagationslaenge Rand->Detektor in mm (Default aus Geometrie)')
-    ap.add_argument('--offset-um', type=float, default=0.0, help='VCSEL-y-Offset (0=Kernmitte)')
-    ap.add_argument('--waist-um', type=float, default=2.0, help='VCSEL-Taille (um)')
-    ap.add_argument('--alpha-tear-permm', type=float, default=10.0,
-                    help='Absorptions-/Streukoeff. des Traenenfilm-Analyten (1/mm) fuer die '
-                         'ATR-Daempfung. Relative Szenario-Unterschiede sind ~alpha-unabhaengig.')
-    ap.add_argument('--couple', choices=('analytic', 'fdtd'), default='analytic',
-                    help='analytic = Gauss-Overlap; fdtd = lokales FDTD am Rand -> Moden-Projektion')
-    ap.add_argument('--validate', action='store_true',
-                    help='Eigenloeser gegen analytische Slab-Formel pruefen und beenden')
-    ap.add_argument('--offset-scan', default='',
-                    help='Komma-Liste VCSEL-Offsets (um), z.B. "-120,-60,0" -> evan/ATR vs Offset (Gesund)')
-    args = ap.parse_args()
+    g_case = ap.add_argument_group('Szenario & Physik')
+    g_case.add_argument('--scenario', default=None, help='nur dieses Szenario (sonst alle)')
+    g_case.add_argument('--polarization', choices=('s', 'p'), default='s',
+                        help='s = TE (Ez-Moden) | p = TM (Hz-Moden)')
+    g_case.add_argument('--r-bend-mm', type=float, default=0.0,
+                        help='Biegeradius in mm fuer ECHTE Kruemmung (Bent-Mode, konforme '
+                             'Abbildung). 0 = gerader Guide. Kontaktlinse: 8.3')
+    g_case.add_argument('--lambda-nm', type=float, default=LAM*1e9, help='Wellenlaenge (nm)')
 
+    g_cpl = ap.add_argument_group('Einkopplung (VCSEL)')
+    g_cpl.add_argument('--offset-um', type=float, default=0.0, help='VCSEL-y-Offset (0=Kernmitte)')
+    g_cpl.add_argument('--waist-um', type=float, default=2.0, help='VCSEL-Taille (um)')
+    g_cpl.add_argument('--couple', choices=('analytic', 'fdtd'), default='analytic',
+                       help='analytic = Gauss-Overlap; fdtd = lokales FDTD am Rand -> Moden-Projektion')
+    g_cpl.add_argument('--offset-scan', default='',
+                       help='Komma-Liste VCSEL-Offsets (um), z.B. "-120,-60,0" -> evan/ATR vs Offset (Gesund)')
+
+    g_tear = ap.add_argument_group('Traenenfilm & ATR')
+    g_tear.add_argument('--t-lipid-nm', type=float, default=None,
+                        help='Lipiddicke (nm) ueberschreiben (sonst Szenario-Wert; Gesund=30)')
+    g_tear.add_argument('--alpha-tear-permm', type=float, default=10.0,
+                        help='Absorptions-/Streukoeff. des Traenenfilm-Analyten (1/mm) fuer die '
+                             'ATR-Daempfung. Relative Szenario-Unterschiede sind ~alpha-unabhaengig.')
+
+    g_num = ap.add_argument_group('Numerik')
+    g_num.add_argument('--dy-nm', type=float, default=10.0, help='transversale Aufloesung (nm)')
+    g_num.add_argument('--L-mm', type=float, default=None,
+                       help='Propagationslaenge Rand->Detektor in mm (Default aus Geometrie)')
+    g_num.add_argument('--validate', action='store_true',
+                       help='Eigenloeser gegen analytische Slab-Formel pruefen und beenden')
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
+    _pol = args.polarization
+    _tl = (lambda tl: args.t_lipid_nm/1000.0 if args.t_lipid_nm is not None else tl)
     lam_um = args.lambda_nm/1000.0
     dy_um = args.dy_nm/1000.0
     if args.validate:
@@ -262,9 +316,11 @@ def main():
     # Bogenlaenge Rand (s=0) -> Detektor D1 (s=D1_S_CENTER): L = D_LENS/2 - x_d1, x_d1<0
     x_d1_mm = (D1_S_CENTER - D_LENS/2)*1e3
     L_um = (args.L_mm*1000.0) if args.L_mm is not None else (D_LENS/2*1e6 - x_d1_mm*1e3)
-    print(f'Moden-Propagation  lam={args.lambda_nm:g}nm  dy={args.dy_nm:g}nm  '
+    print(f'Moden-Propagation  {"TM (Hz)" if _pol=="p" else "TE (Ez)"}  '
+          f'lam={args.lambda_nm:g}nm  dy={args.dy_nm:g}nm  '
           f'L(Rand->D1)={L_um/1000:.2f}mm  Kern={T_LENS*1e6:g}um  waist={args.waist_um:g}um '
-          f'offset={args.offset_um:g}um')
+          f'offset={args.offset_um:g}um'
+          + (f'  Lipid={args.t_lipid_nm:g}nm(override)' if args.t_lipid_nm is not None else ''))
     print('  (brute-force-Stitching bleibt erhalten: sliding_window_fdtd.py / full_domain_fdtd.py)')
 
     r_bend_um = args.r_bend_mm*1000.0 if args.r_bend_mm > 0 else None
@@ -281,8 +337,8 @@ def main():
         print('-'*44)
         for off in offs:
             cf = fdtd_coupling_field(args.lambda_nm, off, args.waist_um) if args.couple == 'fdtd' else None
-            r = run_scenario('Gesund', t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
-                             off, args.waist_um, args.alpha_tear_permm, coupling=cf)
+            r = run_scenario('Gesund', _tl(t_lip), t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
+                             off, args.waist_um, args.alpha_tear_permm, coupling=cf, pol=_pol)
             print(f'{off:>11.0f} {r["evan_ratio"]:>11.4e} {r["delta_um"]:>10.3f} {r["ATR_dB"]:>9.4f}')
         return
 
@@ -300,9 +356,9 @@ def main():
     print('-'*64)
     for nm in names:
         t_lip, t_aq, t_mu, n_aq = scen[nm]
-        r = run_scenario(nm, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
+        r = run_scenario(nm, _tl(t_lip), t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
                          args.offset_um, args.waist_um, args.alpha_tear_permm,
-                         coupling=coupling, r_bend_um=r_bend_um)
+                         coupling=coupling, r_bend_um=r_bend_um, pol=_pol)
         print(f'{nm:<14} {r["neff_max"]:>8.4f} {r["evan_ratio"]:>11.4e} {r["delta_um"]:>10.3f} '
               f'{r["throughput_bend"]:>8.4f} {r["ATR_dB"]:>9.4f}')
     if r_bend_um:
