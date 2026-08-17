@@ -24,7 +24,8 @@ if _REPO_ROOT not in sys.path:
 # Backend (GPU/CPU) und Physik/Materialdaten aus den geteilten Modulen.
 from common.backend import xp, cp, GPU_AVAILABLE, to_np           # noqa: E402
 from common.physics import C0, EPS0, MU0, N_AIR, DISPERSION, n_at  # noqa: E402
-from planar_beads.boundaries import make_boundary, mur1_coeff      # noqa: E402
+from planar_beads.boundaries import (make_boundary, mur1_coeff,     # noqa: E402
+                                     CPML_TE, CPML_TM)
 
 # ---------- demo_beads-spezifische Material-Defaults ----------
 # Kurznamen-Konstanten fuer die 2D-Demo (Brechzahlen aus common.physics ableiten
@@ -557,9 +558,10 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                        length_um=None, bead_x_um=None, wg_n=None, bead_n=None,
                        n_aqueous=None, n_mucin=None, n_cornea=None, n_lipid=None,
                        polarization='s', curved=False, boundary='mur1'):
-    if boundary and boundary.lower() != 'mur1':
-        print(f"  [Rand] '{boundary}' wird derzeit nur von method=full unterstuetzt; "
-              f"stitch nutzt Mur 1. Ordnung (Handoff-Kanten).")
+    _cpml_st = (boundary or 'mur1').lower() == 'cpml'
+    if boundary and boundary.lower() not in ('mur1', 'cpml'):
+        print(f"  [Rand] '{boundary}' nicht fuer stitch; nutze Mur 1. Ordnung. "
+              f"(stitch unterstuetzt: mur1 | cpml an den y-Raendern)")
     """Voller gefuellter CW-Waveguide per GEBIETS-ZERLEGUNG (Hard-Overlap-Handoff).
     Jedes Fenster wird bis zum Steady-State gerechnet; im Ueberlappbereich wird das
     zeitharmonische Feld (komplexe Amplitude, DFT bei f0) des Vorgaengers hart
@@ -609,7 +611,8 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
     phase_y_ey = 0.5*(phase_y[:-1] + phase_y[1:])
     src_ix = 5
     _Nyc = (Ny-1) if _pol == 'p' else Ny                  # y-Groesse der Hauptkomp.
-    print(f'Polarisation: {_pol}-Pol ({"TM/Ey" if _pol=="p" else "TE/Ez"})')
+    print(f'Polarisation: {_pol}-Pol ({"TM/Ey" if _pol=="p" else "TE/Ez"})'
+          + ('  Rand: CPML (y) + Mur (x/Handoff)' if _cpml_st else '  Rand: Mur 1. Ordnung'))
     # v2: weiche cosinus-getaperte Einpraegung des Overlaps (1 an linker Kante ->
     # 0 an Innenkante) statt hartem Dirichlet -> vermeidet Naht/Reflexion am
     # Uebergang zur frei gerechneten Region.
@@ -638,6 +641,12 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
         Ex_t = xp.zeros((Nx_win-1, Ny), dtype=xp.float32)
         Ey_t = xp.zeros((Nx_win, Ny-1), dtype=xp.float32)
         Hz_t = xp.zeros((Nx_win-1, Ny-1), dtype=xp.float32)
+        # CPML nur an den (statischen) y-Raendern; x bleibt Mur/Handoff (npml_x=0).
+        cpml = None
+        if _cpml_st:
+            NPML = 10
+            cpml = ((CPML_TM if _pol == 'p' else CPML_TE)
+                    (Nx_win, Ny, dx, dt, npml_x=0, npml_y=NPML))
         acc = np.zeros((Nx_win, _Nyc), dtype=np.complex64); acc_n = 0
         _drive = xp.asarray(Ehand.astype(np.complex64)) if (w > 0 and Ehand is not None) else None
         for n in range(steps_win):
@@ -645,11 +654,17 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
             env = float(1 - np.exp(-((t_phys/(2*sigma_t))**2)))    # sanfter Anlauf
             if _pol == 'p':
                 # --- TM (Hz, Ex, Ey) ---
-                Hz_t += -Ch_tm*((Ey_t[1:, :] - Ey_t[:-1, :]) - (Ex_t[:, 1:] - Ex_t[:, :-1]))
-                ey_r = Ey_t[-2, :].copy(); ex_b = Ex_t[:, 1].copy(); ex_tp = Ex_t[:, -2].copy()
-                ey_l = Ey_t[1, :].copy()
-                Ex_t[:, 1:-1] += Ca_ex[:, 1:-1]*(Hz_t[:, 1:] - Hz_t[:, :-1])
-                Ey_t[1:-1, :] += -Ca_ey[1:-1, :]*(Hz_t[1:, :] - Hz_t[:-1, :])
+                if _cpml_st:
+                    cpml.update_H(Ex_t, Ey_t, Hz_t, Ch_tm)
+                else:
+                    Hz_t += -Ch_tm*((Ey_t[1:, :] - Ey_t[:-1, :]) - (Ex_t[:, 1:] - Ex_t[:, :-1]))
+                ey_r = Ey_t[-2, :].copy(); ey_l = Ey_t[1, :].copy()
+                ex_b = Ex_t[:, 1].copy(); ex_tp = Ex_t[:, -2].copy()
+                if _cpml_st:
+                    cpml.update_E(Ex_t, Ey_t, Hz_t, Ca_ex, Ca_ey)
+                else:
+                    Ex_t[:, 1:-1] += Ca_ex[:, 1:-1]*(Hz_t[:, 1:] - Hz_t[:, :-1])
+                    Ey_t[1:-1, :] += -Ca_ey[1:-1, :]*(Hz_t[1:, :] - Hz_t[:-1, :])
                 if w == 0:
                     if vcsel_tilt != 0.0:
                         Ey_t[src_ix, :] += env*xp.sin(2*np.pi*f0*t_phys + phase_y_ey)*src_p_ey
@@ -660,20 +675,29 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                     _din = env*xp.real(_drive*np.exp(1j*omega*t_phys))
                     Ey_t[:O_cells, :] = _wtap*_din + (1.0 - _wtap)*Ey_t[:O_cells, :]
                 Ey_t[-1, :] = ey_r + mur*(Ey_t[-2, :] - Ey_t[-1, :])
-                Ex_t[:, 0] = ex_b + mur*(Ex_t[:, 1] - Ex_t[:, 0])
-                Ex_t[:, -1] = ex_tp + mur*(Ex_t[:, -2] - Ex_t[:, -1])
+                if _cpml_st:
+                    cpml.terminate(Ex_t, Ey_t)       # y-PEC hinter der PML (x bleibt Mur)
+                else:
+                    Ex_t[:, 0] = ex_b + mur*(Ex_t[:, 1] - Ex_t[:, 0])
+                    Ex_t[:, -1] = ex_tp + mur*(Ex_t[:, -2] - Ex_t[:, -1])
                 if n >= steps_win - n_acc:
                     acc += (to_np(Ey_t)*np.exp(-1j*omega*t_phys)).astype(np.complex64)
                     acc_n += 1
             else:
                 # --- TE (Ez, Hx, Hy) ---
-                Hx -= Ch*(Ez[:, 1:] - Ez[:, :-1])
-                Hy += Ch*(Ez[1:, :] - Ez[:-1, :])
+                if _cpml_st:
+                    cpml.update_H(Ez, Hx, Hy, Ch)
+                else:
+                    Hx -= Ch*(Ez[:, 1:] - Ez[:, :-1])
+                    Hy += Ch*(Ez[1:, :] - Ez[:-1, :])
                 ex2 = Ez[-2, :].copy(); ey1 = Ez[:, 1].copy(); ey2 = Ez[:, -2].copy()
                 ex1 = Ez[1, :].copy()
-                Ez[1:-1, 1:-1] = (Ce_E[1:-1, 1:-1]*Ez[1:-1, 1:-1]
-                                  + Ce_H[1:-1, 1:-1]*((Hy[1:, 1:-1] - Hy[:-1, 1:-1])
-                                                      - (Hx[1:-1, 1:] - Hx[1:-1, :-1])))
+                if _cpml_st:
+                    cpml.update_E(Ez, Hx, Hy, Ce_E, Ce_H)
+                else:
+                    Ez[1:-1, 1:-1] = (Ce_E[1:-1, 1:-1]*Ez[1:-1, 1:-1]
+                                      + Ce_H[1:-1, 1:-1]*((Hy[1:, 1:-1] - Hy[:-1, 1:-1])
+                                                          - (Hx[1:-1, 1:] - Hx[1:-1, :-1])))
                 if w == 0:
                     if vcsel_tilt != 0.0:
                         Ez[src_ix, :] += env*xp.sin(2*np.pi*f0*t_phys + phase_y)*src_p
@@ -684,8 +708,11 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                     _din = env*xp.real(_drive*np.exp(1j*omega*t_phys))
                     Ez[:O_cells, :] = _wtap*_din + (1.0 - _wtap)*Ez[:O_cells, :]
                 Ez[-1, :] = ex2 + mur*(Ez[-2, :] - Ez[-1, :])
-                Ez[:, 0] = ey1 + mur*(Ez[:, 1] - Ez[:, 0])
-                Ez[:, -1] = ey2 + mur*(Ez[:, -2] - Ez[:, -1])
+                if _cpml_st:
+                    cpml.terminate(Ez)               # y-PEC hinter der PML (x bleibt Mur)
+                else:
+                    Ez[:, 0] = ey1 + mur*(Ez[:, 1] - Ez[:, 0])
+                    Ez[:, -1] = ey2 + mur*(Ez[:, -2] - Ez[:, -1])
                 if n >= steps_win - n_acc:
                     acc += (to_np(Ez)*np.exp(-1j*omega*t_phys)).astype(np.complex64)
                     acc_n += 1

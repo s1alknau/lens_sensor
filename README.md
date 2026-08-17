@@ -184,8 +184,9 @@ is amortized over more cells).
   (default, 1st-order Mur), `mur2` (2nd-order Mur, better at oblique incidence),
   or `cpml` (convolutional PML, best absorption). Measured residual reflection of
   a broadband point source (`tests/boundary_reflection.py`): mur1 ≈ −32 dB,
-  mur2 ≈ −45 dB, cpml ≈ −57 dB. `sliding`/`stitch` currently use `mur1`
-  (co-moving window / handoff edges).
+  mur2 ≈ −45 dB, cpml ≈ −57 dB. `stitch` additionally supports `cpml` on its
+  (static) transverse y-boundaries while the x-edges stay Mur/handoff; `sliding`
+  uses `mur1` (co-moving window).
 - No subpixel averaging → grid-staircasing of curved/oblique material interfaces.
 - Coarse-resolution n_eff bias (numerical dispersion); needs finer dx for < 0.001 accuracy.
 - 4 GB GPU caps full-domain 3D and the large contact lens → use `--method stitch`.
