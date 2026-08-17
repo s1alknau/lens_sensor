@@ -453,8 +453,10 @@ class SimGUI:
                 bx = self._sketch_val('bead_x', float('nan'))
                 fx = 0.5 if (length <= 0 or math.isnan(bx)) else max(0.05, min(0.95, bx/length))
                 by = self._sketch_val('bead_y_um', float('nan'))
-                cyb = (ycore + core_h + 0.05*Ht) if math.isnan(by) else (ycm - by*3.0)
                 r = max(4, min(14, bd*6))
+                # Default (bead_y leer): Oberkante an der WG-Unterkante (y=0), also
+                # direkt am Waveguide anliegend -> Mittelpunkt r unter der Kernkante.
+                cyb = (ycore + core_h + r) if math.isnan(by) else (ycm - by*3.0)
                 cxb = xL + fx*(xR - xL)
                 c.create_oval(cxb - r, cyb - r, cxb + r, cyb + r,
                               fill='#ff7043', outline='#a33')
