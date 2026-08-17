@@ -148,7 +148,8 @@ def _run_2d(args, layers):
         n_aqueous=layers['n_aq'], n_mucin=layers['n_mu'],
         n_cornea=layers['n_co'], n_lipid=layers['n_lip'],
         polarization=args.polarization,
-        curved=(args.curved and args.geometry == 'lens'))
+        curved=(args.curved and args.geometry == 'lens'),
+        boundary=args.boundary)
     if not args.no_save:
         d2.save_results(result, out_dir=os.path.join(_REPO_ROOT, 'results'))
     return result
@@ -300,6 +301,9 @@ def build_parser():
     g_basic.add_argument('--lambda-nm', type=float, default=850.0, help='Wellenlaenge in nm')
     g_basic.add_argument('--polarization', choices=('s', 'p'), default='s',
                          help='s=TE (Ez) | p=TM (Ey)')
+    g_basic.add_argument('--boundary', choices=('mur1', 'mur2', 'cpml'), default='mur1',
+                         help='Absorbierender Rand (nur 2D method=full): mur1 (Default) | '
+                              'mur2 (besser schraeg) | cpml (beste Absorption)')
     g_basic.add_argument('--source-type', choices=('cw', 'pulse'), default='cw')
     g_basic.add_argument('--snapshots', type=int, default=8, help='Anzahl gespeicherter Frames')
 

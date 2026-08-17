@@ -24,6 +24,7 @@ if _REPO_ROOT not in sys.path:
 # Backend (GPU/CPU) und Physik/Materialdaten aus den geteilten Modulen.
 from common.backend import xp, cp, GPU_AVAILABLE, to_np           # noqa: E402
 from common.physics import C0, EPS0, MU0, N_AIR, DISPERSION, n_at  # noqa: E402
+from planar_beads.boundaries import make_boundary, mur1_coeff      # noqa: E402
 
 # ---------- demo_beads-spezifische Material-Defaults ----------
 # Kurznamen-Konstanten fuer die 2D-Demo (Brechzahlen aus common.physics ableiten
@@ -178,7 +179,7 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
               window_w_um=350.0, slide_um=150.0, place_bead=True, t_aqueous_um=None,
               t_mucin_um=None, t_lipid_um=0.0, input_gap_um=0.0, length_um=None,
               bead_x_um=None, wg_n=None, bead_n=None, n_aqueous=None, n_mucin=None,
-              n_cornea=None, n_lipid=None, polarization='s', curved=False):
+              n_cornea=None, n_lipid=None, polarization='s', curved=False, boundary='mur1'):
     if method == 'sliding':
         return run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapshots,
                                  wg_thickness_um, lambda_nm, vcsel_waist, vcsel_tilt,
@@ -187,7 +188,8 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
                                  input_gap_um=input_gap_um, length_um=length_um,
                                  bead_x_um=bead_x_um, wg_n=wg_n, bead_n=bead_n,
                                  n_aqueous=n_aqueous, n_mucin=n_mucin, n_cornea=n_cornea,
-                                 n_lipid=n_lipid, polarization=polarization, curved=curved)
+                                 n_lipid=n_lipid, polarization=polarization, curved=curved,
+                                 boundary=boundary)
     if method == 'stitch':
         return run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapshots,
                                   wg_thickness_um, lambda_nm, vcsel_waist, vcsel_tilt,
@@ -196,7 +198,8 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
                                   input_gap_um=input_gap_um, length_um=length_um,
                                   bead_x_um=bead_x_um, wg_n=wg_n, bead_n=bead_n,
                                   n_aqueous=n_aqueous, n_mucin=n_mucin, n_cornea=n_cornea,
-                                  n_lipid=n_lipid, polarization=polarization, curved=curved)
+                                  n_lipid=n_lipid, polarization=polarization, curved=curved,
+                                  boundary=boundary)
     _pol = 'p' if str(polarization).lower() in ('p', 'tm') else 's'
     t_aq_um = t_aqueous_um if t_aqueous_um is not None else T_AQ*1e6   # feste Aqueous-Dicke
     t_total = time.time()
@@ -244,7 +247,13 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
     f0 = C0/LAM; sigma_t = 4/(2*np.pi*f0); k0 = 2*np.pi/LAM
     phase_y = float(np.sin(np.radians(vcsel_tilt)))*k0*(ys_idx - iy_src)*dx
     phase_y_ey = 0.5*(phase_y[:-1] + phase_y[1:])
-    mur = xp.float32((C0*dt - dx)/(C0*dt + dx))
+    mur = mur1_coeff(dx, dt)
+    NPML = 10
+    bnd = make_boundary(boundary, _pol, Nx, Ny, dx, dt, npml=NPML)
+    _cpml = boundary.lower() == 'cpml'
+    if _cpml:
+        src_ix = max(src_ix, NPML + 2)               # Quelle nicht in die PML legen
+    print(f'Rand: {boundary}' + (f' (PML {NPML} Zellen, src@ix={src_ix})' if _cpml else ''))
     print(f'Polarisation: {_pol}-Pol -> {"TM (Ey/Ex/Hz), Quelle treibt Ey" if _pol=="p" else "TE (Ez/Hx/Hy), Quelle treibt Ez"}')
     steps_total = int(L*wg_n/C0/dt)*2
     snap_every = max(1, steps_total//n_snapshots)
@@ -281,36 +290,61 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
             envelope = float(1 - np.exp(-((t_phys/(2*sigma_t))**2)))
         if _pol == 'p':
             # --- TM (Hz, Ex, Ey) ---
-            Hz_t += -Ch_tm*((Ey_t[1:, :] - Ey_t[:-1, :]) - (Ex_t[:, 1:] - Ex_t[:, :-1]))
+            if _cpml:
+                bnd.update_H(Ex_t, Ey_t, Hz_t, Ch_tm)
+            else:
+                Hz_t += -Ch_tm*((Ey_t[1:, :] - Ey_t[:-1, :]) - (Ex_t[:, 1:] - Ex_t[:, :-1]))
+            if bnd is not None and not _cpml:
+                bnd.capture(Ex_t, Ey_t)              # Mur-2: Kanten VOR Update sichern
             ey_l = Ey_t[1, :].copy(); ey_r = Ey_t[-2, :].copy()
             ex_b = Ex_t[:, 1].copy(); ex_t = Ex_t[:, -2].copy()
-            Ex_t[:, 1:-1] += Ca_ex[:, 1:-1]*(Hz_t[:, 1:] - Hz_t[:, :-1])
-            Ey_t[1:-1, :] += -Ca_ey[1:-1, :]*(Hz_t[1:, :] - Hz_t[:-1, :])
+            if _cpml:
+                bnd.update_E(Ex_t, Ey_t, Hz_t, Ca_ex, Ca_ey)
+            else:
+                Ex_t[:, 1:-1] += Ca_ex[:, 1:-1]*(Hz_t[:, 1:] - Hz_t[:, :-1])
+                Ey_t[1:-1, :] += -Ca_ey[1:-1, :]*(Hz_t[1:, :] - Hz_t[:-1, :])
             if vcsel_tilt != 0.0:
                 Ey_t[src_ix, :] += envelope*xp.sin(2*np.pi*f0*t_phys + phase_y_ey)*src_p_ey
             else:
                 Ey_t[src_ix, :] += envelope*float(np.sin(2*np.pi*f0*t_phys))*src_p_ey
-            # Mur 1. Ordnung: Ey an x-Raendern, Ex an y-Raendern (tangential)
-            Ey_t[0, :] = ey_l + mur*(Ey_t[1, :] - Ey_t[0, :])
-            Ey_t[-1, :] = ey_r + mur*(Ey_t[-2, :] - Ey_t[-1, :])
-            Ex_t[:, 0] = ex_b + mur*(Ex_t[:, 1] - Ex_t[:, 0])
-            Ex_t[:, -1] = ex_t + mur*(Ex_t[:, -2] - Ex_t[:, -1])
+            if _cpml:
+                bnd.terminate(Ex_t, Ey_t)            # PEC hinter der PML
+            elif bnd is not None:
+                bnd.apply(Ex_t, Ey_t)                # Mur-2
+            else:                                    # Mur 1. Ordnung (Default)
+                Ey_t[0, :] = ey_l + mur*(Ey_t[1, :] - Ey_t[0, :])
+                Ey_t[-1, :] = ey_r + mur*(Ey_t[-2, :] - Ey_t[-1, :])
+                Ex_t[:, 0] = ex_b + mur*(Ex_t[:, 1] - Ex_t[:, 0])
+                Ex_t[:, -1] = ex_t + mur*(Ex_t[:, -2] - Ex_t[:, -1])
             field = _tm_node_field(Ey_t)              # (Nx,Ny) fuer Frames/Detektor
         else:
             # --- TE (Ez, Hx, Hy) ---
-            Hx -= Ch*(Ez[:, 1:] - Ez[:, :-1])
-            Hy += Ch*(Ez[1:, :] - Ez[:-1, :])
+            if _cpml:
+                bnd.update_H(Ez, Hx, Hy, Ch)
+            else:
+                Hx -= Ch*(Ez[:, 1:] - Ez[:, :-1])
+                Hy += Ch*(Ez[1:, :] - Ez[:-1, :])
+            if bnd is not None and not _cpml:
+                bnd.capture(Ez)                      # Mur-2: Ez-Kanten VOR Update
             ex1, ex2 = Ez[1, :].copy(), Ez[-2, :].copy()
             ey1, ey2 = Ez[:, 1].copy(), Ez[:, -2].copy()
-            Ez[1:-1, 1:-1] = (Ce_E[1:-1, 1:-1]*Ez[1:-1, 1:-1]
-                              + Ce_H[1:-1, 1:-1]*((Hy[1:, 1:-1] - Hy[:-1, 1:-1])
-                                                  - (Hx[1:-1, 1:] - Hx[1:-1, :-1])))
+            if _cpml:
+                bnd.update_E(Ez, Hx, Hy, Ce_E, Ce_H)
+            else:
+                Ez[1:-1, 1:-1] = (Ce_E[1:-1, 1:-1]*Ez[1:-1, 1:-1]
+                                  + Ce_H[1:-1, 1:-1]*((Hy[1:, 1:-1] - Hy[:-1, 1:-1])
+                                                      - (Hx[1:-1, 1:] - Hx[1:-1, :-1])))
             if vcsel_tilt != 0.0:
                 Ez[src_ix, :] += envelope*xp.sin(2*np.pi*f0*t_phys + phase_y)*src_p
             else:
                 Ez[src_ix, :] += envelope*float(np.sin(2*np.pi*f0*t_phys))*src_p
-            Ez[0, :] = ex1 + mur*(Ez[1, :] - Ez[0, :]); Ez[-1, :] = ex2 + mur*(Ez[-2, :] - Ez[-1, :])
-            Ez[:, 0] = ey1 + mur*(Ez[:, 1] - Ez[:, 0]); Ez[:, -1] = ey2 + mur*(Ez[:, -2] - Ez[:, -1])
+            if _cpml:
+                bnd.terminate(Ez)                    # PEC hinter der PML
+            elif bnd is not None:
+                bnd.apply(Ez)                        # Mur-2
+            else:                                    # Mur 1. Ordnung (Default)
+                Ez[0, :] = ex1 + mur*(Ez[1, :] - Ez[0, :]); Ez[-1, :] = ex2 + mur*(Ez[-2, :] - Ez[-1, :])
+                Ez[:, 0] = ey1 + mur*(Ez[:, 1] - Ez[:, 0]); Ez[:, -1] = ey2 + mur*(Ez[:, -2] - Ez[:, -1])
             field = Ez
         bi = field[ixin0:ixin1, iy_lo:iy_hi]; bo = field[ixout0:ixout1, iy_lo:iy_hi]
         P_in += float(xp.sum(bi*bi))*dx*dx; P_out += float(xp.sum(bo*bo))*dx*dx
@@ -364,7 +398,10 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
                       t_aqueous_um=None, t_mucin_um=None, t_lipid_um=0.0, input_gap_um=0.0,
                       length_um=None, bead_x_um=None, wg_n=None, bead_n=None,
                       n_aqueous=None, n_mucin=None, n_cornea=None, n_lipid=None,
-                      polarization='s', curved=False):
+                      polarization='s', curved=False, boundary='mur1'):
+    if boundary and boundary.lower() != 'mur1':
+        print(f"  [Rand] '{boundary}' wird derzeit nur von method=full unterstuetzt; "
+              f"sliding nutzt Mur 1. Ordnung (Co-Moving-Fenster).")
     _pol = 'p' if str(polarization).lower() in ('p', 'tm') else 's'
     t_total = time.time()
     t_aq_um = t_aqueous_um if t_aqueous_um is not None else T_AQ*1e6   # feste Aqueous-Dicke
@@ -519,7 +556,10 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                        t_aqueous_um=None, t_mucin_um=None, t_lipid_um=0.0, input_gap_um=0.0,
                        length_um=None, bead_x_um=None, wg_n=None, bead_n=None,
                        n_aqueous=None, n_mucin=None, n_cornea=None, n_lipid=None,
-                       polarization='s', curved=False):
+                       polarization='s', curved=False, boundary='mur1'):
+    if boundary and boundary.lower() != 'mur1':
+        print(f"  [Rand] '{boundary}' wird derzeit nur von method=full unterstuetzt; "
+              f"stitch nutzt Mur 1. Ordnung (Handoff-Kanten).")
     """Voller gefuellter CW-Waveguide per GEBIETS-ZERLEGUNG (Hard-Overlap-Handoff).
     Jedes Fenster wird bis zum Steady-State gerechnet; im Ueberlappbereich wird das
     zeitharmonische Feld (komplexe Amplitude, DFT bei f0) des Vorgaengers hart

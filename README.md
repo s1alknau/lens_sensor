@@ -169,7 +169,7 @@ is amortized over more cells).
 | Hardware | GPU (CuPy) **or** CPU (NumPy fallback) | CPU only, parallel via MPI; no GPU |
 | Speed (this bench) | fastest (single GPU) | slower per core; needs many cores |
 | Accuracy | correct physics + numerical dispersion | same, **plus** exact MPB eigensolver |
-| Boundaries | Mur 1st-order ABC | PML (stronger absorption) |
+| Boundaries | Mur 1st/2nd-order ABC **or** CPML (`--boundary`, 2D full) | PML (stronger absorption) |
 | Curved/oblique interfaces | staircased on the Yee grid | subpixel smoothing (less staircasing) |
 | Mode handling | source-driven | `EigenModeSource` + MPB eigenmodes |
 | Large / long domains | GPU **stitch** (windowed, low RAM) | full domain is RAM-heavy; mode-cascade stitch |
@@ -180,7 +180,12 @@ is amortized over more cells).
 ### Limitations
 
 **native**
-- Mur 1st-order ABC absorbs less cleanly than PML → small residual boundary reflections.
+- Absorbing boundary selectable via `--boundary` (2D `--method full`): `mur1`
+  (default, 1st-order Mur), `mur2` (2nd-order Mur, better at oblique incidence),
+  or `cpml` (convolutional PML, best absorption). Measured residual reflection of
+  a broadband point source (`tests/boundary_reflection.py`): mur1 ≈ −32 dB,
+  mur2 ≈ −45 dB, cpml ≈ −57 dB. `sliding`/`stitch` currently use `mur1`
+  (co-moving window / handoff edges).
 - No subpixel averaging → grid-staircasing of curved/oblique material interfaces.
 - Coarse-resolution n_eff bias (numerical dispersion); needs finer dx for < 0.001 accuracy.
 - 4 GB GPU caps full-domain 3D and the large contact lens → use `--method stitch`.
