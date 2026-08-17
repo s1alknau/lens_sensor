@@ -180,13 +180,18 @@ is amortized over more cells).
 ### Limitations
 
 **native**
-- Absorbing boundary selectable via `--boundary` (2D `--method full`): `mur1`
+- Absorbing boundary selectable via `--boundary` for **all 2D methods**: `mur1`
   (default, 1st-order Mur), `mur2` (2nd-order Mur, better at oblique incidence),
   or `cpml` (convolutional PML, best absorption). Measured residual reflection of
   a broadband point source (`tests/boundary_reflection.py`): mur1 ≈ −32 dB,
-  mur2 ≈ −45 dB, cpml ≈ −57 dB. `stitch` additionally supports `cpml` on its
-  (static) transverse y-boundaries while the x-edges stay Mur/handoff; `sliding`
-  uses `mur1` (co-moving window).
+  mur2 ≈ −45 dB, cpml ≈ −57 dB. Coverage per method:
+  - `full` — all four edges (`mur1`/`mur2`/`cpml`).
+  - `sliding` — all four edges; the CPML ψ-fields co-move with the window and
+    the Mur-2 history resets on each slide.
+  - `stitch` — absorber on the (static) transverse **y-edges** only; the x-edges
+    stay Mur/handoff (source facet + hard-overlap CW handoff). `mur2` is
+    numerically incompatible with the hard handoff drive (late-time instability,
+    esp. TM), so on `stitch` it auto-upgrades to `cpml` (stable, stronger).
 - No subpixel averaging → grid-staircasing of curved/oblique material interfaces.
 - Coarse-resolution n_eff bias (numerical dispersion); needs finer dx for < 0.001 accuracy.
 - 4 GB GPU caps full-domain 3D and the large contact lens → use `--method stitch`.

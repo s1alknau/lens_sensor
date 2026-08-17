@@ -302,9 +302,10 @@ def build_parser():
     g_basic.add_argument('--polarization', choices=('s', 'p'), default='s',
                          help='s=TE (Ez) | p=TM (Ey)')
     g_basic.add_argument('--boundary', choices=('mur1', 'mur2', 'cpml'), default='mur1',
-                         help='Absorbierender Rand (2D): mur1 (Default) | mur2 (besser '
-                              'schraeg, nur full) | cpml (beste Absorption; full=alle '
-                              'Raender, stitch=y-Raender)')
+                         help='Absorbierender Rand (alle 2D-Methoden): mur1 (Default) | '
+                              'mur2 (besser schraeg) | cpml (beste Absorption). '
+                              'full/sliding: alle Kanten; stitch: y-Kanten '
+                              '(mur2->cpml wg. Handoff-Stabilitaet)')
     g_basic.add_argument('--source-type', choices=('cw', 'pulse'), default='cw')
     g_basic.add_argument('--snapshots', type=int, default=8, help='Anzahl gespeicherter Frames')
 

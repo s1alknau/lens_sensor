@@ -400,9 +400,9 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
                       length_um=None, bead_x_um=None, wg_n=None, bead_n=None,
                       n_aqueous=None, n_mucin=None, n_cornea=None, n_lipid=None,
                       polarization='s', curved=False, boundary='mur1'):
-    if boundary and boundary.lower() != 'mur1':
-        print(f"  [Rand] '{boundary}' wird derzeit nur von method=full unterstuetzt; "
-              f"sliding nutzt Mur 1. Ordnung (Co-Moving-Fenster).")
+    _bnd_kind = (boundary or 'mur1').lower()
+    _use_bnd = _bnd_kind in ('mur2', 'cpml')         # Rand-Objekt (sonst inline Mur-1)
+    _is_cpml = _bnd_kind == 'cpml'
     _pol = 'p' if str(polarization).lower() in ('p', 'tm') else 's'
     t_total = time.time()
     t_aq_um = t_aqueous_um if t_aqueous_um is not None else T_AQ*1e6   # feste Aqueous-Dicke
@@ -438,8 +438,13 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
     f0 = C0/LAM; sigma_t = 4/(2*np.pi*f0); k0 = 2*np.pi/LAM
     phase_y = float(np.sin(np.radians(vcsel_tilt)))*k0*(ys_idx - iy_src)*dx
     phase_y_ey = 0.5*(phase_y[:-1] + phase_y[1:])
-    mur = xp.float32((C0*dt - dx)/(C0*dt + dx))
-    print(f'Polarisation: {_pol}-Pol ({"TM/Ey" if _pol=="p" else "TE/Ez"})')
+    mur = mur1_coeff(dx, dt)
+    NPML = 10
+    bnd = make_boundary(_bnd_kind, _pol, Nx, Ny, dx, dt, npml=NPML) if _use_bnd else None
+    if _is_cpml:
+        src_ix = max(src_ix, NPML + 2)               # Quelle nicht in die PML legen
+    print(f'Polarisation: {_pol}-Pol ({"TM/Ey" if _pol=="p" else "TE/Ez"})  Rand: {_bnd_kind}'
+          + (' (alle Kanten, psi mitrollend)' if _is_cpml else ''))
     iy_lo = int(round((0.0 + TEAR_BUFFER)/dx)); iy_hi = int(round((T_WG + TEAR_BUFFER)/dx))
     iy_h_det = int(round(DET_LEN/2/dx))
     P_in = 0.0; P_out = 0.0
@@ -476,6 +481,10 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
                 Ez = xp.roll(Ez, -N_shift, axis=0); Ez[Nx-N_shift:, :] = 0
                 Hx = xp.roll(Hx, -N_shift, axis=0); Hx[Nx-N_shift:, :] = 0
                 Hy = xp.roll(Hy, -N_shift, axis=0); Hy[Hy.shape[0]-N_shift:, :] = 0
+            if _is_cpml:
+                bnd.roll(N_shift)                    # psi mit dem Fenster mitziehen
+            elif _use_bnd:
+                bnd.reset()                          # Mur-2-Historie nach Roll verwerfen
         src_active = (slide_i == 0)
         steps_slide = (int(window_w_um*1e-6*wg_n/C0/dt) if src_active
                        else int(slide_um*1e-6*wg_n/C0/dt)) + 200
@@ -489,36 +498,62 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
                 else:
                     envelope = float(1 - np.exp(-((t_phys/(2*sigma_t))**2)))
             if _pol == 'p':
-                Hz_t += -Ch_tm*((Ey_t[1:, :] - Ey_t[:-1, :]) - (Ex_t[:, 1:] - Ex_t[:, :-1]))
+                if _is_cpml:
+                    bnd.update_H(Ex_t, Ey_t, Hz_t, Ch_tm)
+                else:
+                    Hz_t += -Ch_tm*((Ey_t[1:, :] - Ey_t[:-1, :]) - (Ex_t[:, 1:] - Ex_t[:, :-1]))
+                if _use_bnd and not _is_cpml:
+                    bnd.capture(Ex_t, Ey_t)
                 ey_l = Ey_t[1, :].copy(); ey_r = Ey_t[-2, :].copy()
                 ex_b = Ex_t[:, 1].copy(); ex_tp = Ex_t[:, -2].copy()
-                Ex_t[:, 1:-1] += Ca_ex[:, 1:-1]*(Hz_t[:, 1:] - Hz_t[:, :-1])
-                Ey_t[1:-1, :] += -Ca_ey[1:-1, :]*(Hz_t[1:, :] - Hz_t[:-1, :])
+                if _is_cpml:
+                    bnd.update_E(Ex_t, Ey_t, Hz_t, Ca_ex, Ca_ey)
+                else:
+                    Ex_t[:, 1:-1] += Ca_ex[:, 1:-1]*(Hz_t[:, 1:] - Hz_t[:, :-1])
+                    Ey_t[1:-1, :] += -Ca_ey[1:-1, :]*(Hz_t[1:, :] - Hz_t[:-1, :])
                 if src_active:
                     if vcsel_tilt != 0.0:
                         Ey_t[src_ix, :] += envelope*xp.sin(2*np.pi*f0*t_phys + phase_y_ey)*src_p_ey
                     else:
                         Ey_t[src_ix, :] += envelope*float(np.sin(2*np.pi*f0*t_phys))*src_p_ey
-                Ey_t[0, :] = ey_l + mur*(Ey_t[1, :] - Ey_t[0, :])
-                Ey_t[-1, :] = ey_r + mur*(Ey_t[-2, :] - Ey_t[-1, :])
-                Ex_t[:, 0] = ex_b + mur*(Ex_t[:, 1] - Ex_t[:, 0])
-                Ex_t[:, -1] = ex_tp + mur*(Ex_t[:, -2] - Ex_t[:, -1])
+                if _is_cpml:
+                    bnd.terminate(Ex_t, Ey_t)
+                elif _use_bnd:
+                    bnd.apply(Ex_t, Ey_t)
+                else:
+                    Ey_t[0, :] = ey_l + mur*(Ey_t[1, :] - Ey_t[0, :])
+                    Ey_t[-1, :] = ey_r + mur*(Ey_t[-2, :] - Ey_t[-1, :])
+                    Ex_t[:, 0] = ex_b + mur*(Ex_t[:, 1] - Ex_t[:, 0])
+                    Ex_t[:, -1] = ex_tp + mur*(Ex_t[:, -2] - Ex_t[:, -1])
                 field = _tm_node_field(Ey_t)
             else:
-                Hx -= Ch*(Ez[:, 1:] - Ez[:, :-1])
-                Hy += Ch*(Ez[1:, :] - Ez[:-1, :])
+                if _is_cpml:
+                    bnd.update_H(Ez, Hx, Hy, Ch)
+                else:
+                    Hx -= Ch*(Ez[:, 1:] - Ez[:, :-1])
+                    Hy += Ch*(Ez[1:, :] - Ez[:-1, :])
+                if _use_bnd and not _is_cpml:
+                    bnd.capture(Ez)
                 ex1, ex2 = Ez[1, :].copy(), Ez[-2, :].copy()
                 ey1, ey2 = Ez[:, 1].copy(), Ez[:, -2].copy()
-                Ez[1:-1, 1:-1] = (Ce_E[1:-1, 1:-1]*Ez[1:-1, 1:-1]
-                                  + Ce_H[1:-1, 1:-1]*((Hy[1:, 1:-1] - Hy[:-1, 1:-1])
-                                                      - (Hx[1:-1, 1:] - Hx[1:-1, :-1])))
+                if _is_cpml:
+                    bnd.update_E(Ez, Hx, Hy, Ce_E, Ce_H)
+                else:
+                    Ez[1:-1, 1:-1] = (Ce_E[1:-1, 1:-1]*Ez[1:-1, 1:-1]
+                                      + Ce_H[1:-1, 1:-1]*((Hy[1:, 1:-1] - Hy[:-1, 1:-1])
+                                                          - (Hx[1:-1, 1:] - Hx[1:-1, :-1])))
                 if src_active:
                     if vcsel_tilt != 0.0:
                         Ez[src_ix, :] += envelope*xp.sin(2*np.pi*f0*t_phys + phase_y)*src_p
                     else:
                         Ez[src_ix, :] += envelope*float(np.sin(2*np.pi*f0*t_phys))*src_p
-                Ez[0, :] = ex1 + mur*(Ez[1, :] - Ez[0, :]); Ez[-1, :] = ex2 + mur*(Ez[-2, :] - Ez[-1, :])
-                Ez[:, 0] = ey1 + mur*(Ez[:, 1] - Ez[:, 0]); Ez[:, -1] = ey2 + mur*(Ez[:, -2] - Ez[:, -1])
+                if _is_cpml:
+                    bnd.terminate(Ez)
+                elif _use_bnd:
+                    bnd.apply(Ez)
+                else:
+                    Ez[0, :] = ex1 + mur*(Ez[1, :] - Ez[0, :]); Ez[-1, :] = ex2 + mur*(Ez[-2, :] - Ez[-1, :])
+                    Ez[:, 0] = ey1 + mur*(Ez[:, 1] - Ez[:, 0]); Ez[:, -1] = ey2 + mur*(Ez[:, -2] - Ez[:, -1])
                 field = Ez
             for (xg, which) in ((0.1*L_um, 'in'), (0.9*L_um, 'out')):
                 if x_start_um <= xg <= x_end_um:
@@ -558,10 +593,16 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                        length_um=None, bead_x_um=None, wg_n=None, bead_n=None,
                        n_aqueous=None, n_mucin=None, n_cornea=None, n_lipid=None,
                        polarization='s', curved=False, boundary='mur1'):
-    _cpml_st = (boundary or 'mur1').lower() == 'cpml'
-    if boundary and boundary.lower() not in ('mur1', 'cpml'):
-        print(f"  [Rand] '{boundary}' nicht fuer stitch; nutze Mur 1. Ordnung. "
-              f"(stitch unterstuetzt: mur1 | cpml an den y-Raendern)")
+    _bnd_kind = (boundary or 'mur1').lower()
+    if _bnd_kind == 'mur2':
+        # Mur-2 (history-basiert) ist mit dem HART eingepraegten Overlap-Handoff
+        # numerisch instabil (bes. TM divergiert nach vielen Schritten). CPML ist
+        # nicht history-basiert und mit dem Handoff vertraeglich -> hochstufen.
+        print("  [Rand] mur2 ist mit dem stitch-Handoff instabil -> nutze cpml an den "
+              "y-Raendern (stabil, staerkere Absorption).")
+        _bnd_kind = 'cpml'
+    _use_bnd_st = _bnd_kind in ('mur2', 'cpml')      # an den y-Raendern (x=Handoff/Quelle)
+    _is_cpml_st = _bnd_kind == 'cpml'
     """Voller gefuellter CW-Waveguide per GEBIETS-ZERLEGUNG (Hard-Overlap-Handoff).
     Jedes Fenster wird bis zum Steady-State gerechnet; im Ueberlappbereich wird das
     zeitharmonische Feld (komplexe Amplitude, DFT bei f0) des Vorgaengers hart
@@ -612,7 +653,7 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
     src_ix = 5
     _Nyc = (Ny-1) if _pol == 'p' else Ny                  # y-Groesse der Hauptkomp.
     print(f'Polarisation: {_pol}-Pol ({"TM/Ey" if _pol=="p" else "TE/Ez"})'
-          + ('  Rand: CPML (y) + Mur (x/Handoff)' if _cpml_st else '  Rand: Mur 1. Ordnung'))
+          + (f'  Rand: {_bnd_kind} (y) + Mur (x/Handoff)' if _use_bnd_st else '  Rand: Mur 1. Ordnung'))
     # v2: weiche cosinus-getaperte Einpraegung des Overlaps (1 an linker Kante ->
     # 0 an Innenkante) statt hartem Dirichlet -> vermeidet Naht/Reflexion am
     # Uebergang zur frei gerechneten Region.
@@ -641,12 +682,9 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
         Ex_t = xp.zeros((Nx_win-1, Ny), dtype=xp.float32)
         Ey_t = xp.zeros((Nx_win, Ny-1), dtype=xp.float32)
         Hz_t = xp.zeros((Nx_win-1, Ny-1), dtype=xp.float32)
-        # CPML nur an den (statischen) y-Raendern; x bleibt Mur/Handoff (npml_x=0).
-        cpml = None
-        if _cpml_st:
-            NPML = 10
-            cpml = ((CPML_TM if _pol == 'p' else CPML_TE)
-                    (Nx_win, Ny, dx, dt, npml_x=0, npml_y=NPML))
+        # Rand nur an den (statischen) y-Raendern; x bleibt Mur/Handoff.
+        bnd = (make_boundary(_bnd_kind, _pol, Nx_win, Ny, dx, dt,
+                             npml_x=0, npml_y=10, sides='y') if _use_bnd_st else None)
         acc = np.zeros((Nx_win, _Nyc), dtype=np.complex64); acc_n = 0
         _drive = xp.asarray(Ehand.astype(np.complex64)) if (w > 0 and Ehand is not None) else None
         for n in range(steps_win):
@@ -654,14 +692,16 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
             env = float(1 - np.exp(-((t_phys/(2*sigma_t))**2)))    # sanfter Anlauf
             if _pol == 'p':
                 # --- TM (Hz, Ex, Ey) ---
-                if _cpml_st:
-                    cpml.update_H(Ex_t, Ey_t, Hz_t, Ch_tm)
+                if _is_cpml_st:
+                    bnd.update_H(Ex_t, Ey_t, Hz_t, Ch_tm)
                 else:
                     Hz_t += -Ch_tm*((Ey_t[1:, :] - Ey_t[:-1, :]) - (Ex_t[:, 1:] - Ex_t[:, :-1]))
+                if _use_bnd_st and not _is_cpml_st:
+                    bnd.capture(Ex_t, Ey_t)          # Mur-2 (nur y-Kanten)
                 ey_r = Ey_t[-2, :].copy(); ey_l = Ey_t[1, :].copy()
                 ex_b = Ex_t[:, 1].copy(); ex_tp = Ex_t[:, -2].copy()
-                if _cpml_st:
-                    cpml.update_E(Ex_t, Ey_t, Hz_t, Ca_ex, Ca_ey)
+                if _is_cpml_st:
+                    bnd.update_E(Ex_t, Ey_t, Hz_t, Ca_ex, Ca_ey)
                 else:
                     Ex_t[:, 1:-1] += Ca_ex[:, 1:-1]*(Hz_t[:, 1:] - Hz_t[:, :-1])
                     Ey_t[1:-1, :] += -Ca_ey[1:-1, :]*(Hz_t[1:, :] - Hz_t[:-1, :])
@@ -675,8 +715,10 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                     _din = env*xp.real(_drive*np.exp(1j*omega*t_phys))
                     Ey_t[:O_cells, :] = _wtap*_din + (1.0 - _wtap)*Ey_t[:O_cells, :]
                 Ey_t[-1, :] = ey_r + mur*(Ey_t[-2, :] - Ey_t[-1, :])
-                if _cpml_st:
-                    cpml.terminate(Ex_t, Ey_t)       # y-PEC hinter der PML (x bleibt Mur)
+                if _is_cpml_st:
+                    bnd.terminate(Ex_t, Ey_t)        # y-PEC hinter der PML (x bleibt Mur)
+                elif _use_bnd_st:
+                    bnd.apply(Ex_t, Ey_t)            # Mur-2 an den y-Kanten
                 else:
                     Ex_t[:, 0] = ex_b + mur*(Ex_t[:, 1] - Ex_t[:, 0])
                     Ex_t[:, -1] = ex_tp + mur*(Ex_t[:, -2] - Ex_t[:, -1])
@@ -685,15 +727,17 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                     acc_n += 1
             else:
                 # --- TE (Ez, Hx, Hy) ---
-                if _cpml_st:
-                    cpml.update_H(Ez, Hx, Hy, Ch)
+                if _is_cpml_st:
+                    bnd.update_H(Ez, Hx, Hy, Ch)
                 else:
                     Hx -= Ch*(Ez[:, 1:] - Ez[:, :-1])
                     Hy += Ch*(Ez[1:, :] - Ez[:-1, :])
+                if _use_bnd_st and not _is_cpml_st:
+                    bnd.capture(Ez)                  # Mur-2 (nur y-Kanten)
                 ex2 = Ez[-2, :].copy(); ey1 = Ez[:, 1].copy(); ey2 = Ez[:, -2].copy()
                 ex1 = Ez[1, :].copy()
-                if _cpml_st:
-                    cpml.update_E(Ez, Hx, Hy, Ce_E, Ce_H)
+                if _is_cpml_st:
+                    bnd.update_E(Ez, Hx, Hy, Ce_E, Ce_H)
                 else:
                     Ez[1:-1, 1:-1] = (Ce_E[1:-1, 1:-1]*Ez[1:-1, 1:-1]
                                       + Ce_H[1:-1, 1:-1]*((Hy[1:, 1:-1] - Hy[:-1, 1:-1])
@@ -708,8 +752,10 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                     _din = env*xp.real(_drive*np.exp(1j*omega*t_phys))
                     Ez[:O_cells, :] = _wtap*_din + (1.0 - _wtap)*Ez[:O_cells, :]
                 Ez[-1, :] = ex2 + mur*(Ez[-2, :] - Ez[-1, :])
-                if _cpml_st:
-                    cpml.terminate(Ez)               # y-PEC hinter der PML (x bleibt Mur)
+                if _is_cpml_st:
+                    bnd.terminate(Ez)                # y-PEC hinter der PML (x bleibt Mur)
+                elif _use_bnd_st:
+                    bnd.apply(Ez)                    # Mur-2 an den y-Kanten
                 else:
                     Ez[:, 0] = ey1 + mur*(Ez[:, 1] - Ez[:, 0])
                     Ez[:, -1] = ey2 + mur*(Ez[:, -2] - Ez[:, -1])

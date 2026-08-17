@@ -112,6 +112,12 @@ class CPML_TE:
         if self.npml_y > 0:
             Ez[:, 0] = 0.0; Ez[:, -1] = 0.0
 
+    def roll(self, n_shift):                          # Co-Moving (sliding): psi mitziehen
+        for nm in ('psi_Hxy', 'psi_Hyx', 'psi_Ezx', 'psi_Ezy'):
+            a = xp.roll(getattr(self, nm), -n_shift, axis=0)
+            a[a.shape[0]-n_shift:, :] = 0.0
+            setattr(self, nm, a)
+
 
 class CPML_TM:
     """CPML fuer TM (Hz, Ex, Ey). Aeusserer E-Rand PEC (tangentiales E=0:
@@ -151,6 +157,12 @@ class CPML_TM:
         if self.npml_y > 0:
             Ex[:, 0] = 0.0; Ex[:, -1] = 0.0
 
+    def roll(self, n_shift):                          # Co-Moving (sliding): psi mitziehen
+        for nm in ('psi_Hzx', 'psi_Hzy', 'psi_Exy', 'psi_Eyx'):
+            a = xp.roll(getattr(self, nm), -n_shift, axis=0)
+            a[a.shape[0]-n_shift:, :] = 0.0
+            setattr(self, nm, a)
+
 
 # ======================================================================
 # Mur 2. Ordnung (transversaler Korrekturterm; nur Kanten-Historie)
@@ -165,11 +177,17 @@ def _mur2_coeffs(dx, dt):
 
 
 class _Mur2Edge:
-    """Mur-2 fuer EIN skalares Feld an seinen 4 Aussenkanten. Braucht die zwei
-    aeussersten Zell-Lagen zu den Zeiten n (cur) und n-1 (prev)."""
-    def __init__(self, dx, dt):
+    """Mur-2 fuer EIN skalares Feld an seinen Aussenkanten. Braucht die zwei
+    aeussersten Zell-Lagen zu den Zeiten n (cur) und n-1 (prev).
+    sides: 'xy' (alle 4 Kanten), 'x' (nur x) oder 'y' (nur y-Kanten; z.B. stitch,
+    wo die x-Kanten Quelle/Handoff sind)."""
+    def __init__(self, dx, dt, sides='xy'):
         self.ca, self.cb, self.cc, self.mur1 = _mur2_coeffs(dx, dt)
+        self.dox = 'x' in sides; self.doy = 'y' in sides
         self.prev = None; self.cur = None            # dicts der Kantenbaender
+
+    def reset(self):                                 # Historie verwerfen (z.B. nach Slide-Roll)
+        self.prev = None; self.cur = None
 
     def capture(self, F):                            # VOR dem Innen-Update (F=F^n)
         self.prev = self.cur
@@ -184,32 +202,35 @@ class _Mur2Edge:
         ca, cb, cc = self.ca, self.cb, self.cc
         cL, cR, cB, cT = self.cur['L'], self.cur['R'], self.cur['B'], self.cur['T']
         pL, pR, pB, pT = self.prev['L'], self.prev['R'], self.prev['B'], self.prev['T']
-        # --- x-Kanten (links i=0, rechts i=-1); j innen 1..Ny-2 ---
-        F[0, 1:-1] = (-pL[1, 1:-1] + ca*(F[1, 1:-1] + pL[0, 1:-1])
-                      + cb*(cL[0, 1:-1] + cL[1, 1:-1])
-                      + cc*(cL[0, 2:] - 2*cL[0, 1:-1] + cL[0, :-2]
-                            + cL[1, 2:] - 2*cL[1, 1:-1] + cL[1, :-2]))
-        F[-1, 1:-1] = (-pR[1, 1:-1] + ca*(F[-2, 1:-1] + pR[0, 1:-1])
-                       + cb*(cR[0, 1:-1] + cR[1, 1:-1])
-                       + cc*(cR[0, 2:] - 2*cR[0, 1:-1] + cR[0, :-2]
-                             + cR[1, 2:] - 2*cR[1, 1:-1] + cR[1, :-2]))
-        # --- y-Kanten (unten j=0, oben j=-1); i innen 1..Nx-2 ---
-        F[1:-1, 0] = (-pB[1:-1, 1] + ca*(F[1:-1, 1] + pB[1:-1, 0])
-                      + cb*(cB[1:-1, 0] + cB[1:-1, 1])
-                      + cc*(cB[2:, 0] - 2*cB[1:-1, 0] + cB[:-2, 0]
-                            + cB[2:, 1] - 2*cB[1:-1, 1] + cB[:-2, 1]))
-        F[1:-1, -1] = (-pT[1:-1, 1] + ca*(F[1:-1, -2] + pT[1:-1, 0])
-                       + cb*(cT[1:-1, 0] + cT[1:-1, 1])
-                       + cc*(cT[2:, 0] - 2*cT[1:-1, 0] + cT[:-2, 0]
-                             + cT[2:, 1] - 2*cT[1:-1, 1] + cT[:-2, 1]))
-        self._corners(F)
+        if self.dox:                                 # x-Kanten (links i=0, rechts i=-1)
+            F[0, 1:-1] = (-pL[1, 1:-1] + ca*(F[1, 1:-1] + pL[0, 1:-1])
+                          + cb*(cL[0, 1:-1] + cL[1, 1:-1])
+                          + cc*(cL[0, 2:] - 2*cL[0, 1:-1] + cL[0, :-2]
+                                + cL[1, 2:] - 2*cL[1, 1:-1] + cL[1, :-2]))
+            F[-1, 1:-1] = (-pR[1, 1:-1] + ca*(F[-2, 1:-1] + pR[0, 1:-1])
+                           + cb*(cR[0, 1:-1] + cR[1, 1:-1])
+                           + cc*(cR[0, 2:] - 2*cR[0, 1:-1] + cR[0, :-2]
+                                 + cR[1, 2:] - 2*cR[1, 1:-1] + cR[1, :-2]))
+        if self.doy:                                 # y-Kanten (unten j=0, oben j=-1)
+            F[1:-1, 0] = (-pB[1:-1, 1] + ca*(F[1:-1, 1] + pB[1:-1, 0])
+                          + cb*(cB[1:-1, 0] + cB[1:-1, 1])
+                          + cc*(cB[2:, 0] - 2*cB[1:-1, 0] + cB[:-2, 0]
+                                + cB[2:, 1] - 2*cB[1:-1, 1] + cB[:-2, 1]))
+            F[1:-1, -1] = (-pT[1:-1, 1] + ca*(F[1:-1, -2] + pT[1:-1, 0])
+                           + cb*(cT[1:-1, 0] + cT[1:-1, 1])
+                           + cc*(cT[2:, 0] - 2*cT[1:-1, 0] + cT[:-2, 0]
+                                 + cT[2:, 1] - 2*cT[1:-1, 1] + cT[:-2, 1]))
+        if self.dox and self.doy:
+            self._corners(F)
 
     def _mur1(self, F):
         m = self.mur1
-        F[0, :] = self.cur['L'][1, :] + m*(F[1, :] - self.cur['L'][0, :])
-        F[-1, :] = self.cur['R'][1, :] + m*(F[-2, :] - self.cur['R'][0, :])
-        F[:, 0] = self.cur['B'][:, 1] + m*(F[:, 1] - self.cur['B'][:, 0])
-        F[:, -1] = self.cur['T'][:, 1] + m*(F[:, -2] - self.cur['T'][:, 0])
+        if self.dox:
+            F[0, :] = self.cur['L'][1, :] + m*(F[1, :] - self.cur['L'][0, :])
+            F[-1, :] = self.cur['R'][1, :] + m*(F[-2, :] - self.cur['R'][0, :])
+        if self.doy:
+            F[:, 0] = self.cur['B'][:, 1] + m*(F[:, 1] - self.cur['B'][:, 0])
+            F[:, -1] = self.cur['T'][:, 1] + m*(F[:, -2] - self.cur['T'][:, 0])
 
     def _corners(self, F):                           # Ecken per Mur-1 stabil halten
         m = self.mur1; cL, cR = self.cur['L'], self.cur['R']
@@ -220,9 +241,12 @@ class _Mur2Edge:
 
 
 class Mur2TE:
-    """Mur 2. Ordnung fuer TE: wirkt auf Ez (alle 4 Kanten)."""
-    def __init__(self, dx, dt):
-        self.ez = _Mur2Edge(dx, dt)
+    """Mur 2. Ordnung fuer TE: wirkt auf Ez. sides in {'xy','x','y'}."""
+    def __init__(self, dx, dt, sides='xy'):
+        self.ez = _Mur2Edge(dx, dt, sides=sides)
+
+    def reset(self):
+        self.ez.reset()
 
     def capture(self, Ez):
         self.ez.capture(Ez)
@@ -233,11 +257,15 @@ class Mur2TE:
 
 class Mur2TM:
     """Mur 2. Ordnung fuer TM: Ey an x-Raendern, Ex an y-Raendern (tangential).
-    Ey und Ex haben je nur ZWEI absorbierende Kanten -> eigener, schlanker Pfad."""
-    def __init__(self, dx, dt):
+    sides in {'xy','x','y'} waehlt, welche Kanten absorbieren (stitch: 'y')."""
+    def __init__(self, dx, dt, sides='xy'):
         self.ca, self.cb, self.cc, self.mur1 = _mur2_coeffs(dx, dt)
+        self.dox = 'x' in sides; self.doy = 'y' in sides
         self.pEy = self.cEy = None                   # Ey-Baender an x-Kanten
         self.pEx = self.cEx = None                   # Ex-Baender an y-Kanten
+
+    def reset(self):
+        self.pEy = self.cEy = None; self.pEx = self.cEx = None
 
     def capture(self, Ex, Ey):
         self.pEy = self.cEy; self.cEy = (Ey[0:2, :].copy(), Ey[-1:-3:-1, :].copy())
@@ -247,40 +275,46 @@ class Mur2TM:
         ca, cb, cc, m = self.ca, self.cb, self.cc, self.mur1
         if self.pEy is None:                         # erster Schritt: Mur-1
             cL, cR = self.cEy; cB, cT = self.cEx
-            Ey[0, :] = cL[1, :] + m*(Ey[1, :] - cL[0, :])
-            Ey[-1, :] = cR[1, :] + m*(Ey[-2, :] - cR[0, :])
-            Ex[:, 0] = cB[:, 1] + m*(Ex[:, 1] - cB[:, 0])
-            Ex[:, -1] = cT[:, 1] + m*(Ex[:, -2] - cT[:, 0])
+            if self.dox:
+                Ey[0, :] = cL[1, :] + m*(Ey[1, :] - cL[0, :])
+                Ey[-1, :] = cR[1, :] + m*(Ey[-2, :] - cR[0, :])
+            if self.doy:
+                Ex[:, 0] = cB[:, 1] + m*(Ex[:, 1] - cB[:, 0])
+                Ex[:, -1] = cT[:, 1] + m*(Ex[:, -2] - cT[:, 0])
             return
-        (cL, cR) = self.cEy; (pL, pR) = self.pEy
-        Ey[0, 1:-1] = (-pL[1, 1:-1] + ca*(Ey[1, 1:-1] + pL[0, 1:-1])
-                       + cb*(cL[0, 1:-1] + cL[1, 1:-1])
-                       + cc*(cL[0, 2:] - 2*cL[0, 1:-1] + cL[0, :-2]
-                             + cL[1, 2:] - 2*cL[1, 1:-1] + cL[1, :-2]))
-        Ey[-1, 1:-1] = (-pR[1, 1:-1] + ca*(Ey[-2, 1:-1] + pR[0, 1:-1])
-                        + cb*(cR[0, 1:-1] + cR[1, 1:-1])
-                        + cc*(cR[0, 2:] - 2*cR[0, 1:-1] + cR[0, :-2]
-                              + cR[1, 2:] - 2*cR[1, 1:-1] + cR[1, :-2]))
-        (bB, tT) = self.cEx; (pB, pT) = self.pEx
-        Ex[1:-1, 0] = (-pB[1:-1, 1] + ca*(Ex[1:-1, 1] + pB[1:-1, 0])
-                       + cb*(bB[1:-1, 0] + bB[1:-1, 1])
-                       + cc*(bB[2:, 0] - 2*bB[1:-1, 0] + bB[:-2, 0]
-                             + bB[2:, 1] - 2*bB[1:-1, 1] + bB[:-2, 1]))
-        Ex[1:-1, -1] = (-pT[1:-1, 1] + ca*(Ex[1:-1, -2] + pT[1:-1, 0])
-                        + cb*(tT[1:-1, 0] + tT[1:-1, 1])
-                        + cc*(tT[2:, 0] - 2*tT[1:-1, 0] + tT[:-2, 0]
-                              + tT[2:, 1] - 2*tT[1:-1, 1] + tT[:-2, 1]))
+        if self.dox:
+            (cL, cR) = self.cEy; (pL, pR) = self.pEy
+            Ey[0, 1:-1] = (-pL[1, 1:-1] + ca*(Ey[1, 1:-1] + pL[0, 1:-1])
+                           + cb*(cL[0, 1:-1] + cL[1, 1:-1])
+                           + cc*(cL[0, 2:] - 2*cL[0, 1:-1] + cL[0, :-2]
+                                 + cL[1, 2:] - 2*cL[1, 1:-1] + cL[1, :-2]))
+            Ey[-1, 1:-1] = (-pR[1, 1:-1] + ca*(Ey[-2, 1:-1] + pR[0, 1:-1])
+                            + cb*(cR[0, 1:-1] + cR[1, 1:-1])
+                            + cc*(cR[0, 2:] - 2*cR[0, 1:-1] + cR[0, :-2]
+                                  + cR[1, 2:] - 2*cR[1, 1:-1] + cR[1, :-2]))
+        if self.doy:
+            (bB, tT) = self.cEx; (pB, pT) = self.pEx
+            Ex[1:-1, 0] = (-pB[1:-1, 1] + ca*(Ex[1:-1, 1] + pB[1:-1, 0])
+                           + cb*(bB[1:-1, 0] + bB[1:-1, 1])
+                           + cc*(bB[2:, 0] - 2*bB[1:-1, 0] + bB[:-2, 0]
+                                 + bB[2:, 1] - 2*bB[1:-1, 1] + bB[:-2, 1]))
+            Ex[1:-1, -1] = (-pT[1:-1, 1] + ca*(Ex[1:-1, -2] + pT[1:-1, 0])
+                            + cb*(tT[1:-1, 0] + tT[1:-1, 1])
+                            + cc*(tT[2:, 0] - 2*tT[1:-1, 0] + tT[:-2, 0]
+                                  + tT[2:, 1] - 2*tT[1:-1, 1] + tT[:-2, 1]))
 
 
-def make_boundary(kind, pol, Nx, Ny, dx, dt, npml=10):
+def make_boundary(kind, pol, Nx, Ny, dx, dt, npml=10, npml_x=None, npml_y=None, sides='xy'):
     """Fabrik: liefert das Rand-Objekt (oder None fuer mur1) fuer kind in
-    {'mur1','mur2','cpml'} und pol in {'s'/'te','p'/'tm'}."""
+    {'mur1','mur2','cpml'} und pol in {'s'/'te','p'/'tm'}.
+    sides waehlt die Mur-2-Kanten; npml_x/npml_y das CPML-Richtungsprofil."""
     kind = (kind or 'mur1').lower()
     te = str(pol).lower() in ('s', 'te')
     if kind == 'mur1':
         return None
     if kind == 'mur2':
-        return Mur2TE(dx, dt) if te else Mur2TM(dx, dt)
+        return Mur2TE(dx, dt, sides=sides) if te else Mur2TM(dx, dt, sides=sides)
     if kind == 'cpml':
-        return (CPML_TE if te else CPML_TM)(Nx, Ny, dx, dt, npml=npml)
+        return ((CPML_TE if te else CPML_TM)
+                (Nx, Ny, dx, dt, npml=npml, npml_x=npml_x, npml_y=npml_y))
     raise ValueError(f"unbekannte boundary '{kind}' (mur1|mur2|cpml)")
