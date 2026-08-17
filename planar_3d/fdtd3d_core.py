@@ -261,8 +261,11 @@ def check_resources_3d(Nx, Ny, Nz, n_snapshots, vol_dtype, save_vector,
     vram_need = cells*16*4/1e9
     bpp = 2 if vol_dtype == 'float16' else 4
     ncomp = 3 if save_vector else 1
-    # Host: Snapshot-Puffer (+30% fuer Kompression/Save)
-    host_need = n_snapshots*cells*bpp*ncomp/1e9*1.3
+    # Host: build_eps3d legt das volle eps-Array (float32) im RAM an (broadcast+copy)
+    # -> das ist die ERSTE grosse Host-Allokation (haeufigste OOM-Ursache). Dazu die
+    # Snapshot-Puffer (+30% fuer Kompression/Save).
+    host_eps = cells*4/1e9
+    host_need = host_eps + n_snapshots*cells*bpp*ncomp/1e9*1.3
     lines = [f'[Ressourcen-Check] Domain {Nx}x{Ny}x{Nz} = {cells/1e6:.0f}M Zellen, '
              f'{n_snapshots} Snapshots, Vektor={"ja" if save_vector else "nein"}']
     ok = True
@@ -282,7 +285,7 @@ def check_resources_3d(Nx, Ny, Nz, n_snapshots, vol_dtype, save_vector,
     h = _host_free_gb()
     if h is not None:
         lines.append(f'  Host-RAM:  brauche ~{host_need:.1f} GB   frei {h:.1f} GB '
-                     f'(Snapshot-Puffer)')
+                     f'(eps-Array ~{host_eps:.1f} GB + Snapshot-Puffer)')
         if host_need > safety*h:
             ok = False
             new_ns = max(1, int(safety*h/(host_need/max(n_snapshots, 1))))
@@ -307,7 +310,7 @@ def run_3d(label, wg_n, t_wg_um=5.0,
            save_vector=False, check_resources=False,
            pec_faces=(), end_facet_um=0.0,
            vcsel_tilt_deg=0.0, vcsel_offset_y_um=0.0, vcsel_offset_z_um=0.0,
-           input_gap_um=0.0, polarization='s'):
+           input_gap_um=0.0, polarization='s', allow_large=False):
     """Volle 3D-FDTD-Simulation. Rueckgabe: result-dict mit 3D-Volumina.
 
     polarization: 's'/'TE' -> Quelle treibt Ez (E entlang Tiefe z, senkrecht zur
@@ -365,15 +368,23 @@ def run_3d(label, wg_n, t_wg_um=5.0,
     else:
         print(f'Wellenleiter: SLAB (nur Querschnitt/y gefuehrt, in Tiefe/z unbegrenzt)')
 
-    if check_resources:
-        ok, report, hints = check_resources_3d(
-            Nx, Ny, Nz, n_snapshots, vol_dtype, save_vector, dx_nm)
+    # Ressourcen-Check IMMER (nicht nur bei --check-resources): verhindert den
+    # rohen numpy/CuPy-MemoryError beim eps-Aufbau. Bei Nichtpassen harter Abbruch
+    # mit konkreten Vorschlaegen, ausser --allow-large erzwingt es.
+    ok, report, hints = check_resources_3d(
+        Nx, Ny, Nz, n_snapshots, vol_dtype, save_vector, dx_nm)
+    if check_resources or not ok:
         print(report)
-        if not ok:
-            print('  [ABBRUCH] Konfiguration passt NICHT sicher in die Ressourcen.')
-            for hnt in hints:
-                print('   -> ' + hnt)
-            raise SystemExit(2)
+    if not ok and not allow_large:
+        print('  [ABBRUCH] Konfiguration passt NICHT sicher in die Ressourcen '
+              '(sonst MemoryError beim eps-Aufbau).')
+        for hnt in hints:
+            print('   -> ' + hnt)
+        print('   -> oder mit --allow-large trotzdem erzwingen (Risiko OOM/Absturz).')
+        raise SystemExit(2)
+    if not ok and allow_large:
+        print('  [WARNUNG] --allow-large gesetzt: erzwinge trotz Ressourcen-Warnung.')
+    elif check_resources:
         print('  [OK] Konfiguration passt in die vorhandenen Ressourcen.')
 
     pec_faces = tuple(pec_faces or ())

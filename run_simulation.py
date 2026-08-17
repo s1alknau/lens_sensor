@@ -193,6 +193,7 @@ def _run_3d(args, layers):
         result = f3d.run_3d(
             steps_factor=args.steps_factor, calibrate_steps=args.calibrate,
             save_vector=args.save_vector, check_resources=args.check_resources,
+            allow_large=args.allow_large,
             pec_faces=pec_faces, end_facet_um=args.end_facet, **common)
         if args.calibrate:
             return result   # Kalibrierlauf: kein Speichern
