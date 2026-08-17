@@ -42,9 +42,19 @@ except Exception:
 # aufgeloest. Als grauer Platzhalter im Feld sichtbar (nicht mitgesendet).
 _AUTO_HINTS = {
     'resolution_nm': 'auto: 20 nm (2D) / 50 nm (3D)',
-    'length_um': 'auto: je Geometrie & Dimension',
+    'length_um': 'auto: planar 1000 / lens 14000 (2D), 60 (3D) um',
     'window_um': 'auto: 350 (2D) / 20 (3D)',
     'slide_um': 'auto: 150 (2D) / 12 (3D)',
+    # Material-Overrides: Default = Brechzahl @850 nm (leer lassen -> dieser Wert)
+    'wg_n': 'auto: PMMA 1.491 @850nm', 'bead_n': 'auto: Polystyrol 1.590',
+    'n_aqueous': 'auto: 1.336', 'n_mucin': 'auto: 1.342',
+    'n_cornea': 'auto: 1.376', 'n_lipid': 'auto: 1.480',
+    'bead_x': 'auto: Mitte (Laenge/2)', 'bead_y_um': 'auto: an WG-Unterkante',
+    'wg_width': 'leer = Slab (unendlich breit)',
+    # Moden-Propagation
+    'L_mm': 'auto: aus Linsengeometrie (~12 mm)',
+    't_lipid_nm': 'leer = Szenario-Wert (Gesund=30)',
+    'scenario': 'leer = alle Szenarien',
 }
 
 
@@ -458,29 +468,36 @@ class SimGUI:
         flach)."""
         Ht = yB - yT
         n = 56
-        cur = 0.24*Ht                       # uebertriebene Woelbung (Dome nach oben)
-        # Kanten-Basislinien (an den Raendern; Mitte woelbt sich um 'cur' nach oben)
-        e_lens_top = yT + 0.30*Ht
-        e_lens_bot = yT + 0.52*Ht           # -> Linsendicke konstant ~250 um
-        e_tear_bot = yT + 0.63*Ht
+        cur = 0.22*Ht                       # uebertriebene Woelbung (Dome nach oben)
+        # Kanten-Basislinien (an den Raendern; Mitte woelbt sich um 'cur' nach oben).
+        # Traenenfilm ZWISCHEN Linse und Cornea, in seinen drei Schichten (von der
+        # Linse abwaerts): Lipid | waessrig (Aqueous) | Mucin.
+        e_lens_top = yT + 0.22*Ht
+        e_lens_bot = yT + 0.44*Ht           # -> Linsendicke konstant ~250 um
+        e_lip_bot = yT + 0.49*Ht            # Lipidschicht (an der Linse)
+        e_aq_bot = yT + 0.60*Ht             # waessrige Schicht (dickste)
+        e_tear_bot = yT + 0.66*Ht           # Mucinschicht (an der Cornea)
         e_cornea_bot = yB
 
         def surf(edge):
             return [(xL + (xR - xL)*k/n, edge - cur*(1 - (2*(k/n) - 1)**2))
                     for k in range(n + 1)]
 
-        def band(et, eb, fill, name):
+        def band(et, eb, fill, name, col='#333', fs=7):
             poly = surf(et) + surf(eb)[::-1]
             c.create_polygon(*[v for xy in poly for v in xy], fill=fill,
                              outline='#cfd8e0', smooth=True)
             if name:
-                c.create_text(xR + 6, (et + eb)/2, anchor='w', text=name, fill='#333',
-                              font=('Segoe UI', 7))
+                c.create_text(xR + 6, (et + eb)/2, anchor='w', text=name, fill=col,
+                              font=('Segoe UI', fs))
 
         c.create_text(xR + 6, yT + 0.10*Ht, anchor='w', text='Luft (Aussenseite)',
                       fill='#6a8', font=('Segoe UI', 7))
         band(e_tear_bot, e_cornea_bot, '#c9e8c9', 'Cornea (Auge)')                  # gruen
-        band(e_lens_bot, e_tear_bot, '#bfe3ff', 'Traenenfilm (Lipid/Aqu./Mucin)')  # blau
+        band(e_aq_bot, e_tear_bot, '#e2d1f4', 'Mucin', col='#6a4a8a', fs=6)         # violett
+        band(e_lip_bot, e_aq_bot, '#bfe3ff', 'Traenenfilm waessrig (Aqueous)',
+             col='#1a6', fs=6)                                                      # blau
+        band(e_lens_bot, e_lip_bot, '#fff2cc', 'Lipid', col='#8a6d1a', fs=6)       # gelblich
         band(e_lens_top, e_lens_bot, '#ffe08a', '')                                # Linse gelb
         xc = (xL + xR)/2
         c.create_text(xc, (e_lens_top + e_lens_bot)/2 - cur,
@@ -506,18 +523,38 @@ class SimGUI:
             x = xL + (xR - xL)*t
             c.create_line(x, bot_y(t), x, bot_y(t) + 0.05*Ht, fill='#0a7', width=1.4,
                           arrow='last', dash=(2, 2))
-        c.create_text(xc, e_tear_bot - cur + 0.03*Ht, text='evaneszent -> Traenenfilm',
+        c.create_text(xc, e_lip_bot - cur + 0.02*Ht, text='evaneszent -> Traenenfilm (Lipid)',
                       fill='#0a7', font=('Segoe UI', 6))
 
-        # Stirnflaeche (LINKER Rand) + VCSEL Butt-Coupling, End-Fire nach RECHTS
-        # (Propagation links->rechts, konsistent mit dem planaren Waveguide)
+        # TANGENTIALE Einkopplung: der Strahl laeuft entlang der LINSEN-TANGENTE am
+        # linken Rand (Auflagen-/Fuehrungsflaeche), NICHT horizontal. Facette steht
+        # senkrecht zur Tangente ueber die Linsendicke.
         y_rim = (e_lens_top + e_lens_bot)/2
-        c.create_line(xL, e_lens_top, xL, e_lens_bot, fill='magenta', width=2)
-        c.create_rectangle(xL - 16, y_rim - 8, xL - 4, y_rim + 8, fill='#FF3333',
-                           outline='black')
-        c.create_line(10, y_rim, xL - 2, y_rim, fill='#e23', width=3, arrow='last')
-        c.create_text(10, y_rim - 12, anchor='w', text='VCSEL', fill='#e23',
+        half = (e_lens_bot - e_lens_top)/2
+        tvx, tvy = (xR - xL), -4.0*cur                 # Tangente der Mittellinie bei t=0
+        tn = math.hypot(tvx, tvy); tvx, tvy = tvx/tn, tvy/tn
+        px, py = -tvy, tvx                             # Normale (ueber die Linsendicke)
+        off = self._sketch_val('vcsel_offset', 0.0)
+        tilt = max(-45.0, min(45.0, self._sketch_val('vcsel_tilt', 0.0)))
+        ox = max(-half, min(half, off*3.0))            # Eintritt ueber die Dicke verschoben
+        ex_, ey_ = xL + px*ox, y_rim + py*ox
+        # Eintrittsfacette senkrecht zur Tangente (magenta), ueber die Linsendicke
+        c.create_line(ex_ - px*half, ey_ - py*half, ex_ + px*half, ey_ + py*half,
+                      fill='magenta', width=2)
+        # gestrichelte Tangente entlang der Fuehrungsflaeche (zeigt "tangential")
+        c.create_line(ex_, ey_, ex_ + tvx*0.20*(xR - xL), ey_ + tvy*0.20*(xR - xL),
+                      fill='#e23', width=1, dash=(3, 2))
+        # Strahl entlang Tangente (+ optionaler Tilt), von links-unten in die Facette
+        ang = math.atan2(tvy, tvx) + math.radians(tilt)
+        Ls = 50
+        x0, y0 = ex_ - math.cos(ang)*Ls, ey_ - math.sin(ang)*Ls
+        c.create_rectangle(x0 - 11, y0 - 6, x0 + 1, y0 + 6, fill='#FF3333', outline='black')
+        c.create_line(x0, y0, ex_, ey_, fill='#e23', width=3, arrow='last')
+        c.create_text(x0 - 13, y0, anchor='e', text='VCSEL', fill='#e23',
                       font=('Segoe UI', 7, 'bold'))
+        c.create_text(ex_ + tvx*0.10*(xR - xL) + 4, ey_ + tvy*0.10*(xR - xL) + 8,
+                      anchor='w', text='tangential eingekoppelt', fill='#e23',
+                      font=('Segoe UI', 6))
         # Szenario (falls aktiv)
         sc = self.vars.get('scenario')
         w = self.widgets.get('scenario')
