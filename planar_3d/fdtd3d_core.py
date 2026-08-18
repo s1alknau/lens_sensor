@@ -725,11 +725,11 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
     gb_tot = gb_ef + gb_fr + gb_ia
     print(f'[Speicher] assembliertes Volumen streamt auf DISK: '
           f'Efull {gb_ef:.1f} + Frames {gb_fr:.1f} + Iavg {gb_ia:.1f} = ~{gb_tot:.1f} GB Disk')
-    # Per-Fenster GPU-VRAM abschaetzen: 6 Felder + inv(eps) ~ 7 float32-Volumina
-    # der Fenstergroesse. Ist das mehr als der freie VRAM -> sauber abbrechen
-    # (kleineres Fenster / groebere Aufloesung), statt mitten im Lauf OOM.
+    # Per-Fenster GPU-VRAM abschaetzen: 6 Felder + inv(eps) + acc_re + acc_im
+    # ~ 9 float32-Volumina der Fenstergroesse (+ Pool-/Temp-Overhead). Passt das
+    # nicht in den freien VRAM -> sauber abbrechen statt mitten im Lauf OOM.
     _wcell = Nx_win*Ny*Nz
-    gb_win_gpu = _wcell*4*7/1e9
+    gb_win_gpu = _wcell*4*9/1e9
     print(f'[GPU] Bedarf pro Fenster ~{gb_win_gpu:.1f} GB VRAM '
           f'(Fenstergitter {Nx_win}x{Ny}x{Nz})')
     if GPU_AVAILABLE:
@@ -745,6 +745,27 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
             raise SystemExit(2)
         except Exception:
             pass
+    # DISK: passt das assemblierte Volumen + Frames + Iavg auf die Platte? Sonst
+    # crasht der Lauf spaeter beim Schreiben -> hier hart abbrechen.
+    try:
+        import shutil
+        _free_disk = shutil.disk_usage(os.getcwd()).free/1e9
+        print(f'[Disk] Bedarf ~{gb_tot:.1f} GB   frei {_free_disk:.1f} GB')
+        if gb_tot > 0.95*_free_disk:
+            print(f'!!! ABBRUCH: ~{gb_tot:.1f} GB Ausgabe passen nicht auf die Platte '
+                  f'({_free_disk:.1f} GB frei). --save-vector weglassen (Frames /3), '
+                  f'--snapshots reduzieren, oder kuerzere --length-um.')
+            raise SystemExit(2)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    # Host-RAM (nur noch Fenster-Transfer, kein Akkumulator mehr): Warnung, kein Abbruch.
+    _hfree = _host_free_gb()
+    _host_need = _wcell*16/1e9                  # Ew (complex64) + 2 float32-Transferpuffer
+    if _hfree is not None and _host_need > 0.85*_hfree:
+        print(f'!!! WARNUNG: Host-RAM knapp (~{_host_need:.1f} GB Fenster-Transfer vs '
+              f'{_hfree:.1f} GB frei). Bei OOM: Querschnitt (tear/lz) oder Fenster verkleinern.')
     if gb_tot > 40:
         print(f'!!! WARNUNG: ~{gb_tot:.0f} GB Disk-Bedarf. 3D ueber so lange Strecken '
               f'ist teuer. Erwaege kleineres lx (3D = kurze Strecke) oder groebere '
