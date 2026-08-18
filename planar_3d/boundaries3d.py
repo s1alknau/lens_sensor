@@ -16,6 +16,7 @@ die der Rand fuellt):
   y-Flaechen (ymin/ymax): Ex, Ez
   z-Flaechen (zmin/zmax): Ex, Ey
 """
+import numpy as np                                     # noqa: E402
 from common.physics import C0                          # noqa: E402
 
 
@@ -153,9 +154,137 @@ class Mur2_3D:
                 _set_plane(F[name], axis, i0, out)
 
 
-def make_boundary_3d(kind, dx, dt, faces):
+from common.physics import EPS0                            # noqa: E402
+try:
+    from common.backend import xp                          # noqa: E402
+except Exception:                                          # pragma: no cover
+    import numpy as xp
+
+
+def _cpml_bc_1d(N, npml_lo, npml_hi, dx, dt, m=3, a_max=0.05, R0=1e-6):
+    """b,c-Profile (kappa=1) an Ganz- (Laenge N) UND Halbknoten (N-1) fuer EINE
+    Achse. npml_lo/hi = PML-Zellen am unteren/oberen Ende. Ausserhalb: b=1,c=0."""
+    if npml_lo <= 0 and npml_hi <= 0:
+        one_e = xp.ones(N, dtype=xp.float32); zero_e = xp.zeros(N, dtype=xp.float32)
+        one_h = xp.ones(N-1, dtype=xp.float32); zero_h = xp.zeros(N-1, dtype=xp.float32)
+        return (one_e, zero_e), (one_h, zero_h)
+    eta0 = np.sqrt(4e-7*np.pi/EPS0)
+
+    def smax(npml):
+        return (-(m+1)*np.log(R0)/(2.0*eta0*npml*dx)) if npml > 0 else 0.0
+    smx_lo, smx_hi = smax(npml_lo), smax(npml_hi)
+
+    def build(pos):
+        depth = np.zeros_like(pos); sg = np.zeros_like(pos)
+        if npml_lo > 0:
+            lo = pos < npml_lo
+            depth[lo] = (npml_lo - pos[lo])/npml_lo; sg[lo] = smx_lo
+        if npml_hi > 0:
+            hi = pos > (N-1-npml_hi)
+            depth[hi] = (pos[hi]-(N-1-npml_hi))/npml_hi; sg[hi] = smx_hi
+        depth = np.clip(depth, 0, 1)
+        sigma = sg*depth**m
+        a = np.where(depth > 0, a_max*(1.0-depth), 0.0)
+        b = np.exp(-(sigma + a)*dt/EPS0)
+        denom = sigma + a
+        c = np.zeros_like(sigma); nz = denom > 0
+        c[nz] = sigma[nz]*(b[nz]-1.0)/denom[nz]
+        return xp.asarray(b.astype(np.float32)), xp.asarray(c.astype(np.float32))
+
+    be, ce = build(np.arange(N, dtype=np.float64))
+    bh, ch = build(np.arange(N-1, dtype=np.float64) + 0.5)
+    return (be, ce), (bh, ch)
+
+
+def _npml_for_axis(faces, lo_name, hi_name, npml):
+    return (npml if lo_name in faces else 0, npml if hi_name in faces else 0)
+
+
+class CPML_3D:
+    """Convolutional PML (Roden-Gedney, kappa=1) fuer den 3D-Yee-Schritt. Fuer jede
+    der 6 Curl-Komponenten werden die zwei Ableitungsterme per rekursiver Faltung
+    (psi = b*psi + c*dF) korrigiert. psi voll-domaenig (float32); ausserhalb der PML
+    ist c=0 -> psi bleibt 0. Aeusserer E-Rand wird als PEC abgeschlossen.
+    NB: 12 psi-Felder ~ speicherintensiv -> fuer kleine/mittlere 3D-Domaenen.
+    (Streifen-Speicher fuer sehr grosse Fenster ist der naechste Ausbau.)"""
+    def __init__(self, Nx, Ny, Nz, dx, dt, faces, npml=10, **kw):
+        nxl, nxh = _npml_for_axis(faces, 'xmin', 'xmax', npml)
+        nyl, nyh = _npml_for_axis(faces, 'ymin', 'ymax', npml)
+        nzl, nzh = _npml_for_axis(faces, 'zmin', 'zmax', npml)
+        self.px = nxl > 0 or nxh > 0
+        self.py = nyl > 0 or nyh > 0
+        self.pz = nzl > 0 or nzh > 0
+        (self.bxe, self.cxe), (self.bxh, self.cxh) = _cpml_bc_1d(Nx, nxl, nxh, dx, dt, **kw)
+        (self.bye, self.cye), (self.byh, self.cyh) = _cpml_bc_1d(Ny, nyl, nyh, dx, dt, **kw)
+        (self.bze, self.cze), (self.bzh, self.czh) = _cpml_bc_1d(Nz, nzl, nzh, dx, dt, **kw)
+        self.faces = tuple(faces)
+        z = xp.zeros
+        # H-Update-psi (an den H-Positionen)
+        self.p_Hx_z = z((Nx, Ny-1, Nz-1), xp.float32); self.p_Hx_y = z((Nx, Ny-1, Nz-1), xp.float32)
+        self.p_Hy_x = z((Nx-1, Ny, Nz-1), xp.float32); self.p_Hy_z = z((Nx-1, Ny, Nz-1), xp.float32)
+        self.p_Hz_y = z((Nx-1, Ny-1, Nz), xp.float32); self.p_Hz_x = z((Nx-1, Ny-1, Nz), xp.float32)
+        # E-Update-psi (an den E-Innenpositionen [1:-1])
+        self.p_Ex_y = z((Nx-1, Ny-2, Nz-2), xp.float32); self.p_Ex_z = z((Nx-1, Ny-2, Nz-2), xp.float32)
+        self.p_Ey_z = z((Nx-2, Ny-1, Nz-2), xp.float32); self.p_Ey_x = z((Nx-2, Ny-1, Nz-2), xp.float32)
+        self.p_Ez_x = z((Nx-2, Ny-2, Nz-1), xp.float32); self.p_Ez_y = z((Nx-2, Ny-2, Nz-1), xp.float32)
+
+    def step(self, Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch):
+        # ---- H-Update (nutzt E^n) ----
+        dEy_dz = Ey[:, :, 1:] - Ey[:, :, :-1]      # -> Hx (Halb-z)
+        dEz_dy = Ez[:, 1:, :] - Ez[:, :-1, :]      # -> Hx (Halb-y)
+        if self.pz:
+            self.p_Hx_z = self.bzh[None, None, :]*self.p_Hx_z + self.czh[None, None, :]*dEy_dz
+        if self.py:
+            self.p_Hx_y = self.byh[None, :, None]*self.p_Hx_y + self.cyh[None, :, None]*dEz_dy
+        Hx += Ch*((dEy_dz + self.p_Hx_z) - (dEz_dy + self.p_Hx_y))
+        dEz_dx = Ez[1:, :, :] - Ez[:-1, :, :]      # -> Hy (Halb-x)
+        dEx_dz = Ex[:, :, 1:] - Ex[:, :, :-1]      # -> Hy (Halb-z)
+        if self.px:
+            self.p_Hy_x = self.bxh[:, None, None]*self.p_Hy_x + self.cxh[:, None, None]*dEz_dx
+        if self.pz:
+            self.p_Hy_z = self.bzh[None, None, :]*self.p_Hy_z + self.czh[None, None, :]*dEx_dz
+        Hy += Ch*((dEz_dx + self.p_Hy_x) - (dEx_dz + self.p_Hy_z))
+        dEx_dy = Ex[:, 1:, :] - Ex[:, :-1, :]      # -> Hz (Halb-y)
+        dEy_dx = Ey[1:, :, :] - Ey[:-1, :, :]      # -> Hz (Halb-x)
+        if self.py:
+            self.p_Hz_y = self.byh[None, :, None]*self.p_Hz_y + self.cyh[None, :, None]*dEx_dy
+        if self.px:
+            self.p_Hz_x = self.bxh[:, None, None]*self.p_Hz_x + self.cxh[:, None, None]*dEy_dx
+        Hz += Ch*((dEx_dy + self.p_Hz_y) - (dEy_dx + self.p_Hz_x))
+        # ---- E-Update (nutzt H^{n+1/2}, Innenbereich) ----
+        dHz_dy = Hz[:, 1:, 1:-1] - Hz[:, :-1, 1:-1]   # -> Ex (Ganz-y innen)
+        dHy_dz = Hy[:, 1:-1, 1:] - Hy[:, 1:-1, :-1]   # -> Ex (Ganz-z innen)
+        if self.py:
+            self.p_Ex_y = self.bye[None, 1:-1, None]*self.p_Ex_y + self.cye[None, 1:-1, None]*dHz_dy
+        if self.pz:
+            self.p_Ex_z = self.bze[None, None, 1:-1]*self.p_Ex_z + self.cze[None, None, 1:-1]*dHy_dz
+        Ex[:, 1:-1, 1:-1] += ce_x[:, 1:-1, 1:-1]*((dHz_dy + self.p_Ex_y) - (dHy_dz + self.p_Ex_z))
+        dHx_dz = Hx[1:-1, :, 1:] - Hx[1:-1, :, :-1]   # -> Ey (Ganz-z innen)
+        dHz_dx = Hz[1:, :, 1:-1] - Hz[:-1, :, 1:-1]   # -> Ey (Ganz-x innen)
+        if self.pz:
+            self.p_Ey_z = self.bze[None, None, 1:-1]*self.p_Ey_z + self.cze[None, None, 1:-1]*dHx_dz
+        if self.px:
+            self.p_Ey_x = self.bxe[1:-1, None, None]*self.p_Ey_x + self.cxe[1:-1, None, None]*dHz_dx
+        Ey[1:-1, :, 1:-1] += ce_y[1:-1, :, 1:-1]*((dHx_dz + self.p_Ey_z) - (dHz_dx + self.p_Ey_x))
+        dHy_dx = Hy[1:, 1:-1, :] - Hy[:-1, 1:-1, :]   # -> Ez (Ganz-x innen)
+        dHx_dy = Hx[1:-1, 1:, :] - Hx[1:-1, :-1, :]   # -> Ez (Ganz-y innen)
+        if self.px:
+            self.p_Ez_x = self.bxe[1:-1, None, None]*self.p_Ez_x + self.cxe[1:-1, None, None]*dHy_dx
+        if self.py:
+            self.p_Ez_y = self.bye[None, 1:-1, None]*self.p_Ez_y + self.cye[None, 1:-1, None]*dHx_dy
+        Ez[1:-1, 1:-1, :] += ce_z[1:-1, 1:-1, :]*((dHy_dx + self.p_Ez_x) - (dHx_dy + self.p_Ez_y))
+        # ---- PEC-Abschluss (tangentiales E=0) auf den PML-Aussenflaechen ----
+        if 'xmin' in self.faces: Ey[0] = 0; Ez[0] = 0
+        if 'xmax' in self.faces: Ey[-1] = 0; Ez[-1] = 0
+        if 'ymin' in self.faces: Ex[:, 0] = 0; Ez[:, 0] = 0
+        if 'ymax' in self.faces: Ex[:, -1] = 0; Ez[:, -1] = 0
+        if 'zmin' in self.faces: Ex[:, :, 0] = 0; Ey[:, :, 0] = 0
+        if 'zmax' in self.faces: Ex[:, :, -1] = 0; Ey[:, :, -1] = 0
+
+
+def make_boundary_3d(kind, dx, dt, faces, shape=None, npml=10):
     """Rand-Objekt (oder None fuer 'sponge'). kind in {'sponge','mur1','mur2','cpml'};
-    faces = absorbierende Flaechen."""
+    faces = absorbierende Flaechen. shape=(Nx,Ny,Nz) nur fuer cpml noetig."""
     kind = (kind or 'sponge').lower()
     if kind == 'sponge':
         return None
@@ -163,4 +292,8 @@ def make_boundary_3d(kind, dx, dt, faces):
         return Mur1_3D(dx, dt, faces)
     if kind == 'mur2':
         return Mur2_3D(dx, dt, faces)
-    raise ValueError(f"boundary '{kind}' fuer 3D noch nicht verfuegbar (Stufe 3: cpml)")
+    if kind == 'cpml':
+        if shape is None:
+            raise ValueError('cpml (3D) braucht shape=(Nx,Ny,Nz)')
+        return CPML_3D(shape[0], shape[1], shape[2], dx, dt, faces, npml=npml)
+    raise ValueError(f"unbekannte boundary '{kind}' (sponge|mur1|mur2|cpml)")

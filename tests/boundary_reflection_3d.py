@@ -33,16 +33,22 @@ def _solve3d(N, dx, nsteps, boundary, src, probe, fp, t0, n_sp=12, alpha=0.3):
     ce_z = xp.full(Ez.shape, cev, dtype=f32)
     Ch = f32(dt/(MU0*dx))
     g_sp = _sponge_profile(n_sp, alpha)
-    bnd = make_boundary_3d(boundary, dx, dt, ALL_FACES)
+    bnd = make_boundary_3d(boundary, dx, dt, ALL_FACES, shape=(N, N, N))
+    _cpml = hasattr(bnd, 'step')
     sx, sy, sz = src; px, py, pz = probe
     trace = np.empty(nsteps, dtype=np.float64)
     for n in range(nsteps):
-        if bnd is not None:
+        if bnd is not None and not _cpml:
             bnd.capture(Ex, Ey, Ez)
-        _yee_step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch)
+        if _cpml:
+            bnd.step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch)
+        else:
+            _yee_step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch)
         arg = (np.pi*fp*(n*dt - t0))**2
         Ez[sx, sy, sz] += xp.float32((1.0 - 2.0*arg)*np.exp(-arg))     # Ricker (soft)
-        if bnd is not None:
+        if _cpml:
+            pass                                    # Absorption im step (inkl. PEC-Abschluss)
+        elif bnd is not None:
             bnd.apply(Ex, Ey, Ez)
         else:
             for F in (Ex, Ey, Ez, Hx, Hy, Hz):

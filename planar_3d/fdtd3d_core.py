@@ -406,7 +406,8 @@ def run_3d(label, wg_n, t_wg_um=5.0,
 
     pec_faces = tuple(pec_faces or ())
     absorbing_faces = tuple(f for f in ALL_FACES if f not in pec_faces)
-    _bnd3d = make_boundary_3d(boundary, dx, dt, absorbing_faces)   # None = Sponge
+    _bnd3d = make_boundary_3d(boundary, dx, dt, absorbing_faces, shape=(Nx, Ny, Nz))
+    _cpml3d = _bnd3d is not None and hasattr(_bnd3d, 'step')   # cpml: eigener Yee-Schritt
     print(f'Absorber: {"Sponge (gradiert)" if _bnd3d is None else boundary} '
           f'auf {list(absorbing_faces)}')
     if pec_faces:
@@ -547,10 +548,13 @@ def run_3d(label, wg_n, t_wg_um=5.0,
                 cp.cuda.runtime.deviceSynchronize()
             t_cal0 = time.time()
         # --- Mur: E^n-Randebenen VOR dem Update sichern ---
-        if _bnd3d is not None:
+        if _bnd3d is not None and not _cpml3d:
             _bnd3d.capture(Ex, Ey, Ez)
-        # --- Yee-Schritt: H-Update, dann E-Update (Innenbereich) ---
-        _yee_step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch)
+        # --- Yee-Schritt (CPML: eigener Schritt mit psi-Korrektur) ---
+        if _cpml3d:
+            _bnd3d.step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch)
+        else:
+            _yee_step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch)
         # --- Quelle (soft) ---
         t_phys = n*dt
         if source_type == 'pulse':
@@ -562,8 +566,10 @@ def run_3d(label, wg_n, t_wg_um=5.0,
             src_field[src_ix, :, :] += envelope*xp.sin(2*np.pi*f0*t_phys + src_phase)*src_p
         else:
             src_field[src_ix, :, :] += envelope*float(np.sin(2*np.pi*f0*t_phys))*src_p
-        # --- Absorber: Mur (tangentiale E-Aussenebenen) ODER gradierter Sponge ---
-        if _bnd3d is not None:
+        # --- Absorber: CPML (im step) / Mur (Kanten) / gradierter Sponge ---
+        if _cpml3d:
+            pass                                 # Absorption + PEC-Abschluss im step
+        elif _bnd3d is not None:
             _bnd3d.apply(Ex, Ey, Ez)
         else:
             for F in (Ex, Ey, Ez, Hx, Hy, Hz):
@@ -851,13 +857,17 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
         _drive = xp.asarray(Ehand.astype(np.complex64)) if (w > 0 and Ehand is not None) else None
         # Fenster w>0: linke Flaeche wird getrieben -> NICHT absorbieren
         aface = tuple(f for f in ALL_FACES if not (w > 0 and f == 'xmin'))
-        _bnd3d = make_boundary_3d(boundary, dx, dt, aface)   # None = Sponge
+        _bnd3d = make_boundary_3d(boundary, dx, dt, aface, shape=(Nx_win, Ny, Nz))
+        _cpml3d = _bnd3d is not None and hasattr(_bnd3d, 'step')
         if w == 0:
             print(f'Absorber: {"Sponge (gradiert)" if _bnd3d is None else boundary}')
         for n in range(steps_win):
-            if _bnd3d is not None:
+            if _bnd3d is not None and not _cpml3d:
                 _bnd3d.capture(Ex, Ey, Ez)
-            _yee_step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch)
+            if _cpml3d:
+                _bnd3d.step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch)
+            else:
+                _yee_step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch)
             t_phys = n*dt
             env = float(1 - np.exp(-((t_phys/(2*sigma_t))**2)))
             if w == 0:
@@ -868,7 +878,9 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
             else:
                 _din = env*xp.real(_drive*np.complex64(np.exp(1j*omega*t_phys)))
                 src_field[:O_cells, :, :] = _wtap*_din + (1.0 - _wtap)*src_field[:O_cells, :, :]
-            if _bnd3d is not None:
+            if _cpml3d:
+                pass                             # Absorption + PEC-Abschluss im step
+            elif _bnd3d is not None:
                 _bnd3d.apply(Ex, Ey, Ez)
             else:
                 for F in (Ex, Ey, Ez, Hx, Hy, Hz):

@@ -306,7 +306,8 @@ def build_parser():
     g_basic.add_argument('--boundary', choices=('sponge', 'mur1', 'mur2', 'cpml'), default=None,
                          help='Absorbierender Rand. Leer = Dimension-Default. '
                               '2D: mur1 (Default) | mur2 | cpml. '
-                              '3D: sponge (Default) | mur1 [mur2/cpml folgen].')
+                              '3D: sponge (Default) | mur1 | mur2 | cpml '
+                              '(cpml = beste Absorption, aber speicherintensiv: 12 psi-Felder).')
     g_basic.add_argument('--source-type', choices=('cw', 'pulse'), default='cw')
     g_basic.add_argument('--snapshots', type=int, default=8, help='Anzahl gespeicherter Frames')
 
