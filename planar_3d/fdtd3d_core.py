@@ -796,7 +796,10 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
         Hy = xp.zeros((Nx_win-1, Ny,   Nz-1), dtype=xp.float32)
         Hz = xp.zeros((Nx_win-1, Ny-1, Nz),   dtype=xp.float32)
         src_field = Ey if _pol == 'p' else Ez     # getriebene/assemblierte Komponente
-        acc = np.zeros((Nx_win, _Nj, _Nk), dtype=np.complex64); acc_n = 0
+        # DFT-Akkumulation Ê = Σ E(t) e^{-iωt} auf der GPU als Real-/Imagteil (float32).
+        # Kein Host-Akkumulator und KEIN to_np pro Step -> Transfer nur EINMAL pro Fenster.
+        acc_re = xp.zeros((Nx_win, _Nj, _Nk), dtype=xp.float32)
+        acc_im = xp.zeros((Nx_win, _Nj, _Nk), dtype=xp.float32); acc_n = 0
         _drive = xp.asarray(Ehand.astype(np.complex64)) if (w > 0 and Ehand is not None) else None
         # Fenster w>0: linke Flaeche wird getrieben -> NICHT absorbieren
         aface = tuple(f for f in ALL_FACES if not (w > 0 and f == 'xmin'))
@@ -815,21 +818,21 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
             for F in (Ex, Ey, Ez, Hx, Hy, Hz):
                 _apply_sponge(F, g_sp, n_sp, aface)
             if n >= steps_win - n_acc:
-                # DFT-Akkumulation Ê += E(t)*e^{-iωt}. NICHT als float32*complex128
-                # rechnen (das zieht das ganze Volumen auf complex128 hoch ~960MB
-                # Transient -> Host-OOM). Stattdessen Real-/Imagteil getrennt in
-                # float32 aufaddieren (e^{-iωt}=cosωt - i sinωt).
-                sf = to_np(src_field)
-                acc.real += sf*float(np.cos(omega*t_phys))
-                acc.imag -= sf*float(np.sin(omega*t_phys))
+                # Ê += E(t)*e^{-iωt} = E*cosωt - i E*sinωt, komplett auf der GPU (float32).
+                acc_re += src_field*np.float32(np.cos(omega*t_phys))
+                acc_im -= src_field*np.float32(np.sin(omega*t_phys))
                 acc_n += 1
             # Fortschritt INNERHALB des Fensters (~alle 10%) -> im Log sichtbar
             if (n+1) % max(1, steps_win//10) == 0:
                 print(f'  [Fenster {w+1}/{n_win}] Step {n+1}/{steps_win} '
                       f'({100*(n+1)/steps_win:.0f}%)  max|E|={float(xp.max(xp.abs(src_field))):.3e}',
                       flush=True)
-        acc *= np.complex64(2.0/max(acc_n, 1))     # IN-PLACE -> spart 480MB-Kopie
-        Ew = acc                                    # gleiche Speicherung (kein Extra-Array)
+        # Ê = (2/N)*(acc_re + i*acc_im): je ein DtoH-Transfer, direkt in complex64
+        # (kein complex128-Zwischenprodukt).
+        _sc = np.float32(2.0/max(acc_n, 1))
+        Ew = np.empty((Nx_win, _Nj, _Nk), dtype=np.complex64)
+        Ew.real = to_np(acc_re*_sc)
+        Ew.imag = to_np(acc_im*_sc)
         Ehand = Ew[S_cells:S_cells+O_cells, :, :].copy()
         # WICHTIG: die rechte SPONGE-Zone (n_sp Zellen) eines Fensters ist kuenstlich
         # gedaempft -> NICHT assemblieren, sonst entsteht an jeder Naht eine gedaempfte
@@ -853,7 +856,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
         _mxe = float(np.abs(Ew[::4, ::4, ::4]).max())
         print(f'[Fenster {w+1}/{n_win}] x0={x0_um:.1f}um  max|Ez|={_mxe:.3e}')
         src_field = None; Ew = None
-        del Ex, Ey, Ez, Hx, Hy, Hz, inv, ce_x, ce_y, ce_z, acc
+        del Ex, Ey, Ez, Hx, Hy, Hz, inv, ce_x, ce_y, ce_z, acc_re, acc_im
         if GPU_AVAILABLE:
             cp.get_default_memory_pool().free_all_blocks()
             cp.get_default_pinned_memory_pool().free_all_blocks()   # Host-Staging der DtoH-Transfers
