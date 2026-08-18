@@ -40,6 +40,7 @@ if _REPO_ROOT not in sys.path:
 # Backend (GPU/CPU) und Physik/Materialdaten aus den geteilten Modulen.
 from common.backend import xp, cp, GPU_AVAILABLE, to_np           # noqa: E402
 from common.physics import C0, EPS0, MU0, N_AIR, DISPERSION, n_at  # noqa: E402
+from planar_3d.boundaries3d import make_boundary_3d               # noqa: E402
 
 
 def build_eps3d(Nx, Ny, Nz, dx_um, y0_um, z0_um,
@@ -325,7 +326,7 @@ def run_3d(label, wg_n, t_wg_um=5.0,
            save_vector=False, check_resources=False,
            pec_faces=(), end_facet_um=0.0,
            vcsel_tilt_deg=0.0, vcsel_offset_y_um=0.0, vcsel_offset_z_um=0.0,
-           input_gap_um=0.0, polarization='s', allow_large=False):
+           input_gap_um=0.0, polarization='s', allow_large=False, boundary='sponge'):
     """Volle 3D-FDTD-Simulation. Rueckgabe: result-dict mit 3D-Volumina.
 
     polarization: 's'/'TE' -> Quelle treibt Ez (E entlang Tiefe z, senkrecht zur
@@ -405,6 +406,9 @@ def run_3d(label, wg_n, t_wg_um=5.0,
 
     pec_faces = tuple(pec_faces or ())
     absorbing_faces = tuple(f for f in ALL_FACES if f not in pec_faces)
+    _bnd3d = make_boundary_3d(boundary, dx, dt, absorbing_faces)   # None = Sponge
+    print(f'Absorber: {"Sponge (gradiert)" if _bnd3d is None else boundary} '
+          f'auf {list(absorbing_faces)}')
     if pec_faces:
         print(f'Raender: PEC (Spiegel) auf {list(pec_faces)}, '
               f'Absorber auf {list(absorbing_faces)}')
@@ -542,6 +546,9 @@ def run_3d(label, wg_n, t_wg_um=5.0,
             if GPU_AVAILABLE:
                 cp.cuda.runtime.deviceSynchronize()
             t_cal0 = time.time()
+        # --- Mur: E^n-Randebenen VOR dem Update sichern ---
+        if _bnd3d is not None:
+            _bnd3d.capture(Ex, Ey, Ez)
         # --- Yee-Schritt: H-Update, dann E-Update (Innenbereich) ---
         _yee_step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch)
         # --- Quelle (soft) ---
@@ -555,9 +562,12 @@ def run_3d(label, wg_n, t_wg_um=5.0,
             src_field[src_ix, :, :] += envelope*xp.sin(2*np.pi*f0*t_phys + src_phase)*src_p
         else:
             src_field[src_ix, :, :] += envelope*float(np.sin(2*np.pi*f0*t_phys))*src_p
-        # --- Sponge-Absorber nur auf absorbierenden Flaechen ---
-        for F in (Ex, Ey, Ez, Hx, Hy, Hz):
-            _apply_sponge(F, g_sp, n_sp, absorbing_faces)
+        # --- Absorber: Mur (tangentiale E-Aussenebenen) ODER gradierter Sponge ---
+        if _bnd3d is not None:
+            _bnd3d.apply(Ex, Ey, Ez)
+        else:
+            for F in (Ex, Ey, Ez, Hx, Hy, Hz):
+                _apply_sponge(F, g_sp, n_sp, absorbing_faces)
         # --- PEC-Spiegel: tangentiales E = 0 auf gewaehlten Flaechen ---
         if pec_faces:
             _apply_pec(Ex, Ey, Ez, pec_faces)
@@ -679,7 +689,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
                     det_in_um=None, det_out_um=None, vol_dtype='float32',
                     wg_width_um=None, n_clad_side=N_AIR,
                     vcsel_tilt_deg=0.0, vcsel_offset_y_um=0.0, vcsel_offset_z_um=0.0,
-                    input_gap_um=0.0, polarization='s'):
+                    input_gap_um=0.0, polarization='s', boundary='sponge'):
     """Voller gefuellter CW-Waveguide in 3D per GEBIETS-ZERLEGUNG (Stitch).
     polarization: 's'/TE treibt+assembliert Ez, 'p'/TM treibt+assembliert Ey.
     Analog zum in 2D validierten run_beads_stitched: Fenster entlang x, jedes bis
@@ -841,7 +851,12 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
         _drive = xp.asarray(Ehand.astype(np.complex64)) if (w > 0 and Ehand is not None) else None
         # Fenster w>0: linke Flaeche wird getrieben -> NICHT absorbieren
         aface = tuple(f for f in ALL_FACES if not (w > 0 and f == 'xmin'))
+        _bnd3d = make_boundary_3d(boundary, dx, dt, aface)   # None = Sponge
+        if w == 0:
+            print(f'Absorber: {"Sponge (gradiert)" if _bnd3d is None else boundary}')
         for n in range(steps_win):
+            if _bnd3d is not None:
+                _bnd3d.capture(Ex, Ey, Ez)
             _yee_step(Ex, Ey, Ez, Hx, Hy, Hz, ce_x, ce_y, ce_z, Ch)
             t_phys = n*dt
             env = float(1 - np.exp(-((t_phys/(2*sigma_t))**2)))
@@ -853,8 +868,11 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
             else:
                 _din = env*xp.real(_drive*np.complex64(np.exp(1j*omega*t_phys)))
                 src_field[:O_cells, :, :] = _wtap*_din + (1.0 - _wtap)*src_field[:O_cells, :, :]
-            for F in (Ex, Ey, Ez, Hx, Hy, Hz):
-                _apply_sponge(F, g_sp, n_sp, aface)
+            if _bnd3d is not None:
+                _bnd3d.apply(Ex, Ey, Ez)
+            else:
+                for F in (Ex, Ey, Ez, Hx, Hy, Hz):
+                    _apply_sponge(F, g_sp, n_sp, aface)
             if n >= steps_win - n_acc:
                 # Ê += E(t)*e^{-iωt} = E*cosωt - i E*sinωt, komplett auf der GPU (float32).
                 acc_re += src_field*np.float32(np.cos(omega*t_phys))

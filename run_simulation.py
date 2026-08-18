@@ -149,7 +149,7 @@ def _run_2d(args, layers):
         n_cornea=layers['n_co'], n_lipid=layers['n_lip'],
         polarization=args.polarization,
         curved=(args.curved and args.geometry == 'lens'),
-        boundary=args.boundary)
+        boundary=(args.boundary or 'mur1'))          # 2D-Default: mur1
     if not args.no_save:
         d2.save_results(result, out_dir=os.path.join(_REPO_ROOT, 'results'))
     return result
@@ -186,14 +186,15 @@ def _run_3d(args, layers):
         input_gap_um=args.input_gap, polarization=args.polarization)
     if args.method == 'stitch':
         result = f3d.run_3d_stitched(window_w_um=args.window_um,
-                                     slide_um=args.slide_um, **common)
+                                     slide_um=args.slide_um,
+                                     boundary=(args.boundary or 'sponge'), **common)
     else:
         # nur run_3d (full) kennt diese Zusatz-Optionen
         pec_faces = tuple(f.strip() for f in args.pec_faces.split(',') if f.strip())
         result = f3d.run_3d(
             steps_factor=args.steps_factor, calibrate_steps=args.calibrate,
             save_vector=args.save_vector, check_resources=args.check_resources,
-            allow_large=args.allow_large,
+            allow_large=args.allow_large, boundary=(args.boundary or 'sponge'),
             pec_faces=pec_faces, end_facet_um=args.end_facet, **common)
         if args.calibrate:
             return result   # Kalibrierlauf: kein Speichern
@@ -302,11 +303,10 @@ def build_parser():
     g_basic.add_argument('--lambda-nm', type=float, default=850.0, help='Wellenlaenge in nm')
     g_basic.add_argument('--polarization', choices=('s', 'p'), default='s',
                          help='s=TE (Ez) | p=TM (Ey)')
-    g_basic.add_argument('--boundary', choices=('mur1', 'mur2', 'cpml'), default='mur1',
-                         help='Absorbierender Rand (alle 2D-Methoden): mur1 (Default) | '
-                              'mur2 (besser schraeg) | cpml (beste Absorption). '
-                              'full/sliding: alle Kanten; stitch: y-Kanten + echte '
-                              'x-Bauteilenden (mur2->cpml wg. Handoff-Stabilitaet)')
+    g_basic.add_argument('--boundary', choices=('sponge', 'mur1', 'mur2', 'cpml'), default=None,
+                         help='Absorbierender Rand. Leer = Dimension-Default. '
+                              '2D: mur1 (Default) | mur2 | cpml. '
+                              '3D: sponge (Default) | mur1 [mur2/cpml folgen].')
     g_basic.add_argument('--source-type', choices=('cw', 'pulse'), default='cw')
     g_basic.add_argument('--snapshots', type=int, default=8, help='Anzahl gespeicherter Frames')
 
