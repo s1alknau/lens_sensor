@@ -828,7 +828,8 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
                 print(f'  [Fenster {w+1}/{n_win}] Step {n+1}/{steps_win} '
                       f'({100*(n+1)/steps_win:.0f}%)  max|E|={float(xp.max(xp.abs(src_field))):.3e}',
                       flush=True)
-        Ew = (2.0/max(acc_n, 1))*acc
+        acc *= np.complex64(2.0/max(acc_n, 1))     # IN-PLACE -> spart 480MB-Kopie
+        Ew = acc                                    # gleiche Speicherung (kein Extra-Array)
         Ehand = Ew[S_cells:S_cells+O_cells, :, :].copy()
         # WICHTIG: die rechte SPONGE-Zone (n_sp Zellen) eines Fensters ist kuenstlich
         # gedaempft -> NICHT assemblieren, sonst entsteht an jeder Naht eine gedaempfte
@@ -848,11 +849,15 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
         l_hi = l_lo + (g_hi - g_lo)
         if g_hi > g_lo:
             Efull[g_lo:g_hi, :, :] = Ew[l_lo:l_hi, :, :]
-        print(f'[Fenster {w+1}/{n_win}] x0={x0_um:.1f}um  max|Ez|={np.abs(Ew).max():.3e}')
-        src_field = None
+        # Fortschritts-Max per Subsample (voll |Ew| waere ein 229MB-Host-Temp).
+        _mxe = float(np.abs(Ew[::4, ::4, ::4]).max())
+        print(f'[Fenster {w+1}/{n_win}] x0={x0_um:.1f}um  max|Ez|={_mxe:.3e}')
+        src_field = None; Ew = None
         del Ex, Ey, Ez, Hx, Hy, Hz, inv, ce_x, ce_y, ce_z, acc
         if GPU_AVAILABLE:
             cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()   # Host-Staging der DtoH-Transfers
+        Efull.flush()                              # Fenster-Slice auf Disk -> Page-Cache freigeben
 
     Efull.flush()
     total_time = time.time() - t_total
