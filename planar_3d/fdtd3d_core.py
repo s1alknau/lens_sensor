@@ -810,12 +810,18 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
                 else:
                     src_field[src_ix, :, :] += env*float(np.sin(2*np.pi*f0*t_phys))*src_p
             else:
-                _din = env*xp.real(_drive*np.exp(1j*omega*t_phys))
+                _din = env*xp.real(_drive*np.complex64(np.exp(1j*omega*t_phys)))
                 src_field[:O_cells, :, :] = _wtap*_din + (1.0 - _wtap)*src_field[:O_cells, :, :]
             for F in (Ex, Ey, Ez, Hx, Hy, Hz):
                 _apply_sponge(F, g_sp, n_sp, aface)
             if n >= steps_win - n_acc:
-                acc += (to_np(src_field)*np.exp(-1j*omega*t_phys)).astype(np.complex64)
+                # DFT-Akkumulation Ê += E(t)*e^{-iωt}. NICHT als float32*complex128
+                # rechnen (das zieht das ganze Volumen auf complex128 hoch ~960MB
+                # Transient -> Host-OOM). Stattdessen Real-/Imagteil getrennt in
+                # float32 aufaddieren (e^{-iωt}=cosωt - i sinωt).
+                sf = to_np(src_field)
+                acc.real += sf*float(np.cos(omega*t_phys))
+                acc.imag -= sf*float(np.sin(omega*t_phys))
                 acc_n += 1
             # Fortschritt INNERHALB des Fensters (~alle 10%) -> im Log sichtbar
             if (n+1) % max(1, steps_win//10) == 0:
@@ -861,7 +867,9 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
                                      shape=(Nx_full, _Nj, _Nk))
     snap_times = [(k/nfr)*(1.0/f0) for k in range(nfr)]
     snap_steps = [k+1 for k in range(nfr)]
-    _phase = [np.exp(1j*omega*tk) for tk in snap_times]
+    # Re(E*e^{iωt}) = Re*cos - Im*sin ohne complex128-Promotion (float32-Views).
+    _cos = [float(np.cos(omega*tk)) for tk in snap_times]
+    _sin = [float(np.sin(omega*tk)) for tk in snap_times]
     # Frames + Iavg blockweise in x aus dem Efull-Memmap erzeugen (kein 22-GB-Peak)
     _CHUNK = 512
     for x0 in range(0, Nx_full, _CHUNK):
@@ -869,7 +877,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
         blk = np.asarray(Efull[x0:x1])                 # (chunk,Ny,Nz-1) complex64
         Iavg[x0:x1] = (0.5*np.abs(blk)**2).astype(np.float32)
         for k in range(nfr):
-            vol_buf[k, x0:x1] = np.real(blk*_phase[k]).astype(vol_dt)
+            vol_buf[k, x0:x1] = (blk.real*_cos[k] - blk.imag*_sin[k]).astype(vol_dt)
     vol_buf.flush(); Iavg.flush()
     # Sensor-Kennzahlen aus |Efull|^2 an Detektor-Ebenen (Einzel-x-Ebenen)
     iin = int(round(det_in_um/dx_um)); iout = int(round(det_out_um/dx_um))
