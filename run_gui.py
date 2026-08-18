@@ -85,7 +85,7 @@ _LABELS = {
     'bead_material': 'Bead-Material', 'bead_diameter': 'Bead-Durchmesser (um)',
     'bead_x': 'Bead-Position x (um)', 'bead_y_um': 'Bead-Position y (um)',
     'bead_n': 'Bead-Brechzahl (override)', 'no_bead': 'Ohne Bead (Referenzlauf)',
-    'with_reference': 'Auch Referenz OHNE Bead rechnen (Differenz)',
+    'no_reference': 'KEINE Referenz mitrechnen (nur mit Bead)',
     # Quelle (VCSEL)
     'vcsel_waist': 'Strahltaille y (um)', 'vcsel_waist_z': 'Strahltaille z (um, nur 3D)',
     'vcsel_tilt': 'Strahlneigung (Grad)', 'vcsel_offset': 'Spot-Versatz y (um)',

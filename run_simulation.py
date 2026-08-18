@@ -339,9 +339,11 @@ def build_parser():
                         help='Freie Bead-Brechzahl (ueberschreibt --bead-material)')
     g_bead.add_argument('--no-bead', action='store_true',
                         help='planaren Lauf OHNE Bead (Referenz)')
-    g_bead.add_argument('--with-reference', action='store_true',
-                        help='NACH dem Bead-Lauf automatisch den Referenzlauf OHNE '
-                             'Bead rechnen (zweite Datei _ref) -> Bead-Differenz im Analyzer')
+    g_bead.add_argument('--no-reference', action='store_true',
+                        help='KEINEN Referenzlauf ohne Bead mitrechnen. Standard: es '
+                             'werden BEIDE Laeufe gerechnet (mit Bead + Referenz ohne, '
+                             'Datei _ref) fuer die Bead-Differenz. Haken/Flag setzen = '
+                             'nur der Bead-Lauf.')
 
     g_src = ap.add_argument_group('Quelle (VCSEL)')
     g_src.add_argument('--vcsel-waist', type=float, default=2.0, help='Taille (y) in um')
@@ -487,10 +489,10 @@ def main(argv=None):
     else:
         _run_3d(args, layers)
 
-    # Optionaler AUTOMATISCHER Referenzlauf OHNE Bead -> zweite Datei mit Suffix
-    # '_ref'. Damit hat man mit EINEM Aufruf beide Laeufe fuer die Bead-Differenz
-    # (Streufeld = mit - ohne) im Analyzer.
-    if getattr(args, 'with_reference', False) and _had_bead:
+    # STANDARD: nach dem Bead-Lauf automatisch den Referenzlauf OHNE Bead rechnen
+    # (zweite Datei mit Suffix '_ref') -> mit EINEM Aufruf beide Laeufe fuer die
+    # Bead-Differenz (Streufeld = mit - ohne). Mit --no-reference abschaltbar.
+    if _had_bead and not getattr(args, 'no_reference', False):
         print('\n============ REFERENZLAUF (ohne Bead) ============')
         args.no_bead = True                      # zweiter Lauf: kein Bead -> Datei _ref
         if args.dim == 2:
@@ -498,8 +500,6 @@ def main(argv=None):
         else:
             _run_3d(args, layers)
         print('  -> Referenz (_ref) gespeichert. Im Analyzer: Differenz mit - ohne Bead.')
-    elif getattr(args, 'with_reference', False):
-        print('  [Hinweis] --with-reference ohne Bead sinnlos (kein Bead im Lauf).')
 
 
 if __name__ == '__main__':
