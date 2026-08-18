@@ -79,7 +79,7 @@ _LABELS = {
     # Grundeinstellungen
     'length_um': 'Propagationslaenge (um)', 'resolution_nm': 'Gitteraufloesung dx (nm)',
     'lambda_nm': 'Wellenlaenge lambda (nm)', 'polarization': 'Polarisation',
-    'boundary': 'Absorbierender Rand (2D full)',
+    'boundary': 'Absorbierender Rand (leer=Default)',
     'source_type': 'Quell-Zeitverlauf', 'snapshots': 'Gespeicherte Frames (Anzahl)',
     # Material & Schichten
     'wg_material': 'Waveguide-Material', 'wg_thickness_um': 'Waveguide-Dicke (um)',
