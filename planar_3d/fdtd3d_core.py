@@ -297,11 +297,26 @@ def check_resources_3d(Nx, Ny, Nz, n_snapshots, vol_dtype, save_vector,
     return ok, '\n'.join(lines), hints
 
 
+def _resolve_tear_um(tear_um, t_lip_um, t_aq_um, t_mu_um, n_sponge, dx_um, cornea_um=1.5):
+    """tear_um (Gebiets-Hoehe unter dem WG) aufloesen. None -> AUTO aus den
+    physikalischen Schichten + Cornea-Marge + Absorber-Zone (2D macht das ueber
+    einen festen Puffer; 3D leitet es hier ab, damit man es nicht doppelt angeben
+    muss). Explizit gesetzt -> unveraendert (zum Trimmen der Cornea-Marge)."""
+    if tear_um is not None:
+        return float(tear_um)
+    layers = t_lip_um + t_aq_um + t_mu_um
+    absorber = n_sponge*dx_um
+    tot = layers + cornea_um + absorber
+    print(f'  [Auto] tear = {tot:.2f}um (Lipid+Aqueous+Mucin {layers:.2f} + '
+          f'Cornea {cornea_um:g} + Absorber {absorber:.2f}um)')
+    return tot
+
+
 def run_3d(label, wg_n, t_wg_um=5.0,
            t_lip_um=0.0, t_aq_um=4.0, t_mu_um=2.0,
            n_lip=1.480, n_aq=1.336, n_mu=1.342, n_co=1.376,
            lam_nm=850.0,
-           lx_um=40.0, air_um=3.0, tear_um=8.0, lz_um=8.0,
+           lx_um=40.0, air_um=3.0, tear_um=None, lz_um=8.0,
            dx_nm=50.0, vcsel_waist_um=2.0, vcsel_waist_z_um=2.0,
            source_type='cw', n_snapshots=8, steps_factor=2.0,
            bead=None, n_sponge=24, sponge_alpha=0.3,
@@ -340,6 +355,7 @@ def run_3d(label, wg_n, t_wg_um=5.0,
     f0 = C0/LAM
     sigma_t = 4/(2*np.pi*f0)
 
+    tear_um = _resolve_tear_um(tear_um, t_lip_um, t_aq_um, t_mu_um, n_sponge, dx_um)
     ly_um = t_wg_um + air_um + tear_um
     Nx = int(round(lx_um/dx_um))
     Ny = int(round(ly_um/dx_um))
@@ -656,7 +672,7 @@ def run_3d(label, wg_n, t_wg_um=5.0,
 def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
                     t_wg_um=5.0, t_lip_um=0.0, t_aq_um=4.0, t_mu_um=2.0,
                     n_lip=1.480, n_aq=1.336, n_mu=1.342, n_co=1.376,
-                    lam_nm=850.0, lx_um=40.0, air_um=3.0, tear_um=8.0, lz_um=8.0,
+                    lam_nm=850.0, lx_um=40.0, air_um=3.0, tear_um=None, lz_um=8.0,
                     dx_nm=50.0, vcsel_waist_um=2.0, vcsel_waist_z_um=2.0,
                     source_type='cw', n_snapshots=8,
                     bead=None, n_sponge=24, sponge_alpha=0.3,
@@ -683,6 +699,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
     dt = 0.5*dx/(C0*np.sqrt(3))
     LAM = lam_nm*1e-9; f0 = C0/LAM; omega = 2*np.pi*f0
     sigma_t = 4/(2*np.pi*f0); k0 = 2*np.pi/LAM
+    tear_um = _resolve_tear_um(tear_um, t_lip_um, t_aq_um, t_mu_um, n_sponge, dx_um)
     ly_um = t_wg_um + air_um + tear_um
     Ny = int(round(ly_um/dx_um)); Nz = int(round(lz_um/dx_um))
     y0_um = -tear_um; z0_um = -lz_um/2.0

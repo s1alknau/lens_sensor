@@ -354,7 +354,10 @@ def build_parser():
     g_3d = ap.add_argument_group('3D-spezifisch')
     g_3d.add_argument('--lz-um', type=float, default=8.0, help='Domain-Tiefe z in um (nur 3D)')
     g_3d.add_argument('--air', type=float, default=3.0, help='Luft ueber WG in um (nur 3D)')
-    g_3d.add_argument('--tear', type=float, default=8.0, help='Tear+Cornea unter WG um (nur 3D)')
+    g_3d.add_argument('--tear', type=float, default=None,
+                      help='Tear+Cornea-Gebiet unter WG in um (nur 3D). Leer = AUTO: '
+                           'Lipid+Aqueous+Mucin + ~1.5um Cornea + Absorber. Nur zum '
+                           'Trimmen der Cornea-Marge explizit setzen.')
     g_3d.add_argument('--wg-width', type=float, default=None,
                       help='WG-Kernbreite in z (um) -> Rechteck-Kanal, Fuehrung in y UND z '
                            '(ohne Angabe: Slab, nur y-Fuehrung; nur 3D)')
@@ -465,7 +468,8 @@ def main(argv=None):
     if args.method == 'stitch':
         print(f'  Stitch    : Fenster {args.window_um:g} um, Slide {args.slide_um:g} um')
     if args.dim == 3:
-        print(f'  Tiefe z   : {args.lz_um:g} um   (air {args.air:g} / tear {args.tear:g} um)')
+        print(f'  Tiefe z   : {args.lz_um:g} um   (air {args.air:g} / '
+              f'tear {"auto" if args.tear is None else f"{args.tear:g} um"})')
         if args.calibrate:
             print(f'  Kalibrier.: {args.calibrate} Steps messen (kein voller Lauf)')
     print('==============================================================')

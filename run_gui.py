@@ -45,6 +45,7 @@ _AUTO_HINTS = {
     'length_um': 'auto: planar 1000 / lens 14000 (2D), 60 (3D) um',
     'window_um': 'auto: 350 (2D) / 20 (3D)',
     'slide_um': 'auto: 150 (2D) / 12 (3D)',
+    'tear': 'auto: Lipid+Aqueous+Mucin + ~1.5um Cornea + Absorber',
     # Material-Overrides: Default = Brechzahl @850 nm (leer lassen -> dieser Wert)
     'wg_n': 'auto: PMMA 1.491 @850nm', 'bead_n': 'auto: Polystyrol 1.590',
     'n_aqueous': 'auto: 1.336', 'n_mucin': 'auto: 1.342',
