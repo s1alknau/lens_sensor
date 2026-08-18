@@ -261,6 +261,7 @@ class Analyzer:
         self.pol = 'p' if _polv in ('p', 'tm') else 's'
         # Primaerkomponente = gespeichertes Skalarfeld; Label je nach Polarisation
         self.prim = 'Ey' if self.pol == 'p' else 'Ez'
+        self.comp = self.prim                        # aktive Komponente (auch 2D pol-abhaengig)
         self.pol_tag = 'TM/p' if self.pol == 'p' else 'TE/s'
         if self.is3d:
             # Volles Volumen: (nf, Nx=Laenge, Ny=Querschnitt, Nz=Tiefe)
@@ -1815,7 +1816,7 @@ class Analyzer:
                 self.ax.set_ylim(-vmax*1.1, vmax*1.1)
         self.ax.set_xlim(zoom_bot, zoom_top)
         self.ax.set_xlabel('y (um)  — Zoom auf Lens + Tear-Region', color='#cccccc')
-        self.ax.set_ylabel('Ez', color='#cccccc')
+        self.ax.set_ylabel(getattr(self, 'comp', self.prim), color='#cccccc')
         self.ax.grid(True, alpha=0.2)
         for y_line, color, label in self._layer_marks(y_lens_top, y_lens_bot):
             self.ax.axvline(y_line, color=color, ls='--', lw=1, alpha=0.7,
@@ -2178,7 +2179,8 @@ class Analyzer:
         self.ax.set_ylim(_mx*1e-7, _mx*30)
         self.ax.set_xticks(x_pos)
         self.ax.set_xticklabels(layer_names, color='#cccccc')
-        self.ax.set_ylabel('Integrierte |Ez|^2 (log)', color='#cccccc')
+        self.ax.set_ylabel(f'Integrierte |{getattr(self, "comp", self.prim)}|^2 (log)',
+                           color='#cccccc')
         _bt = '  (Bead = lokales Integral um x=%.0fum)' % getattr(self,'bead_x',500.0) if getattr(self,'is_bead',False) else ''
         self.ax.set_title(f'Layer Power - {self.scenario}{_bt}',
                           color='#ffffff', fontsize=10)
@@ -2244,7 +2246,8 @@ class Analyzer:
                          bbox=dict(facecolor='#330000', edgecolor='#FFAA55', alpha=0.7))
         self.ax.set_xlabel(f'Frame-Index  (gesamt: {len(amps)} Frames in {n_sl} Slide-Fenstern)',
                            color='#cccccc')
-        self.ax.set_ylabel('max |Ez|' + (' (log)' if use_log else ''), color='#cccccc')
+        self.ax.set_ylabel(f'max |{getattr(self, "comp", self.prim)}|'
+                           + (' (log)' if use_log else ''), color='#cccccc')
         self.ax.set_title('Zeitliche Entwicklung der Wellen-Amplitude '
                           '(Bands = Slide-Fenster, oben: x-Startposition)',
                           color='#ffffff', fontsize=10)
@@ -2282,7 +2285,7 @@ class Analyzer:
         self.ax.set_yscale('log')
         self.ax.set_xticks(x_pos)
         self.ax.set_xticklabels(names, color='#cccccc', rotation=20, ha='right')
-        self.ax.set_ylabel('|Ez| (log)', color='#cccccc')
+        self.ax.set_ylabel(f'|{getattr(self, "comp", self.prim)}| (log)', color='#cccccc')
         self.ax.set_title('Vergleich der geladenen Szenarien (max/mean |Ez|)',
                           color='#ffffff', fontsize=10)
         self.ax.grid(True, alpha=0.25, axis='y', which='both')
