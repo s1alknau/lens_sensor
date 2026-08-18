@@ -63,6 +63,12 @@ def _auto_hint(dest):
     return _AUTO_HINTS.get(dest, 'auto (Default des Solvers)')
 
 
+# Optionen, die im GUI NICHT als Feld erscheinen (bleiben per CLI nutzbar).
+# no_bead: intern fuer den automatischen Referenzlauf; im GUI genuegt der eine
+# Haken 'no_reference' (Referenzlauf abschalten) - Default rechnet beides.
+_GUI_HIDE = {'no_bead'}
+
+
 # Klartext-Beschriftungen (mit Einheit) statt roher CLI-Flags. Das rohe Flag und
 # der Hilfetext erscheinen im Tooltip. Nicht gelistete Flags werden aus dem
 # Flag-Namen abgeleitet (_pretty).
@@ -275,7 +281,7 @@ class SimGUI:
         self.vars.clear(); self.widgets.clear(); self.labels.clear(); self.placeholders.clear()
         for grp in self.parser._action_groups:
             acts = [a for a in grp._group_actions
-                    if a.option_strings and a.dest != 'help']
+                    if a.option_strings and a.dest != 'help' and a.dest not in _GUI_HIDE]
             if not acts:
                 continue
             sec = ttk.LabelFrame(self.form, text='  ' + (grp.title or '') + '  ',
