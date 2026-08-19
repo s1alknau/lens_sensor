@@ -98,9 +98,10 @@ _LABELS = {
     'vcsel_offset_z': 'Spot-Versatz z (um, nur 3D)',
     'input_gap': 'Einkoppelabstand Laser->WG (um)',
     # 3D-spezifisch
-    'lz_um': 'Domaenen-Tiefe z (um, nur 3D)', 'air': 'Luft ueber WG (um, nur 3D)',
+    'lz_um': 'GESAMTE Rechen-Tiefe z (Domaene, +/-lz/2 um z=0)',
+    'air': 'Luft ueber WG (um, nur 3D)',
     'tear': 'Traenenfilm+Cornea unter WG (um, nur 3D)',
-    'wg_width': 'Kanalbreite z (um; leer=Slab, nur 3D)',
+    'wg_width': 'Waveguide-Kanalbreite in z (leer=Slab/unendlich)',
     'wg_clad_n': 'Seitliches Cladding n (nur 3D)',
     'steps_factor': 'Zeitschritt-Faktor (nur 3D full)',
     'vol_dtype': 'Speicherformat 3D-Volumen', 'pec_faces': 'PEC-Spiegelflaechen (nur 3D full)',

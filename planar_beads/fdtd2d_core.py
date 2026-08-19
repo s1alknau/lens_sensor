@@ -42,8 +42,8 @@ MAT = {'polystyrol': N_POLYSTYR, 'pmma': N_PMMA}
 L_DEMO = 1.0e-3
 AIR_BUFFER = 5.0e-6
 TEAR_BUFFER = 10.0e-6
-T_MU = 2.0e-6            # Mucin-Dicke
-T_AQ = 6.0e-6            # Aqueous(Wasser)-Dicke, FEST (> groesster Bead) -> Bead eingebettet
+T_MU = 0.5e-6            # Mucin-Dicke (physiologisch ~0.2-0.5 um)
+T_AQ = 3.5e-6            # Aqueous(Wasser)-Dicke (physiologisch ~3-4 um; > typ. Bead)
 
 
 def aqueous_thickness(bead_d_um):

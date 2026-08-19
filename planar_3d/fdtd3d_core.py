@@ -314,7 +314,7 @@ def _resolve_tear_um(tear_um, t_lip_um, t_aq_um, t_mu_um, n_sponge, dx_um, corne
 
 
 def run_3d(label, wg_n, t_wg_um=5.0,
-           t_lip_um=0.0, t_aq_um=4.0, t_mu_um=2.0,
+           t_lip_um=0.0, t_aq_um=3.5, t_mu_um=0.5,
            n_lip=1.480, n_aq=1.336, n_mu=1.342, n_co=1.376,
            lam_nm=850.0,
            lx_um=40.0, air_um=3.0, tear_um=None, lz_um=8.0,
@@ -686,7 +686,7 @@ def run_3d(label, wg_n, t_wg_um=5.0,
 
 
 def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
-                    t_wg_um=5.0, t_lip_um=0.0, t_aq_um=4.0, t_mu_um=2.0,
+                    t_wg_um=5.0, t_lip_um=0.0, t_aq_um=3.5, t_mu_um=0.5,
                     n_lip=1.480, n_aq=1.336, n_mu=1.342, n_co=1.376,
                     lam_nm=850.0, lx_um=40.0, air_um=3.0, tear_um=None, lz_um=8.0,
                     dx_nm=50.0, vcsel_waist_um=2.0, vcsel_waist_z_um=2.0,

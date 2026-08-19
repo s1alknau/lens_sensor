@@ -93,8 +93,10 @@ def _resolve_layers(args):
         lip, aq, mu, n_aq = LENS_SCENARIOS[args.scenario]
         base = dict(t_wg_um=T_LENS_UM, t_lip_um=lip, t_aq_um=aq, t_mu_um=mu, n_aq=n_aq)
     else:
-        base = dict(t_wg_um=args.wg_thickness_um, t_lip_um=0.0,
-                    t_aq_um=None, t_mu_um=None, n_aq=None)
+        # Einheitliche PHYSIOLOGISCHE Tränenfilm-Schichten (2D=3D): Lipid 30nm +
+        # Aqueous 3.5um + Mucin 0.5um -> Tränenfilm gesamt ~4um. Einzeln via --t-*.
+        base = dict(t_wg_um=args.wg_thickness_um, t_lip_um=0.030,
+                    t_aq_um=3.5, t_mu_um=0.5, n_aq=None)
     # WG-Brechzahl: --wg-n ueberschreibt; sonst aus --wg-material + Wellenlaenge.
     base['wg_n'] = (args.wg_n if args.wg_n is not None
                     else n_at(getattr(args, 'wg_material', 'pmma'), args.lambda_nm))
@@ -164,8 +166,8 @@ def _run_3d(args, layers):
                     n=(args.bead_n if args.bead_n is not None
                        else f3d.n_at(args.bead_material, args.lambda_nm)))
     # Layer-Defaults fuer 3D (run_3d verlangt konkrete Werte)
-    t_aq = layers['t_aq_um'] if layers['t_aq_um'] is not None else 4.0
-    t_mu = layers['t_mu_um'] if layers['t_mu_um'] is not None else 2.0
+    t_aq = layers['t_aq_um'] if layers['t_aq_um'] is not None else 3.5
+    t_mu = layers['t_mu_um'] if layers['t_mu_um'] is not None else 0.5
     n_aq = layers['n_aq'] if layers['n_aq'] is not None else f3d.n_at('aqueous', args.lambda_nm)
     n_mu = layers['n_mu'] if layers['n_mu'] is not None else f3d.n_at('mucin', args.lambda_nm)
     n_co = layers['n_co'] if layers['n_co'] is not None else f3d.n_at('cornea', args.lambda_nm)
@@ -358,15 +360,18 @@ def build_parser():
                        help='Einkoppelabstand Laser-zu-WG in um (Luftweg + Fresnel-Eintritt)')
 
     g_3d = ap.add_argument_group('3D-spezifisch')
-    g_3d.add_argument('--lz-um', type=float, default=8.0, help='Domain-Tiefe z in um (nur 3D)')
+    g_3d.add_argument('--lz-um', type=float, default=8.0,
+                      help='GESAMTE Rechen-Tiefe z (Domaene) in um, symmetrisch um z=0 '
+                           '(-lz/2 .. +lz/2). NICHT die Waveguide-Breite (das ist --wg-width).')
     g_3d.add_argument('--air', type=float, default=3.0, help='Luft ueber WG in um (nur 3D)')
     g_3d.add_argument('--tear', type=float, default=None,
                       help='Tear+Cornea-Gebiet unter WG in um (nur 3D). Leer = AUTO: '
                            'Lipid+Aqueous+Mucin + ~1.5um Cornea + Absorber. Nur zum '
                            'Trimmen der Cornea-Marge explizit setzen.')
     g_3d.add_argument('--wg-width', type=float, default=None,
-                      help='WG-Kernbreite in z (um) -> Rechteck-Kanal, Fuehrung in y UND z '
-                           '(ohne Angabe: Slab, nur y-Fuehrung; nur 3D)')
+                      help='WAVEGUIDE-Kanalbreite in z (um), zentriert um z=0 (|z|<Breite/2) '
+                           '-> Rechteck-Kanal, Fuehrung in y UND z. Muss < --lz-um sein. '
+                           'Ohne Angabe: Slab (in z unendlich, nur y-Fuehrung). Nur 3D.')
     g_3d.add_argument('--wg-clad-n', type=float, default=1.0,
                       help='Brechzahl seitliches Cladding (nur 3D, Default Luft)')
     g_3d.add_argument('--steps-factor', type=float, default=2.0, help='nur 3D full')
