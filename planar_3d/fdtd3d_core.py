@@ -995,11 +995,16 @@ def save_results_3d(result, out_dir='results', prefix='fdtd3d',
     Slice-NPZ (z-Mittelebene, lesbar mit fdtd_analyzer.py)."""
     os.makedirs(out_dir, exist_ok=True)
     tag = result['scenario']
-    summary = {k: v for k, v in result.items()
-               if k not in ('vols', 'vols_array', 'vols_ex', 'vols_ey', 'Iavg')}
-    with open(f'{out_dir}/{prefix}_{tag}.pkl', 'wb') as f:
-        pickle.dump(summary, f)
-    print(f'  Saved: {out_dir}/{prefix}_{tag}.pkl')
+    # ALLE grossen Feld-Arrays vom PKL-Summary ausschliessen (die kommen ins NPZ).
+    # 'cw_vol' fehlte hier -> das volle CW-Volumen wurde ins Pickle geladen -> OOM.
+    _big = ('vols', 'vols_array', 'vols_ex', 'vols_ey', 'Iavg', 'cw_vol')
+    summary = {k: v for k, v in result.items() if k not in _big}
+    try:
+        with open(f'{out_dir}/{prefix}_{tag}.pkl', 'wb') as f:
+            pickle.dump(summary, f)
+        print(f'  Saved: {out_dir}/{prefix}_{tag}.pkl')
+    except Exception as e:                      # PKL darf NIE die NPZ-Speicherung verhindern
+        print(f'  [WARN] PKL-Summary nicht gespeichert ({e}); fahre mit NPZ fort.')
 
     # ezs3d ist bereits der vorallokierte Puffer (kein np.stack -> kein RAM-Peak)
     ezs3d = result.get('vols_array')
@@ -1021,14 +1026,16 @@ def save_results_3d(result, out_dir='results', prefix='fdtd3d',
     cw_vol = result.get('cw_vol'); _cwonly = bool(result.get('cw_only', False))
     kw_cw_fr = {}; kw_cw_vol = {}
     if cw_vol is not None and not _cwonly:
-        cw3d = np.asarray(cw_vol)
-        cw_xy = cw3d[:, :, :, cw3d.shape[3]//2].astype(np.float32)
+        # Nur die z-Mittelebene laden (Memmap-Slice), NICHT das ganze Volumen -> kein
+        # RAM-Peak fuer das (kleine) Frames-NPZ. Das volle Volumen geht als Memmap
+        # ins (spaetere, mit Fallback abgesicherte) Volumen-NPZ.
+        cw_xy = np.asarray(cw_vol[:, :, :, cw_vol.shape[3]//2]).astype(np.float32)
         _f0 = result.get('f0') or (2.99792458e8/(result.get('lam_nm', 850.0)*1e-9))
         ncw = cw_xy.shape[0]
         meta_cw = np.array([(0.0, x_end, y_start, y_end, 0, (k/ncw)/_f0, k)
                             for k in range(ncw)], dtype=np.float64)
         kw_cw_fr = dict(Ez_cw=cw_xy, meta_cw=meta_cw)
-        kw_cw_vol = dict(Ez_cw=cw3d)
+        kw_cw_vol = dict(Ez_cw=cw_vol)
     _flags = dict(has_transient=np.array([0 if _cwonly else 1]),
                   has_cw=np.array([1 if (_cwonly or cw_vol is not None) else 0]),
                   cw_only=np.array([1 if _cwonly else 0]),
