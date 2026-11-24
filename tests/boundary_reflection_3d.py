@@ -1,4 +1,4 @@
-"""Reflexions-Benchmark der 3D-Absorber (sponge / mur1 / mur2 / cpml).
+"""Reflexions-Benchmark der 3D-Absorber (sponge / mur1 / cpml).
 
 Ricker-Punktquelle (treibt Ez) in der Mitte eines NxNxN-Freiraumgitters. Die an
 den 6 Aussenflaechen zuruecklaufende Welle ist der Fehler. Referenz = viel
@@ -57,7 +57,7 @@ def _solve3d(N, dx, nsteps, boundary, src, probe, fp, t0, n_sp=12, alpha=0.3):
     return trace
 
 
-def main(boundaries=('sponge', 'mur1')):
+def main(boundaries=('sponge', 'mur1', 'cpml')):
     dx = 20e-9
     N = 70
     nsteps = 320

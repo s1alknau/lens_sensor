@@ -1,0 +1,14 @@
+{
+  "scale_um": 1.0,
+  "axis": "xzy",
+  "materials": {
+    "Kern": "pmma",
+    "Film": "aqueous",
+    "Cornea": "cornea",
+    "Bead": "polystyrol"
+  },
+  "background": "air",
+  "priority": {},
+  "core": null,
+  "tear": null
+}

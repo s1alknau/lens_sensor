@@ -104,6 +104,18 @@ the handoff (captures mode conversion; radiation is not carried and shows up as
 guided-power loss). For large/long domains the native stitch solver
 (`--engine native --method stitch`) remains the right tool.
 
+**Absorption (complex refractive index).** Every layer and the bead accept a
+complex index `n = n' + i·kappa`, either directly (`--n-aqueous 1.331+0.001i`) or
+as an extinction coefficient on top of the dispersion model
+(`--kappa-aqueous 0.001`; also `--kappa-wg/-lipid/-mucin/-cornea/-bead`). CAD
+bodies take `n=1.50+0.002i` or `aqueous+0.001i` in the material dialog. The solver
+uses `eps' = n'^2 - kappa^2` plus a conductivity `sigma = omega0 eps0 · 2 n' kappa`.
+That is exact at the operating wavelength and approximate for broadband pulses.
+It works in native 2D TE/TM and 3D, and in Meep (`D_conductivity`). Metals
+(kappa ≥ n') would need a Drude model and are rejected. Validation:
+`python tests/absorption_validation.py`. It compares the decay rate of the guided
+mode with the exact complex slab eigenvalue, agreeing to < 1 % for TE and TM.
+
 Evaluate results with the analyzer:
 
 ```
@@ -128,6 +140,13 @@ against the analytic slab dispersion relation, which equals Meep's frequency-dom
 eigenmode solver (MPB) exactly and is therefore the dispersion-free ground truth
 (**n_eff = 1.4889**). Reproduce with the commands at the end of this section.
 
+> **Note (material indices):** this benchmark was measured with the former
+> visible-range indices (PMMA 1.491, aqueous 1.336). The solvers now take n(λ)
+> from sourced Sellmeier fits in `common/physics.py` (PMMA 1.4835, tears 1.3313,
+> cornea 1.3704, mucin 1.3331, lipid 1.4729 at 850 nm; see the source list
+> there), for which the exact slab value is n_eff = 1.4813. The *offsets* below
+> (numerical dispersion) are a property of the grid and carry over unchanged.
+
 Hardware here: native on one NVIDIA RTX A500 (4 GB) GPU; Meep on 22 CPU cores
 (MPI, `mpi_mpich` build). Meep has **no GPU support** — it scales only over CPU
 cores.
@@ -146,9 +165,15 @@ the grid is refined (2D: +0.0030 → +0.0011 from dx = 20 → 12 nm). That bias 
 generic FDTD **numerical dispersion** — not a bug in either solver — and it
 vanishes toward the exact MPB/analytic value with finer resolution. Meep's own
 time-domain FDTD carries an *even slightly larger* bias than the native solver at
-the same coarse 3D resolution, which is the strongest possible confirmation that
-the native physics is correct. The frequency-domain MPB eigensolver reproduces
-the analytic n_eff to 4 decimals.
+the same coarse 3D resolution. Two Yee solvers sharing the same bias is expected
+(it is the standard Yee dispersion, predicted analytically: +0.0029 / +0.0010 /
++0.0187 for 2D 20 nm / 2D 12 nm / 3D 50 nm), so the agreement alone does not prove
+the physics; the real evidence is the second-order convergence of both toward the
+analytic value as dx is refined. At 3D 50 nm n_eff exceeds the core index, so
+absolute 3D quantities at that resolution are not meaningful. The frequency-domain
+MPB eigensolver reproduces the analytic n_eff to 4 decimals. Sensing physics is
+checked separately in `tests/sensing_validation.py` (thin core, dn_eff/dn_aq) and
+`tests/bead_subpixel_series.py` (bead vs gap).
 
 ### Speed — native GPU vs. Meep CPU/MPI
 
@@ -183,21 +208,36 @@ is amortized over more cells).
 ### Limitations
 
 **native**
-- Absorbing boundary selectable via `--boundary` for **all 2D methods**: `mur1`
-  (default, 1st-order Mur), `mur2` (2nd-order Mur, better at oblique incidence),
-  or `cpml` (convolutional PML, best absorption). Measured residual reflection of
-  a broadband point source (`tests/boundary_reflection.py`): mur1 ≈ −32 dB,
-  mur2 ≈ −45 dB, cpml ≈ −57 dB. Coverage per method:
-  - `full` — all four edges (`mur1`/`mur2`/`cpml`).
-  - `sliding` — all four edges; the CPML ψ-fields co-move with the window and
-    the Mur-2 history resets on each slide.
-  - `stitch` — absorber on the transverse **y-edges** and on the **two real
-    device x-ends** (window 0 = entry facet, last window = exit facet). The
-    *internal* window seams stay handoff/Mur, because the CPML lossy layer would
-    otherwise eat into the assembled field (no guard region between seams). `mur2`
-    is numerically incompatible with the hard handoff drive (late-time
-    instability, esp. TM), so on `stitch` it auto-upgrades to `cpml`.
-- No subpixel averaging → grid-staircasing of curved/oblique material interfaces.
+- Absorbing boundary via `--boundary`: **default `cpml` in 2D and 3D** (convolutional
+  PML, 10 cells, κ = 1 with a CFS term a = 2π·ε₀·f₀/10; `tests/cpml_compare.py` measured
+  κ = 7 or 3 to reflect up to 25× more with only 10 cells, and the CFS term lowers
+  grazing-incidence reflection by ~20 %). 3D alternative: `sponge` (graded absorber,
+  fixed 1.2 µm thick so its reflection does not grow when dx is refined). `mur1` remains a
+  CLI-only expert option (hidden in the GUI): 1st-order Mur with the *local* speed
+  (x-ends c0/n_eff of the fundamental guided mode, transverse edges c0/n of the edge
+  cells). Measured backward-wave amplitude of the guided wave (5 µm PMMA slab):
+  2D mur1 0.006 (was 0.20 with the old vacuum-speed coefficient), cpml 0.002;
+  3D mur1 0.012 (was 0.14), sponge 0.0015. Mur is exact only for the fundamental
+  mode at normal incidence — use cpml for quantitative results. `mur2` was removed
+  (no gain over local-speed mur1, unstable with the stitch handoff).
+  - `full` / `sliding` — all edges (the CPML ψ-fields co-move with the sliding window).
+  - `stitch` — the chosen boundary applies to the **outer** edges (y-edges, entry
+    of window 0, exit of the last window). The *internal* window seams are always
+    CPML in a non-assembled extension of each window.
+- `transmission` is one definition for all CW methods: net CW Poynting flux
+  through the planes at 10 % / 90 % of the length, integrated over the whole
+  cross-section (TE exact, TM ε-weighted). The old intensity-box value is kept as
+  `transmission_intensity`.
+- Run length: ramp + transits at a group-index margin (1.1 × n_core); full runs
+  then check CW convergence (phasor change between the last two 8-period DFT
+  windows < 1 %) and extend themselves up to 2× if needed (`cw_rel_change`).
+- Beads use subpixel averaging (`common/subpixel.py`): cells cut by the sphere get
+  the volume-fraction mean (TE: arithmetic; TM and 3D: anisotropic per E-component,
+  harmonic mean normal / arithmetic mean tangential to the surface, Farjadpour et
+  al. 2006), so bead position and bead–core gap are continuous instead of snapping
+  to the grid (`BEAD_SUBPIXEL = False` restores the hard mask for comparison;
+  `tests/bead_subpixel_series.py` checks it). Planar layer interfaces lie on the
+  grid; CAD bodies are still voxelized without smoothing.
 - Coarse-resolution n_eff bias (numerical dispersion); needs finer dx for < 0.001 accuracy.
 - 4 GB GPU caps full-domain 3D and the large contact lens → use `--method stitch`.
 - Evanescent-decay extraction in `crossval` is experimental (sub-µm decay, unreliable).

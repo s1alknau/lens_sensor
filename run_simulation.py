@@ -31,6 +31,8 @@ import os
 import sys
 import subprocess
 
+import numpy as np
+
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 for _sub in ("planar_beads", "planar_3d"):
     _p = os.path.join(_REPO_ROOT, _sub)
@@ -38,7 +40,7 @@ for _sub in ("planar_beads", "planar_3d"):
         sys.path.insert(0, _p)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-from common.physics import n_at            # noqa: E402  (Brechzahl aus Material+Lambda)
+from common.physics import n_at, tear_index_at, cornea_default, parse_n, split_n   # noqa: E402
 
 # WSL-Ziel fuer den Meep-Zweig (Meep laeuft nur unter Linux).
 WSL_DISTRO = "Ubuntu-24.04"
@@ -82,7 +84,112 @@ DEFAULT_LENGTH_UM = {
 _GEOM_ALIASES = {
     'lens': 'lens', 'linse': 'lens', 'kontaktlinse': 'lens', 'contact': 'lens',
     'planar': 'planar', 'waveguide': 'planar', 'wg': 'planar', 'bead': 'planar',
+    'cad': 'cad', 'step': 'cad', 'stl': 'cad', 'inventor': 'cad', 'solidcraft': 'cad',
 }
+
+
+def _make_cad(args, absorber_um=None):
+    """CAD-Szene + Rechenbox fuer --geometry cad. Materialzuordnung aus
+    '<datei>.lens.json' (GUI) und/oder --cad-materials ('Kern=pmma,Film=aqueous,
+    Prisma=n=1.52'); --cad-materials wird in die Konfigdatei uebernommen."""
+    from common.cad_geometry import CadScene, CadRun
+    if not args.cad:
+        raise SystemExit('--geometry cad requires --cad <file> (.sc/.step/.stl/.ipt/...).')
+    scene = CadScene.from_config(args.cad, scale_um=args.cad_scale, axis=args.cad_axis,
+                                 core=args.cad_core, tear=args.cad_tear,
+                                 background=args.cad_background)
+    if args.cad_materials:
+        for item in args.cad_materials.split(','):
+            if '=' not in item:
+                continue
+            body, mat = item.split('=', 1)
+            body = body.strip()
+            if body not in scene.bodies:
+                raise SystemExit(f'--cad-materials: body "{body}" does not exist. '
+                                 f'Available: {", ".join(scene.bodies)}')
+            scene.materials[body] = mat.strip()
+        print(f'  CAD material assignment saved: {scene.save_config()}')
+    if args.cad_open:
+        try:
+            scene.open_by_spec(args.cad_open, args.lambda_nm)
+        except ValueError as e:
+            raise SystemExit(str(e))
+        print(f'  CAD open faces saved: {scene.save_config()}')
+    missing = scene.unassigned()
+    if missing:
+        raise SystemExit('CAD: bodies without material: ' + ', '.join(missing) +
+                         '\n  -> assign them in the GUI or pass --cad-materials "'
+                         + ','.join(f'{b}=pmma' for b in missing) + '".')
+    dx_um = args.resolution_nm/1000.0
+    bnd = (args.boundary or 'cpml').lower()
+    # 3D-Sponge: feste Dicke 1.2 um (mind. 8 Zellen), wie planar_3d._sponge_cells
+    _ncell = max(8, -int(-1.2//dx_um)) if (args.dim == 3 and bnd == 'sponge') else 10
+    absorber = _ncell*dx_um if bnd != 'mur1' else 0.0
+    if absorber_um is not None:                     # z.B. Meep-PML (liegt in der Zelle)
+        absorber = float(absorber_um)
+    return CadRun(scene, args.dim, dx_um, args.lambda_nm, plane_z_um=args.cad_plane_z,
+                  absorber_um=absorber)
+
+
+def _prepare_meep_cad(args):
+    """CAD fuer Meep: Konvertierung/Voxelisierung laeuft unter Windows (SolidCraft,
+    Inventor), Meep laeuft in WSL. Deshalb hier das eps-Gitter der CAD-Box (gleiches dx
+    wie Meep), Regionen, Quelle und Detektoren vorberechnen und als NPZ ablegen; der
+    Meep-Treiber liest es (--meep-cad-eps). Meep-PML (~1 lambda) liegt in der Zelle."""
+    import json as _json
+    resolve_args(args)
+    lam_um = args.lambda_nm/1000.0
+    cad = _make_cad(args, absorber_um=lam_um)
+    dx = cad.dx_um
+    nx = max(2, int(round(cad.lx_um/dx))); ny = max(2, int(round(cad.ly_um/dx)))
+    if args.dim == 3:
+        nz = max(2, int(round(cad.lz_um/dx)))
+        eps, reg = cad.eps3d(0.0, nx, ny, nz)
+        reg_xy = reg[:, :, nz//2]
+    else:
+        eps, reg = cad.eps2d(0.0, nx, ny)
+        reg_xy = reg
+    x_src = lam_um + 0.5                             # wie Meep: knapp hinter der PML
+    src = cad.source(x_src)
+    lo, hi = cad.scene.bbox(cad.core)
+    L = hi[0] - lo[0]
+    path = os.path.join(_REPO_ROOT, 'results',
+                        f'_meep_cad_{os.path.splitext(os.path.basename(args.cad))[0]}.npz')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    meta = cad.meta()
+    if np.iscomplexobj(eps) and np.any(np.abs(np.imag(eps)) > 0):
+        # Meep liest hier ein REELLES eps-Gitter: absorbierende CAD-Materialien
+        # (z.B. 'aqueous+0.001i') wuerden sonst stillschweigend verlustfrei gerechnet.
+        print('[engine=meep] WARNING: CAD materials with absorption (Im(n) > 0) - Meep '
+              'computes the CAD grid LOSSLESS (Re(eps) only). For absorption '
+              'use --engine native.')
+        eps = np.real(eps)
+    np.savez_compressed(path, eps=np.asarray(eps, np.float32), region=np.asarray(reg, np.int8),
+                        dx_um=dx, lx_um=cad.lx_um, ly_um=cad.ly_um, lz_um=cad.lz_um,
+                        y0_um=cad.y0_um, z0_um=cad.z0_um, x_src_um=x_src,
+                        src_y_um=src['y_um'], src_z_um=src['z_um'], src_tilt_deg=src['tilt_deg'],
+                        det_in_x_um=lo[0] + 0.1*L, det_out_x_um=lo[0] + 0.9*L,
+                        meta_json=_json.dumps(meta, default=float))
+    print(f'[engine=meep] CAD prepared: {nx}x{ny}' + (f'x{nz}' if args.dim == 3 else '')
+          + f' cells, core "{cad.core}", source y={src["y_um"]:.2f} um, '
+          f'tilt {src["tilt_deg"]:.2f} deg -> {path}')
+    return path
+
+
+LENS_LAYER_NAMES = ['PMMA lens', 'Lipid', 'Aqueous', 'Mucin', 'Cornea']
+GENERIC_LAYER_NAMES = ['Waveguide', 'Layer 1', 'Layer 2', 'Layer 3', 'Substrate']
+
+
+def _layer_names(args):
+    """Namen von Kern, den drei Schichten darunter (--t-lipid/--t-aqueous/--t-mucin)
+    und dem Substrat (--n-cornea). Traenenfilm-Namen nur fuer die Kontaktlinse; sonst
+    neutral, frei vergebbar mit --layer-names (fehlende Eintraege -> Standard)."""
+    base = list(LENS_LAYER_NAMES if args.geometry == 'lens' else GENERIC_LAYER_NAMES)
+    given = [t.strip() for t in str(getattr(args, 'layer_names', '') or '').split(',')]
+    for i, t in enumerate(given[:5]):
+        if t:
+            base[i] = t
+    return base
 
 
 def _resolve_layers(args):
@@ -91,7 +198,9 @@ def _resolve_layers(args):
     jeweilige Solver setzt seinen eigenen Default."""
     if args.geometry == 'lens':
         lip, aq, mu, n_aq = LENS_SCENARIOS[args.scenario]
-        base = dict(t_wg_um=T_LENS_UM, t_lip_um=lip, t_aq_um=aq, t_mu_um=mu, n_aq=n_aq)
+        # Szenario-n_aq ist ein Wert im Sichtbaren -> auf lambda umrechnen (Review F5)
+        base = dict(t_wg_um=T_LENS_UM, t_lip_um=lip, t_aq_um=aq, t_mu_um=mu,
+                    n_aq=tear_index_at(n_aq, args.lambda_nm))
     else:
         # Einheitliche PHYSIOLOGISCHE Tränenfilm-Schichten (2D=3D): Lipid 30nm +
         # Aqueous 3.5um + Mucin 0.5um -> Tränenfilm gesamt ~4um. Einzeln via --t-*.
@@ -108,6 +217,7 @@ def _resolve_layers(args):
     base['n_mu'] = args.n_mucin
     base['n_co'] = args.n_cornea
     base['n_lip'] = args.n_lipid
+    base['names'] = _layer_names(args)
     return base
 
 
@@ -117,11 +227,11 @@ def _enforce_lens_stitch(args):
             and args.method != 'stitch':
         print('')
         print('  ############################################################')
-        print('  #  HINWEIS: GROSSE KONTAKTLINSE                            #')
-        print(f'  #  Laenge {args.length_um:.0f} um (> {LENS_STITCH_ONLY_UM:.0f} um) passt NICHT')
-        print('  #  komplett in den Speicher. Die volle Linse funktioniert  #')
-        print('  #  NUR im STITCHED-Modus (Gebiets-Zerlegung).              #')
-        print(f'  #  -> schalte Methode "{args.method}" automatisch auf "stitch".')
+        print('  #  NOTE: LARGE CONTACT LENS                               #')
+        print(f'  #  Length {args.length_um:.0f} um (> {LENS_STITCH_ONLY_UM:.0f} um) does NOT fit')
+        print('  #  into memory as a whole. The full lens works          #')
+        print('  #  ONLY in STITCHED mode (domain decomposition).         #')
+        print(f'  #  -> switching method "{args.method}" to "stitch" automatically.')
         print('  ############################################################')
         print('')
         args.method = 'stitch'
@@ -132,8 +242,19 @@ def _place_bead(args):
     return (args.geometry == 'planar') and (not args.no_bead) and (args.bead_diameter > 0)
 
 
+def _cornea_full_tear(layers, absorber_um):
+    """Gebietstiefe unter dem Kern fuer --cornea-full: Lipid + Aqueous + Mucin + Cornea bis
+    zur Rueckseite (~545 um) + 5 um Kammerwasser + Absorber."""
+    from common.physics import cornea_full_depth_um
+    t = (layers['t_lip_um'] or 0.0) + (layers['t_aq_um'] if layers['t_aq_um'] is not None else 3.5) \
+        + (layers['t_mu_um'] if layers['t_mu_um'] is not None else 0.5)
+    return t + cornea_full_depth_um() + absorber_um
+
+
 def _run_2d(args, layers):
     import fdtd2d_core as d2
+    d2.KAPPA = dict(getattr(args, 'kappa', {}) or {})   # Absorption je Schicht
+    d2.SRC_CORE_ONLY = bool(getattr(args, 'source_core_only', False))   # Quelle nur im Kern
     result = d2.run_beads(
         wg_mat=args.wg_material, bead_mat=args.bead_material,
         bead_d_um=(args.bead_diameter if _place_bead(args) else 0.0),
@@ -146,12 +267,25 @@ def _run_2d(args, layers):
         place_bead=_place_bead(args), length_um=args.length_um,
         t_aqueous_um=layers['t_aq_um'], t_mucin_um=layers['t_mu_um'],
         t_lipid_um=(layers['t_lip_um'] or 0.0), input_gap_um=args.input_gap,
-        bead_x_um=args.bead_x, wg_n=layers['wg_n'], bead_n=args.bead_n,
+        bead_x_um=args.bead_x, bead_y_um=args.bead_y_um, wg_n=layers['wg_n'], bead_n=args.bead_n,
         n_aqueous=layers['n_aq'], n_mucin=layers['n_mu'],
         n_cornea=layers['n_co'], n_lipid=layers['n_lip'],
         polarization=args.polarization,
         curved=(args.curved and args.geometry == 'lens'),
-        boundary=(args.boundary or 'mur1'))          # 2D-Default: mur1
+        boundary=(args.boundary or 'cpml'),          # 2D-Default: cpml
+        cad=getattr(args, '_cad', None),
+        pulse_cycles=args.pulse_cycles, pulse_tmax_fs=args.pulse_tmax_fs,
+        pulse_nfreq=args.pulse_nfreq, pulse_dispersion=not args.pulse_no_dispersion,
+        n_aq_tear_offset=((layers['n_aq'] - n_at('aqueous', args.lambda_nm))
+                          if (args.geometry == 'lens' and args.n_aqueous is None
+                              and layers['n_aq'] is not None) else None),
+        pulse_mode=args.pulse_stitch,
+        tear_buffer_um=(_cornea_full_tear(layers, 0.2) if args.cornea_full else None))
+    result['layer_names'] = layers['names']
+    if args.bead_y_um is not None:
+        result['bead_y_um'] = args.bead_y_um          # Bead-Zentrum y (Analyzer-Marker)
+    result['n_lip'] = (layers['n_lip'] if layers['n_lip'] is not None
+                       else n_at('lipid', args.lambda_nm))
     if not args.no_save:
         d2.save_results(result, out_dir=os.path.join(_REPO_ROOT, 'results'))
     return result
@@ -159,50 +293,98 @@ def _run_2d(args, layers):
 
 def _run_3d(args, layers):
     import fdtd3d_core as f3d
+    f3d.KAPPA = dict(getattr(args, 'kappa', {}) or {})  # Absorption je Schicht
+    f3d.SRC_CORE_ONLY = bool(getattr(args, 'source_core_only', False))  # Quelle nur im Kern
     bead = None
     if _place_bead(args):
         bead = dict(x_um=(args.bead_x if args.bead_x is not None else args.length_um/2.0),
                     d_um=args.bead_diameter,
                     n=(args.bead_n if args.bead_n is not None
                        else f3d.n_at(args.bead_material, args.lambda_nm)))
+        if args.bead_y_um is not None:              # Bead-Zentrum in y (sonst aufliegend, -d/2)
+            bead['y_um'] = args.bead_y_um
     # Layer-Defaults fuer 3D (run_3d verlangt konkrete Werte)
     t_aq = layers['t_aq_um'] if layers['t_aq_um'] is not None else 3.5
     t_mu = layers['t_mu_um'] if layers['t_mu_um'] is not None else 0.5
     n_aq = layers['n_aq'] if layers['n_aq'] is not None else f3d.n_at('aqueous', args.lambda_nm)
     n_mu = layers['n_mu'] if layers['n_mu'] is not None else f3d.n_at('mucin', args.lambda_nm)
-    n_co = layers['n_co'] if layers['n_co'] is not None else f3d.n_at('cornea', args.lambda_nm)
-    n_lip = layers['n_lip'] if layers['n_lip'] is not None else 1.480
-    label = f'{args.geometry}3d_{args.scenario if args.geometry=="lens" else args.bead_material}'
+    n_co = layers['n_co'] if layers['n_co'] is not None else cornea_default(args.lambda_nm)
+    n_lip = layers['n_lip'] if layers['n_lip'] is not None else f3d.n_at('lipid', args.lambda_nm)
+    # Dateiname <geometrie>3d_<label>_<methode>: Bead nur, wenn einer platziert ist; die
+    # Methode im Namen verhindert, dass full- und stitch-Laeufe sich ueberschreiben.
+    if args.geometry == 'lens':
+        label = str(args.scenario)
+    elif bead is not None:
+        label = f'Bead-{args.bead_material}_d{args.bead_diameter:g}'
+    else:
+        label = 'ohneBead'
+    _cad = getattr(args, '_cad', None)
+    if _cad is not None:
+        label = os.path.splitext(os.path.basename(args.cad))[0]   # Datei: cad3d_<name>
+    label += f'_{args.method}'
     # Gemeinsame Argumente fuer run_3d UND run_3d_stitched
     common = dict(
         label=label, wg_n=layers['wg_n'], t_wg_um=layers['t_wg_um'],
         t_lip_um=(layers['t_lip_um'] or 0.0), t_aq_um=t_aq, t_mu_um=t_mu,
         n_lip=n_lip, n_aq=n_aq, n_mu=n_mu, n_co=n_co,
         lam_nm=args.lambda_nm, lx_um=args.length_um, air_um=args.air,
-        tear_um=args.tear, lz_um=args.lz_um, dx_nm=args.resolution_nm,
+        tear_um=(args.tear if (args.tear is not None or not args.cornea_full) else
+                 _cornea_full_tear(layers, 1.2 if (args.boundary or 'cpml') == 'sponge'
+                                   else 0.2)),
+        lz_um=args.lz_um, dx_nm=args.resolution_nm,
         vcsel_waist_um=args.vcsel_waist, vcsel_waist_z_um=args.vcsel_waist_z,
         source_type=args.source_type, n_snapshots=args.snapshots, bead=bead,
         vol_dtype=args.vol_dtype, wg_width_um=args.wg_width,
         n_clad_side=args.wg_clad_n, vcsel_tilt_deg=args.vcsel_tilt,
         vcsel_offset_y_um=args.vcsel_offset, vcsel_offset_z_um=args.vcsel_offset_z,
         input_gap_um=args.input_gap, polarization=args.polarization)
-    if args.method == 'stitch':
+    if args.method == 'stitch' and args.source_type == 'pulse' and args.pulse_stitch == 'td':
+        result = f3d.run_3d_stitched_td(window_w_um=args.window_um, slide_um=args.slide_um,
+                                        pulse_cycles=args.pulse_cycles,
+                                        pulse_tmax_fs=args.pulse_tmax_fs, cad=_cad, **common)
+    elif args.method == 'stitch' and args.source_type == 'pulse':
+        # Fourier: nur NICHT explizit gesetzte Brechzahlen folgen n(lambda) je Frequenz
+        disp = {}
+        if args.wg_n is None:
+            disp['wg_n'] = args.wg_material
+        if args.n_aqueous is None:
+            # Linse: Szenario-Traenen = n_aqueous(lambda) + fester Szenario-Offset
+            disp['n_aq'] = (('aqueous', n_aq - f3d.n_at('aqueous', args.lambda_nm))
+                            if args.geometry == 'lens' else 'aqueous')
+        if args.n_mucin is None:
+            disp['n_mu'] = 'mucin'
+        if args.n_cornea is None:
+            disp['n_co'] = 'cornea_layered'
+        if args.n_lipid is None:
+            disp['n_lip'] = 'lipid'
+        if args.bead_n is None:
+            disp['bead'] = args.bead_material
+        cm = dict(common); cm.pop('source_type', None)
+        result = f3d.run_3d_stitched_pulse(window_w_um=args.window_um, slide_um=args.slide_um,
+                                           pulse_cycles=args.pulse_cycles,
+                                           pulse_tmax_fs=args.pulse_tmax_fs,
+                                           pulse_nfreq=args.pulse_nfreq,
+                                           pulse_dispersion=not args.pulse_no_dispersion,
+                                           disp_map=disp, cad=_cad,
+                                           boundary=(args.boundary or 'cpml'), **cm)
+    elif args.method == 'stitch':
         result = f3d.run_3d_stitched(window_w_um=args.window_um,
                                      slide_um=args.slide_um,
-                                     boundary=(args.boundary or 'sponge'), **common)
+                                     boundary=(args.boundary or 'cpml'), cad=_cad, **common)
     else:
         # nur run_3d (full) kennt diese Zusatz-Optionen
         pec_faces = tuple(f.strip() for f in args.pec_faces.split(',') if f.strip())
         result = f3d.run_3d(
             steps_factor=args.steps_factor, calibrate_steps=args.calibrate,
             save_vector=args.save_vector, check_resources=args.check_resources,
-            allow_large=args.allow_large, boundary=(args.boundary or 'sponge'),
-            pec_faces=pec_faces, end_facet_um=args.end_facet, **common)
+            allow_large=args.allow_large, boundary=(args.boundary or 'cpml'),
+            pec_faces=pec_faces, end_facet_um=args.end_facet, cad=_cad,
+            pulse_cycles=args.pulse_cycles, **common)
         if args.calibrate:
             return result   # Kalibrierlauf: kein Speichern
     if not args.no_save:
         f3d.save_results_3d(result, out_dir=os.path.join(_REPO_ROOT, 'results'),
-                            prefix=f'{args.geometry}3d')
+                            prefix=f'{args.geometry}3d', material_names=layers['names'])
     return result
 
 
@@ -252,9 +434,9 @@ def _dispatch_meep(raw, np_ranks=1):
                  % (wsl_repo, WSL_CONDA, WSL_ENV, mpi,
                     ' '.join(_q(a) for a in args_fwd)))
         cmd = ['wsl', '-d', WSL_DISTRO, '-u', 'root', 'bash', '-lc', inner]
-        print(f'[engine=meep] Windows erkannt -> Auslagerung nach WSL ({WSL_DISTRO})')
+        print(f'[engine=meep] Windows detected -> dispatching to WSL ({WSL_DISTRO})')
         if mpi:
-            print(f'  MPI: {mpi.strip()} (Meep nutzt nur CPU-Kerne, kein GPU)')
+            print(f'  MPI: {mpi.strip()} (Meep uses CPU cores only, no GPU)')
         print('  ' + ' '.join(cmd[:6]) + ' ...')
     else:
         base = [sys.executable, os.path.join(_REPO_ROOT, 'meep', 'run_meep.py')] + args_fwd
@@ -263,12 +445,12 @@ def _dispatch_meep(raw, np_ranks=1):
             cmd = ['mpirun', '-np', n] + base
         else:
             cmd = base
-        print('[engine=meep] Linux -> Meep direkt' + (f' (mpirun -np {n})' if mpi else ''))
+        print('[engine=meep] Linux -> running Meep directly' + (f' (mpirun -np {n})' if mpi else ''))
     try:
         return subprocess.call(cmd)
     except FileNotFoundError as e:
-        raise SystemExit(f'[FEHLER] Meep-Start fehlgeschlagen ({e}). '
-                         f'Ist WSL/Distro "{WSL_DISTRO}" eingerichtet? Siehe docs/meep_setup_wsl.md')
+        raise SystemExit(f'[ERROR] Meep launch failed ({e}). '
+                         f'Is WSL/distro "{WSL_DISTRO}" set up? See docs/meep_setup_wsl.md')
 
 
 def _q(s):
@@ -278,146 +460,263 @@ def _q(s):
 
 def build_parser():
     ap = argparse.ArgumentParser(
-        description='Vereinheitlichter FDTD-Einstieg: Kontaktlinse | planar, in 2D | 3D.')
+        description='Unified FDTD entry point: contact lens | planar, in 2D | 3D.')
     # Argumente in benannte GRUPPEN -> dienen zugleich als Sektionen im GUI.
-    g_case = ap.add_argument_group('Fall-Auswahl')
+    g_case = ap.add_argument_group('Case')
     g_case.add_argument('--engine', '-e', choices=('native', 'meep'), default='native',
-                        help='native = eigener NumPy/CuPy-Solver; meep = Meep-Toolbox '
-                             '(laeuft nur unter Linux/WSL, wird auf Windows automatisch '
-                             'nach WSL ausgelagert)')
+                        help='native = built-in NumPy/CuPy solver; meep = Meep toolbox '
+                             '(runs only on Linux/WSL; on Windows it is dispatched to WSL '
+                             'automatically)')
     g_case.add_argument('--geometry', '-g', default='planar',
-                        help='kontaktlinse/lens ODER planar/waveguide (Default: planar)')
+                        help='kontaktlinse/lens OR planar/waveguide (default: planar)')
     g_case.add_argument('--dim', '-d', type=int, choices=(2, 3), default=3,
-                        help='Dimension: 2 oder 3 (Default: 3)')
+                        help='Dimension: 2 or 3 (default: 3)')
     g_case.add_argument('--method', '-m', choices=('full', 'sliding', 'stitch'),
-                        default='full', help='full | sliding (nur 2D) | stitch')
+                        default='full', help='full | sliding (2D only) | stitch')
     g_case.add_argument('--scenario', default='Gesund', choices=list(LENS_SCENARIOS),
-                        help='Trockenauge-Szenario (nur --geometry lens)')
+                        help='Dry-eye scenario (--geometry lens only)')
     g_case.add_argument('--curved', action='store_true',
-                        help='(nur lens, 2D) ECHTE Kruemmung via konformer Abbildung '
-                             'eps*(1+u/R)^2 statt flattened. Wirkt in TE UND TM.')
+                        help='(lens only, 2D) TRUE curvature via conformal mapping '
+                             'eps*(1+u/R)^2 instead of flattened. Applies to TE AND TM.')
 
-    g_basic = ap.add_argument_group('Grundeinstellungen')
+    g_basic = ap.add_argument_group('Basic settings')
     g_basic.add_argument('--length-um', type=float, default=None,
-                         help='Propagationslaenge in um (Default geometrie-/dim-abhaengig)')
+                         help='Propagation length in um (default depends on geometry/dim)')
     g_basic.add_argument('--resolution-nm', type=float, default=None,
-                         help='dx in nm (Default: 2D=20, 3D=50)')
-    g_basic.add_argument('--lambda-nm', type=float, default=850.0, help='Wellenlaenge in nm')
+                         help='dx in nm (default: 2D=20, 3D=50)')
+    g_basic.add_argument('--lambda-nm', type=float, default=850.0, help='Wavelength in nm')
     g_basic.add_argument('--polarization', choices=('s', 'p'), default='s',
                          help='s=TE (Ez) | p=TM (Ey)')
-    g_basic.add_argument('--boundary', choices=('sponge', 'mur1', 'mur2', 'cpml'), default=None,
-                         help='Absorbierender Rand. Leer = Dimension-Default. '
-                              '2D: mur1 (Default) | mur2 | cpml. '
-                              '3D: sponge (Default) | mur1 | mur2 | cpml '
-                              '(cpml = beste Absorption, aber speicherintensiv: 12 psi-Felder).')
-    g_basic.add_argument('--source-type', choices=('cw', 'pulse'), default='cw')
-    g_basic.add_argument('--snapshots', type=int, default=8, help='Anzahl gespeicherter Frames')
+    g_basic.add_argument('--boundary', choices=('sponge', 'cpml', 'mur1'), default=None,
+                         help='Absorbing OUTER boundary. Empty = default for the dimension. '
+                              'Default cpml (2D and 3D; 10 cells, kappa 1 + CFS). 3D also: sponge (1.2 um). '
+                              'mur1 = expert option (CLI only): first-order Mur with local '
+                              'velocity (c0/n_eff), exact only for the fundamental mode at '
+                              'normal incidence - use cpml for quantitative results. '
+                              'stitch: inner window boundaries are always CPML.')
+    g_basic.add_argument('--source-type', choices=('cw', 'pulse'), default='cw',
+                         help='cw = continuous wave (steady state). pulse = Gaussian pulse; with '
+                              '--method stitch (2D) as Fourier stitch: one CW stitch per frequency '
+                              'with n(lambda), inverse transform -> true time trace + spectrum.')
+    g_basic.add_argument('--pulse-cycles', type=float, default=30.0,
+                         help='Pulse duration in optical periods (s = cycles/f0; 30 ~ 1.3 %% '
+                              'bandwidth, 10 ~ 4 %%). Smaller = broader band = more frequencies.')
+    g_basic.add_argument('--pulse-tmax-fs', type=float, default=None,
+                         help='Fourier stitch: time window in fs (default: pulse + transit time). '
+                              'Sets the frequency spacing (no aliasing up to t_max).')
+    g_basic.add_argument('--pulse-nfreq', type=int, default=None,
+                         help='Fourier stitch: fixed number of frequencies (default: auto).')
+    g_basic.add_argument('--pulse-stitch', choices=('fourier', 'td'), default='fourier',
+                         help='Pulse with --method stitch: fourier = one CW stitch per frequency + '
+                              'inverse transform (with dispersion, also yields the spectrum); td = '
+                              'directly in the time domain, windows coupled via recorded '
+                              'Huygens planes (TF/SF), single run, no dispersion. Both in 2D and 3D.')
+    g_basic.add_argument('--pulse-no-dispersion', action='store_true',
+                         help='Fourier stitch: all refractive indices fixed at lambda0 (as in '
+                              'the time domain) instead of n(lambda) per frequency.')
+    g_basic.add_argument('--snapshots', type=int, default=8, help='Number of saved frames')
 
-    g_mat = ap.add_argument_group('Material & Schichten')
+    g_mat = ap.add_argument_group('Material & layers')
+    g_mat.add_argument('--cornea-full', action='store_true',
+                       help='Compute the full cornea thickness (epithelium, Bowman, stroma, '
+                            'endothelium, ~545 um) down into the aqueous humour instead of a few um '
+                            'of epithelium. Expensive: about 28,000 extra rows at dx 20 nm; use a '
+                            'coarser grid or stitch.')
+    g_mat.add_argument('--layer-names', default=None,
+                       help='Names: core, layer directly below the core (--t-lipid/--n-lipid), '
+                            'second (--t-aqueous/--n-aqueous), third (--t-mucin/--n-mucin), '
+                            'substrate (--n-cornea), comma-separated. Default for lens: '
+                            'PMMA lens,Lipid,Aqueous,Mucin,Cornea; otherwise Waveguide,Layer 1,'
+                            'Layer 2,Layer 3,Substrate. Shown in the analyzer and GUI.')
     g_mat.add_argument('--wg-material', choices=('pmma', 'polystyrol'), default='pmma',
-                       help='Waveguide-Material (Brechzahl aus Dispersion; --wg-n ueberschreibt)')
+                       help='Waveguide material (refractive index from dispersion; --wg-n overrides)')
     g_mat.add_argument('--wg-thickness-um', type=float, default=5.0,
-                       help='Waveguide-Dicke (nur planar; Linse nutzt fest 250um)')
-    g_mat.add_argument('--wg-n', type=float, default=None,
-                       help='Freie WG-Brechzahl (ueberschreibt --wg-material)')
-    g_mat.add_argument('--t-aqueous', type=float, default=None, help='Aqueous-Dicke um')
-    g_mat.add_argument('--t-mucin', type=float, default=None, help='Mucin-Dicke um')
-    g_mat.add_argument('--t-lipid', type=float, default=None, help='Lipid-Dicke um')
-    g_mat.add_argument('--n-aqueous', type=float, default=None, help='Freie Aqueous-Brechzahl')
-    g_mat.add_argument('--n-mucin', type=float, default=None, help='Freie Mucin-Brechzahl')
-    g_mat.add_argument('--n-cornea', type=float, default=None, help='Freie Cornea-Brechzahl')
-    g_mat.add_argument('--n-lipid', type=float, default=None, help='Freie Lipid-Brechzahl')
+                       help='Waveguide thickness (planar only; lens uses a fixed 250 um)')
+    g_mat.add_argument('--wg-n', type=parse_n, default=None,
+                       help='Custom waveguide refractive index (overrides --wg-material)')
+    g_mat.add_argument('--kappa-wg', type=float, default=None,
+                       help='Absorption of the waveguide core: extinction coefficient kappa, n = n_real + i*kappa (intensity decays as exp(-4 pi kappa z/lambda))')
+    # Reihenfolge = Schichtstapel von oben nach unten (GUI zeigt die Felder so an):
+    # Kern -> Schicht 1 (lipid) -> Schicht 2 (aqueous) -> Schicht 3 (mucin) -> Substrat
+    g_mat.add_argument('--t-lipid', type=float, default=None,
+                       help='Thickness of layer 1 directly below the core (lens: lipid), um')
+    g_mat.add_argument('--n-lipid', type=parse_n, default=None,
+                       help='Refractive index of layer 1 (lens: lipid)')
+    g_mat.add_argument('--kappa-lipid', type=float, default=None,
+                       help='Absorption of layer 1 (lens: lipid): extinction coefficient kappa, n = n_real + i*kappa (intensity decays as exp(-4 pi kappa z/lambda))')
+    g_mat.add_argument('--t-aqueous', type=float, default=None,
+                       help='Thickness of layer 2 (lens: aqueous), um')
+    g_mat.add_argument('--n-aqueous', type=parse_n, default=None,
+                       help='Refractive index of layer 2 (lens: aqueous)')
+    g_mat.add_argument('--kappa-aqueous', type=float, default=None,
+                       help='Absorption of layer 2 (lens: aqueous): extinction coefficient kappa, n = n_real + i*kappa (intensity decays as exp(-4 pi kappa z/lambda))')
+    g_mat.add_argument('--t-mucin', type=float, default=None,
+                       help='Thickness of layer 3 (lens: mucin), um')
+    g_mat.add_argument('--n-mucin', type=parse_n, default=None,
+                       help='Refractive index of layer 3 (lens: mucin)')
+    g_mat.add_argument('--kappa-mucin', type=float, default=None,
+                       help='Absorption of layer 3 (lens: mucin): extinction coefficient kappa, n = n_real + i*kappa (intensity decays as exp(-4 pi kappa z/lambda))')
+    g_mat.add_argument('--n-cornea', type=parse_n, default=None,
+                       help='Refractive index of the substrate (lens: cornea), semi-infinite')
+    g_mat.add_argument('--kappa-cornea', type=float, default=None,
+                       help='Absorption of the substrate (lens: cornea): extinction coefficient kappa, n = n_real + i*kappa (intensity decays as exp(-4 pi kappa z/lambda))')
 
-    g_bead = ap.add_argument_group('Bead (nur planar)')
+    g_cad = ap.add_argument_group('CAD geometry (--geometry cad)')
+    g_cad.add_argument('--cad', default=None,
+                       help='CAD file: .sc (SolidCraft), .step/.stp, .ipt/.iam (Inventor), .stl, '
+                            '.3mf/.obj. Each body = one material; the source aligns itself '
+                            'automatically to the entry face of the core. Methods: full, '
+                            'stitch (2D+3D), sliding (2D). stitch only computes forward: strong '
+                            'back-reflections (e.g. an end facet) are captured only by full - or '
+                            'mark the face as open with --cad-open (GUI: mouse click).')
+    g_cad.add_argument('--cad-scale', type=float, default=None,
+                       help='um per CAD mm (default 1000 = true to scale; 1 = "1 mm in CAD '
+                            '= 1 um"). Remembered in <file>.lens.json.')
+    g_cad.add_argument('--cad-axis', choices=('xzy', 'xyz'), default=None,
+                       help='Axis mapping CAD->simulation. xzy (default): CAD Z (up) = '
+                            'layer stack y, CAD Y = depth z.')
+    g_cad.add_argument('--cad-materials', default='',
+                       help='Body=material, comma-separated, e.g. "Kern=pmma,Film=aqueous,'
+                            'Prisma=n=1.52". Extends/overrides <file>.lens.json.')
+    g_cad.add_argument('--cad-core', default=None,
+                       help='Body name of the core (default: highest-index long body).')
+    g_cad.add_argument('--cad-tear', default=None,
+                       help='Body name of the tear film (sensor evaluation in the analyzer).')
+    g_cad.add_argument('--cad-background', default=None,
+                       help='Surrounding medium (default air), material or n=<number>.')
+    g_cad.add_argument('--cad-open', default='',
+                       help='Open faces (no reflection): "Kern:+x,Film:+x,Cornea:+x" extends '
+                            'the last cross-section of these faces into the absorber (the '
+                            'part "continues"). Axes x/y/z, sign = normal direction. '
+                            'In the GUI by clicking the face. Remembered in .lens.json.')
+    g_cad.add_argument('--cad-plane-z', type=float, default=None,
+                       help='2D: position of the cut in depth z (um, simulation coordinates). '
+                            'Default: center of the core.')
+
+    g_bead = ap.add_argument_group('Bead (planar only)')
     g_bead.add_argument('--bead-material', choices=('polystyrol', 'pmma'),
-                        default='polystyrol', help='Bead-Material (Brechzahl aus Dispersion)')
+                        default='polystyrol', help='Bead material (refractive index from dispersion)')
     g_bead.add_argument('--bead-diameter', type=float, default=0.5,
-                        help='Bead-Durchmesser in um (0/--no-bead = kein Bead)')
+                        help='Bead diameter in um (0/--no-bead = no bead)')
     g_bead.add_argument('--bead-x', type=float, default=None,
-                        help='Bead-x-Position in um (Default Mitte)')
+                        help='Bead x position in um (default: center)')
     g_bead.add_argument('--bead-y-um', type=float, default=None,
-                        help='Bead-y-Position in um (Default: unter WG bei -d/2; '
-                             '0..t_wg = im WG-Kern -> starke Streuung)')
-    g_bead.add_argument('--bead-n', type=float, default=None,
-                        help='Freie Bead-Brechzahl (ueberschreibt --bead-material)')
+                        help='Bead y position in um (default: below the WG at -d/2; '
+                             '0..t_wg = inside the WG core -> strong scattering)')
+    g_bead.add_argument('--bead-n', type=parse_n, default=None,
+                        help='Custom bead refractive index (overrides --bead-material)')
+    g_bead.add_argument('--kappa-bead', type=float, default=None,
+                        help='Absorption of the bead: extinction coefficient kappa, n = n_real + i*kappa (intensity decays as exp(-4 pi kappa z/lambda))')
     g_bead.add_argument('--no-bead', action='store_true',
-                        help='planaren Lauf OHNE Bead (Referenz)')
+                        help='Planar run WITHOUT bead (reference)')
     g_bead.add_argument('--no-reference', action='store_true',
-                        help='KEINEN Referenzlauf ohne Bead mitrechnen. Standard: es '
-                             'werden BEIDE Laeufe gerechnet (mit Bead + Referenz ohne, '
-                             'Datei _ref) fuer die Bead-Differenz. Haken/Flag setzen = '
-                             'nur der Bead-Lauf.')
+                        help='Do NOT also compute a reference run without bead. By default '
+                             'BOTH runs are computed (with bead + reference without, '
+                             'file _ref) for the bead difference. Check/set flag = '
+                             'bead run only.')
 
-    g_src = ap.add_argument_group('Quelle (VCSEL)')
-    g_src.add_argument('--vcsel-waist', type=float, default=2.0, help='Taille (y) in um')
-    g_src.add_argument('--vcsel-waist-z', type=float, default=2.0, help='Taille z in um (nur 3D)')
-    g_src.add_argument('--vcsel-tilt', type=float, default=0.0, help='Strahlneigung in Grad')
+    g_src = ap.add_argument_group('Source (VCSEL)')
+    g_src.add_argument('--vcsel-waist', type=float, default=2.0, help='Waist (y) in um')
+    g_src.add_argument('--vcsel-waist-z', type=float, default=2.0, help='Waist z in um (3D only)')
+    g_src.add_argument('--vcsel-tilt', type=float, default=0.0, help='Beam tilt in degrees')
+    g_src.add_argument('--source-core-only', action='store_true',
+                       help='Inject the source ONLY inside the waveguide core (soft 0.2 um edge): '
+                            'no direct light from the Gaussian tails into air/tear film '
+                            '(clean evanescent field). Layer stack only, not CAD.')
     g_src.add_argument('--vcsel-offset', type=float, default=0.0,
-                       help='Spot-Versatz in y (um); in 3D = Offset y')
+                       help='Spot offset in y (um); in 3D = offset y')
     g_src.add_argument('--vcsel-offset-z', type=float, default=0.0,
-                       help='Spot-Versatz in z (um, nur 3D)')
+                       help='Spot offset in z (um, 3D only)')
     g_src.add_argument('--input-gap', type=float, default=0.0,
-                       help='Einkoppelabstand Laser-zu-WG in um (Luftweg + Fresnel-Eintritt)')
+                       help='Laser-to-WG coupling gap in um (air path + Fresnel entry)')
 
-    g_3d = ap.add_argument_group('3D-spezifisch')
+    g_3d = ap.add_argument_group('3D specific')
     g_3d.add_argument('--lz-um', type=float, default=8.0,
-                      help='GESAMTE Rechen-Tiefe z (Domaene) in um, symmetrisch um z=0 '
-                           '(-lz/2 .. +lz/2). NICHT die Waveguide-Breite (das ist --wg-width).')
-    g_3d.add_argument('--air', type=float, default=3.0, help='Luft ueber WG in um (nur 3D)')
+                      help='TOTAL computational depth z (domain) in um, symmetric about z=0 '
+                           '(-lz/2 .. +lz/2). NOT the waveguide width (that is --wg-width).')
+    g_3d.add_argument('--air', type=float, default=3.0, help='Air above the WG in um (3D only)')
     g_3d.add_argument('--tear', type=float, default=None,
-                      help='Tear+Cornea-Gebiet unter WG in um (nur 3D). Leer = AUTO: '
-                           'Lipid+Aqueous+Mucin + ~1.5um Cornea + Absorber. Nur zum '
-                           'Trimmen der Cornea-Marge explizit setzen.')
+                      help='Tear + cornea region below the WG in um (3D only). Empty = AUTO: '
+                           'lipid+aqueous+mucin + ~1.5 um cornea + absorber. Set explicitly '
+                           'only to trim the cornea margin.')
     g_3d.add_argument('--wg-width', type=float, default=None,
-                      help='WAVEGUIDE-Kanalbreite in z (um), zentriert um z=0 (|z|<Breite/2) '
-                           '-> Rechteck-Kanal, Fuehrung in y UND z. Muss < --lz-um sein. '
-                           'Ohne Angabe: Slab (in z unendlich, nur y-Fuehrung). Nur 3D.')
+                      help='WAVEGUIDE channel width in z (um), centered at z=0 (|z|<width/2) '
+                           '-> rectangular channel, guiding in y AND z. Must be < --lz-um. '
+                           'If omitted: slab (infinite in z, guiding in y only). 3D only.')
     g_3d.add_argument('--wg-clad-n', type=float, default=1.0,
-                      help='Brechzahl seitliches Cladding (nur 3D, Default Luft)')
-    g_3d.add_argument('--steps-factor', type=float, default=2.0, help='nur 3D full')
+                      help='Refractive index of the lateral cladding (3D only, default air)')
+    g_3d.add_argument('--steps-factor', type=float, default=2.0, help='3D full only')
     g_3d.add_argument('--vol-dtype', choices=('float16', 'float32'), default='float32',
-                      help='Speicherformat der 3D-Volumina')
+                      help='Storage format of the 3D volumes')
     g_3d.add_argument('--pec-faces', default='',
-                      help='Komma-Liste PEC-Spiegelflaechen, z.B. "xmax" (nur 3D full)')
+                      help='Comma list of PEC mirror faces, e.g. "xmax" (3D full only)')
     g_3d.add_argument('--end-facet', type=float, default=0.0,
-                      help='Luftzone am WG-Ende in um -> Fresnel (nur 3D full)')
+                      help='Air zone at the WG end in um -> Fresnel (3D full only)')
     g_3d.add_argument('--save-vector', action='store_true',
-                      help='Ex,Ey,Ez speichern (nur 3D full)')
+                      help='Save Ex,Ey,Ez (3D full only)')
 
     g_stitch = ap.add_argument_group('Stitch / Meep')
     g_stitch.add_argument('--window-um', type=float, default=None,
-                          help='Fensterbreite in um (nur --method stitch)')
+                          help='Window width in um (--method stitch only)')
     g_stitch.add_argument('--slide-um', type=float, default=None,
-                          help='Schrittweite in um (nur --method stitch)')
+                          help='Step size in um (--method stitch only)')
     g_stitch.add_argument('--meep-modes', type=int, default=1, metavar='M',
-                          help='(engine meep, stitch, handoff mode) Anzahl gefuehrter Moden '
-                               'im Handoff. 1=Fundamentalmode; >1 erfasst Mode-Konversion.')
-    g_stitch.add_argument('--meep-handoff', choices=('mode', 'field'), default='mode',
-                          help='(engine meep, stitch) mode = Mode-Kaskade (robust, empfohlen); '
-                               'field = VOLL-FELD (nur gefuehrt-dominiert; bricht bei starker '
-                               'Streuung).')
+                          help='(engine meep, stitch, handoff mode) Number of guided modes '
+                               'in the handoff. 1 = fundamental mode; >1 captures mode conversion.')
+    g_stitch.add_argument('--meep-handoff', choices=('mode', 'field', 'vector'), default='mode',
+                          help='(engine meep, stitch) mode = mode cascade (planar 2D); field = full '
+                               'Ez/Hy field (planar 2D, guided-dominated only); vector = all tangential '
+                               'E/H components via the equivalence principle (2D and 3D, planar, lens '
+                               'and CAD; used automatically for 3D, lens and CAD).')
+    g_stitch.add_argument('--meep-cad-eps', default=None, help=argparse.SUPPRESS)
     g_stitch.add_argument('--meep-np', type=int, default=1, metavar='N',
-                          help='(engine meep) Anzahl MPI-Prozesse. Meep hat KEINEN GPU-Support '
-                               'und parallelisiert nur ueber MPI (CPU-Kerne). 1=seriell; '
-                               '>1 startet den Lauf via "mpirun -np N" (setzt den MPI-Build von '
-                               'pymeep voraus). 0=alle verfuegbaren Kerne.')
+                          help='(engine meep) Number of MPI processes. Meep has NO GPU support '
+                               'and parallelizes only via MPI (CPU cores). 1 = serial; '
+                               '>1 launches the run via "mpirun -np N" (requires the MPI build of '
+                               'pymeep). 0 = all available cores.')
 
-    g_run = ap.add_argument_group('Ablauf')
+    g_run = ap.add_argument_group('Run control')
     g_run.add_argument('--allow-large', action='store_true',
-                       help='(engine meep) den adaptiven Zellzahl-/RAM-Schutz umgehen '
-                            '(Risiko: OOM).')
-    g_run.add_argument('--no-save', action='store_true', help='nicht speichern')
+                       help='(engine meep) bypass the adaptive cell-count/RAM guard '
+                            '(risk: OOM).')
+    g_run.add_argument('--no-save', action='store_true', help='Do not save results')
 
     # Alle Parameter, die NICHT (voll) rechnen: Vorschau, Ressourcen-Check,
     # Kurz-Kalibrierung. Geordnet von "gar nicht rechnen" zu "kurz messen".
-    g_prep = ap.add_argument_group('Kalibrierung & Vorschau')
+    g_prep = ap.add_argument_group('Calibration & preview')
     g_prep.add_argument('--dry-run', action='store_true',
-                        help='nur die aufgeloeste Konfiguration zeigen, NICHT rechnen')
+                        help='Only show the resolved configuration, do NOT compute')
     g_prep.add_argument('--check-resources', action='store_true',
-                        help='vor dem Lauf VRAM/RAM pruefen (nur 3D full)')
+                        help='Check VRAM/RAM before the run (3D full only)')
     g_prep.add_argument('--calibrate', type=int, default=0, metavar='N',
-                        help='nur N Steps messen + Gesamtlaufzeit hochrechnen (nur 3D full)')
+                        help='Measure only N steps + extrapolate total runtime (3D full only)')
     return ap
+
+
+def _split_absorption(args):
+    """Komplexe Brechzahlen (--n-aqueous 1.331+0.001i) und --kappa-* zu reellen n plus
+    args.kappa = {'wg','lip','aq','mu','co','bead'} (Extinktion kappa). Die Solver
+    rechnen mit reellem n (Laufzeit, Mur, Ausgaben) und setzen kappa nur im Material
+    als Leitfaehigkeit um (common.physics.loss_sigma)."""
+    if getattr(args, '_kappa_done', False):
+        return
+    kap = {}
+    for key, nd, kd in (('wg', 'wg_n', 'kappa_wg'), ('lip', 'n_lipid', 'kappa_lipid'),
+                        ('aq', 'n_aqueous', 'kappa_aqueous'), ('mu', 'n_mucin', 'kappa_mucin'),
+                        ('co', 'n_cornea', 'kappa_cornea'), ('bead', 'bead_n', 'kappa_bead')):
+        n, k = split_n(getattr(args, nd, None))
+        setattr(args, nd, n)
+        kk = getattr(args, kd, None)
+        k = float(kk) if kk is not None else k
+        if k < 0:
+            raise SystemExit(f'--{kd.replace("_", "-")} < 0 would mean gain.')
+        if k > 0:
+            kap[key] = k
+    args.kappa = kap
+    args._kappa_done = True
+    if kap:
+        print('[Absorption] kappa: ' + ', '.join(f'{k}={v:g}' for k, v in kap.items())
+              + f'  (exact at {args.lambda_nm:g} nm; pulses: approximation)')
 
 
 def resolve_args(args):
@@ -428,13 +727,17 @@ def resolve_args(args):
     # Geometrie-Alias aufloesen
     key = str(args.geometry).strip().lower()
     if key not in _GEOM_ALIASES:
-        raise SystemExit(f'Unbekannte Geometrie "{args.geometry}". '
-                         f'Erlaubt: lens/kontaktlinse oder planar/waveguide.')
+        raise SystemExit(f'Unknown geometry "{args.geometry}". '
+                         f'Allowed: lens/kontaktlinse or planar/waveguide.')
     args.geometry = _GEOM_ALIASES[key]
+
+    _split_absorption(args)
 
     # Dimension-abhaengige Defaults
     if args.resolution_nm is None:
         args.resolution_nm = 20.0 if args.dim == 2 else 50.0
+    if args.geometry == 'cad':
+        args.length_um = args.length_um or 0.0   # Laenge kommt aus der CAD-Szene
     if args.length_um is None:
         args.length_um = DEFAULT_LENGTH_UM[(args.geometry, args.dim)]
     if args.window_um is None:
@@ -442,9 +745,17 @@ def resolve_args(args):
     if args.slide_um is None:
         args.slide_um = 150.0 if args.dim == 2 else 12.0
 
+    if str(args.boundary or '').lower() == 'mur1':
+        print('[Warning] --boundary mur1: first-order Mur (local velocity c0/n_eff) is exact only for '
+              'the fundamental mode at normal incidence; higher modes, radiation and '
+              'bead scattering reflect more strongly (2D ~0.6%, 3D ~1% amplitude). '
+              'Use cpml for quantitative results.')
+    if args.dim == 2 and str(args.boundary or '').lower() == 'sponge':
+        raise SystemExit('--boundary sponge is available in 3D only (2D: cpml or mur1).')
+
     # 'sliding' gibt es nur in 2D
     if args.dim == 3 and args.method == 'sliding':
-        print('[Hinweis] "sliding" existiert nur in 2D -> nutze in 3D "stitch".')
+        print('[Note] "sliding" exists in 2D only -> using "stitch" in 3D.')
         args.method = 'stitch'
 
     # Grosse Kontaktlinse: Stitch-Zwang (mit Hinweis)
@@ -459,34 +770,67 @@ def main(argv=None):
 
     # Engine-Weiche: Meep laeuft nur unter Linux/WSL. Auf Windows nach WSL auslagern.
     if args.engine == 'meep':
+        if _GEOM_ALIASES.get(str(args.geometry).strip().lower()) == 'cad':
+            # CAD-Geometrie unter Windows vorbereiten, Meep liest das eps-Gitter
+            _p = _prepare_meep_cad(build_parser().parse_args(argv))
+            raw = list(raw) + ['--meep-cad-eps', _to_wsl_path(_p) if os.name == 'nt' else _p]
         return _dispatch_meep(raw, np_ranks=args.meep_np)
 
     layers = resolve_args(args)
+    args._cad = _make_cad(args) if args.geometry == 'cad' else None
 
-    print('===================== FDTD-Konfiguration =====================')
-    print(f'  Geometrie : {"Kontaktlinse (geflattet)" if args.geometry=="lens" else "planarer Waveguide"}')
+    print('===================== FDTD configuration =====================')
+    _gname = {'lens': 'contact lens (flattened)', 'planar': 'planar waveguide',
+              'cad': f'CAD {os.path.basename(args.cad or "")}'}[args.geometry]
+    print(f'  Geometry  : {_gname}')
     print(f'  Dimension : {args.dim}D')
-    print(f'  Methode   : {args.method}')
+    print(f'  Method    : {args.method}')
+    if args._cad is not None:
+        _c = args._cad
+        print(_c.scene.summary(args.lambda_nm))
+        _src = _c.source(0.0)
+        print(f'  Box       : x 0..{_c.lx_um:.2f}  y {_c.y0_um:.2f}..{_c.y0_um + _c.ly_um:.2f}'
+              + (f'  z {_c.z0_um:.2f}..{_c.z0_um + _c.lz_um:.2f} um' if args.dim == 3
+                 else f' um, cut z={_c.z0_um:.2f} um'))
+        print(f'  Core      : {_c.core}   entry face center {[round(v, 2) for v in _src["facet_center"]]} '
+              f'normal {[round(v, 3) for v in _src["facet_normal"]]}')
+        _op = _c.scene.open_faces
+        print('  Open      : ' + (', '.join(f'{f["body"]}:{"+" if f["sign"] > 0 else "-"}{"xyz"[f["axis"]]}'
+                                         for f in _op) if _op else 'none (all faces reflect)'))
+        print(f'  Lambda: {args.lambda_nm:g} nm   Resolution: {args.resolution_nm:g} nm   Pol: {args.polarization}')
+        print('==============================================================')
+        if args.dry_run:
+            print('[dry-run] Configuration resolved - no run started.')
+            return
+        if args.dim == 2:
+            _run_2d(args, layers)
+        else:
+            _run_3d(args, layers)
+        return
     if args.geometry == 'lens':
-        print(f'  Szenario  : {args.scenario}  (lipid/aq/mu = '
+        print(f'  Scenario  : {args.scenario}  (lipid/aq/mu = '
               f'{layers["t_lip_um"]:g}/{layers["t_aq_um"]:g}/{layers["t_mu_um"]:g} um, '
-              f'n_aq={layers["n_aq"]})')
+              f'n_aq={layers["n_aq"]:.4f} @{args.lambda_nm:g}nm)')
     else:
-        print(f'  Bead      : {"nein" if not _place_bead(args) else f"{args.bead_material} d={args.bead_diameter:g} um"}')
-    print(f'  Waveguide : Dicke {layers["t_wg_um"]:g} um, n={layers["wg_n"]:.3f}')
-    print(f'  Laenge    : {args.length_um:g} um   Aufloesung: {args.resolution_nm:g} nm   '
+        print(f'  Bead      : {"none" if not _place_bead(args) else f"{args.bead_material} d={args.bead_diameter:g} um"}')
+    print(f'  Waveguide : thickness {layers["t_wg_um"]:g} um, n={layers["wg_n"]:.3f}')
+    if args.geometry != 'cad':
+        print('  Cornea    : ' + ('constant n=%.4f (--n-cornea)' % layers['n_co'] if layers['n_co'] is not None
+              else ('layered, FULL thickness down to the aqueous humour (depth %.0f um)' % _cornea_full_tear(layers, 0.2)
+                    if args.cornea_full else 'layered (epithelium directly below the mucin)')))
+    print(f'  Length    : {args.length_um:g} um   Resolution: {args.resolution_nm:g} nm   '
           f'Lambda: {args.lambda_nm:g} nm   Pol: {args.polarization}')
     if args.method == 'stitch':
-        print(f'  Stitch    : Fenster {args.window_um:g} um, Slide {args.slide_um:g} um')
+        print(f'  Stitch    : window {args.window_um:g} um, Slide {args.slide_um:g} um')
     if args.dim == 3:
-        print(f'  Tiefe z   : {args.lz_um:g} um   (air {args.air:g} / '
+        print(f'  Depth z   : {args.lz_um:g} um   (air {args.air:g} / '
               f'tear {"auto" if args.tear is None else f"{args.tear:g} um"})')
         if args.calibrate:
-            print(f'  Kalibrier.: {args.calibrate} Steps messen (kein voller Lauf)')
+            print(f'  Calibrate : measure {args.calibrate} steps (no full run)')
     print('==============================================================')
 
     if args.dry_run:
-        print('[dry-run] Konfiguration aufgeloest - kein Lauf gestartet.')
+        print('[dry-run] Configuration resolved - no run started.')
         return
 
     _had_bead = _place_bead(args)
@@ -499,13 +843,13 @@ def main(argv=None):
     # (zweite Datei mit Suffix '_ref') -> mit EINEM Aufruf beide Laeufe fuer die
     # Bead-Differenz (Streufeld = mit - ohne). Mit --no-reference abschaltbar.
     if _had_bead and not getattr(args, 'no_reference', False):
-        print('\n============ REFERENZLAUF (ohne Bead) ============')
+        print('\n============ REFERENCE RUN (without bead) ============')
         args.no_bead = True                      # zweiter Lauf: kein Bead -> Datei _ref
         if args.dim == 2:
             _run_2d(args, layers)
         else:
             _run_3d(args, layers)
-        print('  -> Referenz (_ref) gespeichert. Im Analyzer: Differenz mit - ohne Bead.')
+        print('  -> Reference (_ref) saved. In the analyzer: difference with - without bead.')
 
 
 if __name__ == '__main__':

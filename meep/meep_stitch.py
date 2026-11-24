@@ -26,6 +26,14 @@ def _window_cfg(cfg, gx0, Wx):
     return wc
 
 
+def _parity(cfg):
+    """Eigenmode-Paritaet fuer 2D: NO_PARITY liefert als Band 1 die Mode mit dem
+    hoechsten n_eff UEBER BEIDE Polarisationen (beim Slab die Ez/TE-Mode) -> bei p
+    wuerde die falsche Mode gelauncht/projiziert. ODD_Z = (Ez,Hx,Hy) = s,
+    EVEN_Z = (Hz,Ex,Ey) = p."""
+    return mp.ODD_Z if cfg['pol'] == 's' else mp.EVEN_Z
+
+
 def _fwd(sim, mon, parity):
     """Vorwaerts (+x) Mode-Koeffizient der Fundamentalmode am Monitor."""
     c = sim.get_eigenmode_coefficients(mon, [1], eig_parity=parity)
@@ -38,7 +46,7 @@ def run_stitch(cfg, window_w_um, slide_um, modes=1):
     erfasst Mode-Konversion. Strahlung (Radiation) wird von keiner Mode getragen
     und erscheint als Verlust der gefuehrten Gesamtleistung."""
     comp = mp.Ez if cfg['pol'] == 's' else mp.Ey
-    parity = mp.NO_PARITY          # 2D-Mode: Meep die Mode selbst finden lassen
+    parity = _parity(cfg)          # 2D: Ez-Moden ODD_Z (s), Ey-Moden EVEN_Z (p)
     f0 = cfg['f0']
     lx, ly, res = cfg['lx'], cfg['ly'], cfg['resolution']
     M = max(1, int(modes))
@@ -51,21 +59,21 @@ def run_stitch(cfg, window_w_um, slide_um, modes=1):
     xR = min(xL + slide_um, Wx/2 - dpml - 0.4)
     Sx = xR - xL
     if Sx <= 0.2:
-        raise SystemExit('[meep-stitch] Fenster zu klein fuer den Slide: '
-                         '--window-um groesser oder --slide-um kleiner waehlen.')
+        raise SystemExit('[meep-stitch] window too small for the slide: '
+                         'choose a larger --window-um or a smaller --slide-um.')
     n_win = (int(np.ceil((lx - Wx)/Sx)) + 1) if lx > Wx else 1
 
     Nx_full = int(round(lx*res))
     Ny = int(round(ly*res))
     Efull = np.zeros((Nx_full, Ny), dtype=np.complex64)
 
-    print(f'[meep-stitch] {n_win} Fenster a {Wx:g}um, Transfer-Slide {Sx:.2f}um, '
-          f'{M} Mode(n), Grid/Fenster ~{int(Wx*res)}x{Ny}')
+    print(f'[meep-stitch] {n_win} windows of {Wx:g}um, transfer slide {Sx:.2f}um, '
+          f'{M} mode(s), grid/window ~{int(Wx*res)}x{Ny}')
     A = np.zeros(M, dtype=complex)
     A[0] = 1.0             # Eingang: Fundamentalmode, Amplitude 1
     Ttot = np.eye(M, dtype=complex)
     for w in range(n_win):
-        gx0 = min(w*Sx, max(0.0, lx - Wx))
+        gx0 = w*Sx       # NICHT am Ende klemmen: die Kaskade braucht Fensterstart = w*Sx
         wc = _window_cfg(cfg, gx0, Wx)
         Tcol = np.zeros((M, M), dtype=complex)     # Transfer-Matrix des Fensters
         fields = []                                 # Feld je EINHEITS-Eingangsmode
@@ -105,16 +113,17 @@ def run_stitch(cfg, window_w_um, slide_um, modes=1):
         l0 = trim if w > 0 else 0
         l1 = fld.shape[0] - (trim if w < n_win - 1 else 0)
         gi1 = min(gi0 + l1, Nx_full)
-        Efull[gi0 + l0:gi1, :fld.shape[1]] = fld[l0:l0 + (gi1 - gi0 - l0), :]
+        ny = min(Ny, fld.shape[1])           # Meep liefert oft Ny+1/Ny+2 Punkte
+        Efull[gi0 + l0:gi1, :ny] = fld[l0:l0 + (gi1 - gi0 - l0), :ny]
 
         A = Tcol @ A
         Ttot = Tcol @ Ttot
-        print(f'  [meep-stitch] Fenster {w+1}/{n_win} x0={gx0:.1f}um  '
-              f'gefuehrte Leistung |A|^2={float(np.sum(np.abs(A)**2)):.3f}', flush=True)
+        print(f'  [meep-stitch] window {w+1}/{n_win} x0={gx0:.1f}um  '
+              f'guided power |A|^2={float(np.sum(np.abs(A)**2)):.3f}', flush=True)
 
     Tr = float(np.sum(np.abs(A)**2))    # gefuehrte Gesamtleistung am Ende (Eingang=1)
-    print(f'[meep-stitch Result] {cfg["label"]}: Transmission(gefuehrt, {M} Mode(n))'
-          f'~{Tr:.4f} ({n_win} Fenster, nur EIN Fenster im RAM)')
+    print(f'[meep-stitch Result] {cfg["label"]}: Transmission(guided, {M} mode(s))'
+          f'~{Tr:.4f} ({n_win} windows, only ONE window in RAM)')
     return dict(Efull=Efull, transmission=Tr, n_win=n_win, shape=(Nx_full, Ny),
                 modes=M)
 
@@ -139,6 +148,15 @@ def _yee_angular_filter(prof, res, kmed):
     return np.fft.ifft(np.fft.fft(prof)*ph)
 
 
+def _equiv_signs(cfg):
+    """Vorzeichen (J, M) der Aequivalenz-Stromblaetter fuer Vorwaerts-Einstrahlung (+x):
+    J = n x H, M = -n x E mit n = +x.  s (Ez,Hy): Jz = +Hy, My = +Ez;
+    p (Ey,Hz): Jy = -Hz, Mz = -Ey.  In Meep gemessen (results/meep_sign_check.py):
+    so strahlt das Blatt zu ~99 % vorwaerts; mit umgedrehtem M (frueher: My = -Ez)
+    lief es fast nur RUECKWAERTS und C musste einen kleinen Rest hochskalieren."""
+    return (1.0, 1.0) if cfg['pol'] == 's' else (-1.0, -1.0)
+
+
 def _calibrate_C(cfg, Wx):
     """Bestimmt den Aequivalenz-Skalenfaktor C selbst: extrahiert in einem
     uniformen Fenster das Ez/Hy-Profil + Mode-Amplitude a_ref an einer Ebene,
@@ -146,8 +164,8 @@ def _calibrate_C(cfg, Wx):
     C = a_ref/a_test macht die Einpraegung amplituden- UND phasenerhaltend.
     Robust gegen Aufloesung (C haengt von der Diskretisierung ab)."""
     comp = mp.Ez if cfg['pol'] == 's' else mp.Ey
-    hcomp = mp.Hy if cfg['pol'] == 's' else mp.Hx
-    parity = mp.NO_PARITY
+    hcomp = mp.Hy if cfg['pol'] == 's' else mp.Hz
+    parity = _parity(cfg)
     f0 = cfg['f0']
     ly, res = cfg['ly'], cfg['resolution']
     dpml = max(0.1, min(cfg['lam_nm']/1000.0, 0.4*min(Wx, ly)))
@@ -198,18 +216,19 @@ def _calibrate_C(cfg, Wx):
     # Filter (kmed = f0*n_wg) -> jede ky-Komponente ihre eigene kx-Phase.
     kmed = f0*cfg['wg_n']
     ez_pf = _yee_angular_filter(ez_p, res, kmed)
+    js, ms = _equiv_signs(cfg)
     src_t = mp.GaussianSource(f0, fwidth=0.15*f0)
     aprobe, _, _, P_probe, _ = _win([
         mp.Source(src=src_t, component=comp, center=mp.Vector3(x_inj, y_off, 0),
                   size=mp.Vector3(0, mode_h, 0),
-                  amp_func=lambda p: A_PROBE*_profile_interp(hy_p, ys, p.y)),
+                  amp_func=lambda p: js*A_PROBE*_profile_interp(hy_p, ys, p.y)),
         mp.Source(src=src_t, component=hcomp, center=mp.Vector3(x_inj, y_off, 0),
                   size=mp.Vector3(0, mode_h, 0),
-                  amp_func=lambda p: -A_PROBE*_profile_interp(ez_pf, ys, p.y))], xP)
+                  amp_func=lambda p: ms*A_PROBE*_profile_interp(ez_pf, ys, p.y))], xP)
     Cmag = A_PROBE*np.sqrt(abs(P_target)/max(abs(P_probe), 1e-30))
     phase = np.angle(aref) - np.angle(aprobe) if abs(aprobe) > 1e-30 else 0.0
     C = Cmag*np.exp(1j*phase)
-    print(f'[meep-stitch/fullfield] Auto-Kalibrierung |C|={Cmag:.3g} '
+    print(f'[meep-stitch/fullfield] auto-calibration |C|={Cmag:.3g} '
           f'kmed={kmed:.2f} (P_target={P_target:.2e}, P_probe={P_probe:.2e})')
     return C
 
@@ -229,17 +248,17 @@ def run_stitch_fullfield(cfg, window_w_um, slide_um, C=None):
     wird die Strahlung fehl-skaliert -> unphysikalische Ergebnisse (Transmission
     kann >1 werden, Amplitude explodiert). In dem Regime ist die Mode-Kaskade
     (--meep-handoff mode) oder der native Stitch vorzuziehen."""
-    print('  [voll-feldbasierter Handoff] Aequivalenzprinzip (Ez+Hy), '
-          'fluss-selbstkalibriert + Yee-Offset-phasenkorrigiert -> '
-          'aufloesungsrobust (nm=15..60) fuer GEFUEHRT-DOMINIERTE Felder.')
-    print('  !!! WICHTIG: Die skalare Kalibrierung ist auf die Grundmode getunt. '
-          'Bei STARKER Streuung (radiation-lastiges Handoff-Feld, z.B. Bead im '
-          'WG-Kern) skaliert sie die Strahlung falsch -> UNPHYSIKALISCH (Amplitude '
-          'kann explodieren). Dann --meep-handoff mode (Multi-Mode) oder nativen '
-          'Stitch nutzen. !!!')
+    print('  [full-field handoff] equivalence principle (Ez+Hy), '
+          'flux self-calibrated + Yee-offset phase-corrected -> '
+          'resolution-robust (nm=15..60) for GUIDED-DOMINATED fields.')
+    print('  !!! IMPORTANT: the scalar calibration is tuned to the fundamental mode. '
+          'With STRONG scattering (radiation-heavy handoff field, e.g. bead in the '
+          'WG core) it scales the radiation wrongly -> UNPHYSICAL (amplitude '
+          'can blow up). In that case use --meep-handoff mode (multi-mode) or the native '
+          'stitch. !!!')
     comp = mp.Ez if cfg['pol'] == 's' else mp.Ey
-    hcomp = mp.Hy if cfg['pol'] == 's' else mp.Hx
-    parity = mp.NO_PARITY
+    hcomp = mp.Hy if cfg['pol'] == 's' else mp.Hz
+    parity = _parity(cfg)
     f0 = cfg['f0']
     lx, ly, res = cfg['lx'], cfg['ly'], cfg['resolution']
     Wx = min(window_w_um, lx)
@@ -258,11 +277,11 @@ def run_stitch_fullfield(cfg, window_w_um, slide_um, C=None):
     # y-Koordinaten der Handoff-Profile (Meep-lokal, relativ zum Quell-Zentrum)
     ys = (np.arange(int(round(mode_h*res))) - int(round(mode_h*res))//2)/res
 
-    print(f'[meep-stitch/fullfield] {n_win} Fenster a {Wx:g}um, Slide {Sx:.2f}um, C={C}')
+    print(f'[meep-stitch/fullfield] {n_win} windows of {Wx:g}um, slide {Sx:.2f}um, C={C}')
     handoff = None      # (Ez_profile, Hy_profile) am Handoff-Plane des Vorgaengers
     afwd0 = None; afwd_last = None
     for w in range(n_win):
-        gx0 = min(w*Sx, max(0.0, lx - Wx))
+        gx0 = w*Sx       # NICHT am Ende klemmen: die Kaskade braucht Fensterstart = w*Sx
         wc = _window_cfg(cfg, gx0, Wx)
         if w == 0:
             sources = [mp.EigenModeSource(
@@ -273,11 +292,13 @@ def run_stitch_fullfield(cfg, window_w_um, slide_um, C=None):
         else:
             ez_p, hy_p = handoff
             ez_pf = _yee_angular_filter(ez_p, res, kmed)   # winkelaufgeloeste Yee-Korr.
-            def amp_e(p, hy_p=hy_p):     # elektrische Stromquelle (treibt Ez) ~ +C*Hy
-                return C*_profile_interp(hy_p, ys, p.y)
+            js, ms = _equiv_signs(cfg)
 
-            def amp_h(p, ez_pf=ez_pf):   # magnetische Stromquelle (treibt Hy) ~ -C*Ez
-                return -C*_profile_interp(ez_pf, ys, p.y)
+            def amp_e(p, hy_p=hy_p):     # J = n x H:  s: Jz=+Hy,  p: Jy=-Hz
+                return js*C*_profile_interp(hy_p, ys, p.y)
+
+            def amp_h(p, ez_pf=ez_pf):   # M = -n x E: s: My=+Ez,  p: Mz=-Ey
+                return ms*C*_profile_interp(ez_pf, ys, p.y)
             src_t = mp.GaussianSource(f0, fwidth=0.15*f0)
             sources = [
                 mp.Source(src=src_t, component=comp,
@@ -320,25 +341,26 @@ def run_stitch_fullfield(cfg, window_w_um, slide_um, C=None):
         l0 = trim if w > 0 else 0
         l1 = ez_full.shape[0] - (trim if w < n_win - 1 else 0)
         gi1 = min(gi0 + l1, Nx_full)
-        Efull[gi0 + l0:gi1, :ez_full.shape[1]] = ez_full[l0:l0 + (gi1 - gi0 - l0), :]
+        ny = min(Ny, ez_full.shape[1])       # Meep liefert oft Ny+1/Ny+2 Punkte
+        Efull[gi0 + l0:gi1, :ny] = ez_full[l0:l0 + (gi1 - gi0 - l0), :ny]
 
         if w == 0:
             afwd0 = a_fwd
         afwd_last = a_fwd
         ratio = abs(a_bwd)/max(abs(a_fwd), 1e-30)
-        print(f'  [fullfield] Fenster {w+1}/{n_win} x0={gx0:.1f}um  '
+        print(f'  [fullfield] window {w+1}/{n_win} x0={gx0:.1f}um  '
               f'|fwd|={abs(a_fwd):.3f} |bwd|={abs(a_bwd):.3f} '
               f'(bwd/fwd={ratio:.2f})', flush=True)
         del sim
 
     Tr = abs(afwd_last/afwd0)**2 if (afwd0 and abs(afwd0) > 1e-30) else 0.0
     print(f'[meep-stitch/fullfield Result] {cfg["label"]}: '
-          f'Transmission(gefuehrt)~{Tr:.4f} ({n_win} Fenster, voll-feldbasiert)')
+          f'Transmission(guided)~{Tr:.4f} ({n_win} windows, full-field based)')
     if Tr > 1.05:
-        print('  !!! WARNUNG: Transmission > 1 ist UNPHYSIKALISCH -> das Handoff-Feld '
-              'ist radiation-dominiert (starke Streuung), die skalare Kalibrierung '
-              'ueber-skaliert die Strahlung. Ergebnis NICHT belastbar. Nutze '
-              '--meep-handoff mode oder --engine native --method stitch. !!!')
+        print('  !!! WARNING: Transmission > 1 is UNPHYSICAL -> the handoff field '
+              'is radiation-dominated (strong scattering), the scalar calibration '
+              'over-scales the radiation. Result NOT reliable. Use '
+              '--meep-handoff mode or --engine native --method stitch. !!!')
     return dict(Efull=Efull, transmission=Tr, n_win=n_win, shape=(Nx_full, Ny))
 
 
@@ -346,7 +368,7 @@ def mode_transfer_full(cfg):
     """Referenz: EIN Full-Domain-Lauf, Mode-Transfer |a_R/a_L|^2 zwischen zwei
     Planes nahe den Enden (fairer Vergleich zum Stitch, gleiche Groesse)."""
     comp = mp.Ez if cfg['pol'] == 's' else mp.Ey
-    parity = mp.NO_PARITY
+    parity = _parity(cfg)
     f0 = cfg['f0']
     lx, ly, res = cfg['lx'], cfg['ly'], cfg['resolution']
     dpml = max(0.1, min(cfg['lam_nm']/1000.0, 0.4*min(lx, ly)))
@@ -392,7 +414,232 @@ if __name__ == '__main__':
     cfg = _build_cfg(args, layers)
     print('=== STITCH ===')
     st = run_stitch(cfg, args.window_um, args.slide_um, modes=args.meep_modes)
-    print('=== FULL-DOMAIN Mode-Transfer (Referenz) ===')
+    print('=== FULL-DOMAIN mode transfer (reference) ===')
     Tf, span = mode_transfer_full(cfg)
-    print(f'\n[VERGLEICH] stitch T(mode)={st["transmission"]:.4f}  '
-          f'vs full-domain T(mode ueber {span:.1f}um)={Tf:.4f}')
+    print(f'\n[COMPARISON] stitch T(mode)={st["transmission"]:.4f}  '
+          f'vs full-domain T(mode over {span:.1f}um)={Tf:.4f}')
+
+
+# =============================================================================
+# Vektor-Stitch (2D/3D, planar, Linse, CAD): Aequivalenzprinzip mit ALLEN
+# tangentialen Komponenten (Ey, Ez, Hy, Hz) - unabhaengig von Moden und Geometrie.
+# =============================================================================
+_TANG = None
+
+
+def _tang():
+    global _TANG
+    if _TANG is None:
+        _TANG = (mp.Ey, mp.Ez, mp.Hy, mp.Hz)
+    return _TANG
+
+
+def _window_cfg_v(cfg, gx0, Wx):
+    """Fenster-cfg: Zelle [gx0, gx0+Wx]; Bead nur wenn (teilweise) drin; CAD-Gitter
+    auf das Fenster zugeschnitten; gekruemmte Linse ueber gx0 (Gitter global)."""
+    wc = dict(cfg)
+    wc['lx'] = Wx
+    wc['cx'] = gx0 + Wx/2.0
+    wc['gx0'] = gx0
+    wc['lx_total'] = cfg.get('lx_total', cfg['lx'])
+    b = cfg.get('bead')
+    wc['bead'] = b if (b and gx0 - b['r'] <= b['x'] <= gx0 + Wx + b['r']) else None
+    if cfg.get('cad'):
+        c = dict(cfg['cad'])
+        dx = c['dx']
+        i0 = int(round(gx0/dx)); n = max(2, int(round(Wx/dx)))
+        e = c['eps'][i0:i0 + n]
+        if e.shape[0] < n:                       # am Ende auffuellen (letzte Spalte)
+            pad = np.repeat(e[-1:], n - e.shape[0], axis=0)
+            e = np.concatenate([e, pad], axis=0)
+        c['eps'] = e
+        wc['cad'] = c
+    return wc
+
+
+def _plane_size(cfg, d):
+    is3d = cfg['dim'] == 3
+    return mp.Vector3(0, cfg['ly'] - 2*d, (cfg['lz'] - 2*d) if is3d else 0)
+
+
+def _nearest(arr, frac):
+    """Wert eines 1D/2D-Profils bei relativer Lage frac (0..1 je Achse)."""
+    idx = tuple(min(max(int(round(f*(n - 1))), 0), n - 1) for f, n in zip(frac, arr.shape))
+    return arr[idx]
+
+
+def _sx_flux(ph, res, is3d):
+    """Netto-Fluss in +x aus tangentialen Phasoren: S_x = 1/2 Re(Ey Hz* - Ez Hy*)."""
+    s = 0.5*np.real(ph[mp.Ey]*np.conj(ph[mp.Hz]) - ph[mp.Ez]*np.conj(ph[mp.Hy]))
+    return float(np.sum(s))*(1.0/res)**(2 if is3d else 1)
+
+
+def run_stitch_vector(cfg, window_w_um, slide_um, n_dft_periods=4):
+    """CW-Fenster-Stitch fuer Meep, 2D und 3D, planar/Linse/CAD (Pendant zum nativen
+    Stitch). Fenster 0: physikalische Quelle (Gauss-Spot). Fenster w>0: Einspeisung des
+    eingeschwungenen Feldes am Uebergabe-Querschnitt als Flaechenstroeme
+        J = x^ x H = (0, -Hz, Hy),   M = -x^ x E = (0, Ez, -Ey)
+    (Aequivalenzprinzip -> strahlt nur in +x). Meeps Normierung der Stroeme wird einmal
+    im Ueberlapp von Fenster 0/1 kalibriert (komplexer Faktor C, linear -> exakt fuer
+    alle weiteren Fenster). Ein Fenster im Speicher. NOCH NICHT gegen Meep-full validiert."""
+    is3d = cfg['dim'] == 3
+    comp = mp.Ez if cfg['pol'] == 's' else mp.Ey
+    f0 = cfg['f0']; res = cfg['resolution']
+    lx = cfg['lx']
+    d = cfg.get('dpml') or cfg['lam_nm']/1000.0
+    Wx = min(window_w_um, lx)
+    if Wx < 2*d + 3.0 and Wx < lx:
+        raise SystemExit(f'[meep-stitch] window {Wx:g} um too small (>= 2*PML + 3 um = {2*d + 3:g}).')
+    x_inj = -Wx/2 + d + 0.3                      # Einspeise-Ebene (lokal)
+    Sx = max(0.5, min(slide_um, Wx - 2*d - 2.0)) if lx > Wx else lx
+    # Slide auf ganze Zellen: die Fensterstarts werden aufs Gitter gerundet; ist Sx kein
+    # Vielfaches von dx, liegt die Einspeiseebene bis dx/2 neben der Uebergabeebene des
+    # Vorgaengers -> Phasensprung beta*dx/2 an jeder Naht.
+    Sx = max(1, int(round(Sx*res)))/res
+    n_win = (int(np.ceil((lx - Wx)/Sx)) + 1) if lx > Wx else 1
+    xR = x_inj + Sx                               # Uebergabe-Ebene (lokal)
+    n_max = max(float(cfg['wg_n']), 1.5)
+    T_win = 3.0*Wx*n_max + 10.0/f0
+    T_dft = n_dft_periods/f0
+    Nx_full = int(round(lx*res))
+    Efull = None              # y/z-Groesse aus den Meep-Gitterkoordinaten des 1. Fensters
+    x_off = 0.0               # Efull[i] liegt bei x = base + i/res (interpoliert)
+    print(f'[meep-stitch/vector] {n_win} windows of {Wx:g} um, slide {Sx:.2f} um, '
+          f'{"3D" if is3d else "2D"}, injection J=n x H, M=-n x E (Ey,Ez,Hy,Hz)', flush=True)
+
+    C = 1.0 + 0j
+    handoff = None
+    prev = None                                   # (gx0, Evol, x-Koordinaten lokal) Fenster w-1
+    S_in = S_out = None
+    base = float(cfg.get('gx0', 0.0))            # native x-Aufteilung: Zelle beginnt bei 10dx - dpml
+    for w in range(n_win):
+        # Fenster immer um genau Sx weiter: die Einspeiseebene von Fenster w MUSS auf der
+        # Uebergabeebene xR von Fenster w-1 liegen. Das letzte Fenster darf daher ueber
+        # das Domaenenende hinausragen (Geometrie laeuft weiter, Rest wird verworfen).
+        gx0 = base + w*Sx
+        gx0 = round(gx0*res)/res                  # Fenster auf dem Gitter ausrichten
+        wc = _window_cfg_v(cfg, gx0, Wx)
+        psize = _plane_size(wc, d)
+        if w == 0:
+            wc0 = dict(wc); wc0['source_type'] = 'cw'
+            sources = mb.build_source(wc0)
+        else:
+            src_t = mp.ContinuousSource(frequency=f0, width=5.0/f0)
+            hy, hz, ey, ez = (handoff[mp.Hy], handoff[mp.Hz], handoff[mp.Ey], handoff[mp.Ez])
+            hy_, hz_ = psize.y, psize.z
+
+            def mk(arr, sign):
+                def f(p, arr=arr, sign=sign):
+                    fr = [(p.y + hy_/2)/max(hy_, 1e-12)]
+                    if is3d:
+                        fr.append((p.z + hz_/2)/max(hz_, 1e-12))
+                    return complex(sign*_nearest(arr, fr))
+                return f
+            cen = mp.Vector3(x_inj, 0, 0)
+            sources = [mp.Source(src=src_t, component=mp.Ey, center=cen, size=psize, amp_func=mk(hz, -1.0)),
+                       mp.Source(src=src_t, component=mp.Ez, center=cen, size=psize, amp_func=mk(hy, +1.0)),
+                       mp.Source(src=src_t, component=mp.Hy, center=cen, size=psize, amp_func=mk(ez, +1.0)),
+                       mp.Source(src=src_t, component=mp.Hz, center=cen, size=psize, amp_func=mk(ey, -1.0))]
+        kw = {}
+        g = mb._grid(wc)
+        if g is not None:
+            h5 = mb._eps_file(g)
+            kw = {'epsilon_input_file': h5} if h5 else {'default_material': mb._grid_material(wc, g)}
+        else:
+            kw = {'default_material': mp.Medium(index=1.0)}
+        cell = mp.Vector3(Wx, wc['ly'], wc['lz'] if is3d else 0)
+        sim = mp.Simulation(cell_size=cell, resolution=res, geometry=mb.build_geometry(wc),
+                            sources=sources, boundary_layers=[mp.PML(d)],
+                            force_complex_fields=True, **kw)
+        sim.run(until=T_win)                       # einschwingen
+        # DFT nur ueber die letzten Perioden (eingeschwungen)
+        dft_vol = sim.add_dft_fields([comp], f0, 0, 1, center=mp.Vector3(), size=cell)
+        dft_R = sim.add_dft_fields(list(_tang()), f0, 0, 1, center=mp.Vector3(xR, 0, 0), size=psize)
+        x_in_l = cfg['det_in_x'] - wc['cx']; x_out_l = cfg['det_out_x'] - wc['cx']
+        lo_ok = -Wx/2 + d + 0.4; hi_ok = Wx/2 - d - 0.2
+        dft_in = (sim.add_dft_fields(list(_tang()), f0, 0, 1, center=mp.Vector3(x_in_l, 0, 0),
+                                     size=psize) if (S_in is None and lo_ok <= x_in_l <= hi_ok
+                                                     and (w == 0 or x_in_l > x_inj + 0.3)) else None)
+        dft_out = (sim.add_dft_fields(list(_tang()), f0, 0, 1, center=mp.Vector3(x_out_l, 0, 0),
+                                      size=psize) if lo_ok <= x_out_l <= hi_ok else None)
+        _t0 = sim.meep_time()
+        sim.run(until=T_dft)
+        # Meep-DFT = 1/sqrt(2 pi) * sum f e^{i w t} dt -> Amplitude A = DFT*sqrt(2 pi)/Dauer
+        # (tatsaechliche Dauer: ganze Zeitschritte), damit Stitch und Full gleich skaliert sind
+        _nrm = np.sqrt(2*np.pi)/max(sim.meep_time() - _t0, 1e-12)
+        Ev = np.asarray(sim.get_dft_array(dft_vol, comp, 0))*_nrm
+        phR = {c: np.asarray(sim.get_dft_array(dft_R, c, 0))*_nrm for c in _tang()}
+        # exakte Gitterkoordinaten (lokal) statt linspace (Meep liefert je nach Region
+        # n oder n+1/n+2 Punkte -> gestreckte Achse = Phasenfehler am Rand)
+        xs_l, ys_l, zs_l, _w = sim.get_array_metadata(dft_cell=dft_vol)
+        xs_l = np.asarray(xs_l)
+        if Efull is None:
+            ys_l = np.asarray(ys_l)
+            shp_full = (Nx_full, len(ys_l)) + ((len(zs_l),) if is3d else ())
+            Efull = np.zeros(shp_full, dtype=np.complex64)
+            cfg['view_yr'] = (float(ys_l[0] + wc['cy']), float(ys_l[-1] + wc['cy']))
+
+        # Kalibrierung (einmal): Fenster 1 gegen Fenster 0 im Ueberlapp
+        if w == 1 and prev is not None:
+            g0, E0, xs0 = prev
+            # globale Lagen: Fenster [gx0, gx0+Wx], lokale x relativ zur Fenstermitte
+            a = gx0 + Wx/2 + x_inj + 0.5           # hinter der Einspeisung von Fenster 1
+            b = g0 + Wx - d - 0.3                  # vor dem rechten PML von Fenster 0
+            i1 = (xs_l + gx0 + Wx/2 >= a) & (xs_l + gx0 + Wx/2 <= b)
+            if i1.sum() >= 3:
+                xg = xs_l[i1] + gx0 + Wx/2
+                i0 = np.clip(np.round((xg - g0 - Wx/2 - xs0[0])/(xs0[1] - xs0[0])).astype(int),
+                             0, len(xs0) - 1)
+                e1 = Ev[i1]; e0 = E0[i0]
+                C = complex(np.vdot(e1, e0)/max(np.vdot(e1, e1).real, 1e-30))
+                print(f'  [vector] calibration C = {abs(C):.4g} * exp(i {np.angle(C):+.3f}) '
+                      f'(overlap {b - a:.2f} um)', flush=True)
+            else:
+                print('  [vector] WARNING: no overlap for the calibration -> C = 1')
+        if w >= 1:
+            Ev = Ev*C
+            phR = {c: v*C for c, v in phR.items()}
+        handoff = phR
+        # Fluesse (Transmission wie native: ganzer Querschnitt)
+        if dft_in is not None and S_in is None:
+            ph = {c: np.asarray(sim.get_dft_array(dft_in, c, 0))*_nrm*(C if w else 1) for c in _tang()}
+            S_in = _sx_flux(ph, res, is3d)
+        if dft_out is not None:
+            ph = {c: np.asarray(sim.get_dft_array(dft_out, c, 0))*_nrm*(C if w else 1) for c in _tang()}
+            S_out = _sx_flux(ph, res, is3d)
+        # Assemblieren: Fenster 0 ab x=0, sonst ab der Einspeisung; Ende vor der PML
+        a_l = -Wx/2 if w == 0 else x_inj + 0.2
+        b_l = Wx/2 if w == n_win - 1 else Wx/2 - d - 0.2
+        # Linear auf das globale Gitter Efull[i] <-> x = base + i/res interpolieren: Meeps
+        # DFT-Punkte liegen nicht exakt im Abstand 1/res, Runden liesse Spalten leer.
+        p = (xs_l + gx0 + Wx/2 - base)*res               # Gleitkomma-Index je Meep-Punkt
+        pa = (a_l + gx0 + Wx/2 - base)*res; pb = (b_l + gx0 + Wx/2 - base)*res
+        t = np.arange(max(0, int(np.ceil(max(pa, p[0])))),
+                      min(Nx_full - 1, int(np.floor(min(pb, p[-1])))) + 1)
+        if t.size:
+            k = np.clip(np.searchsorted(p, t), 1, len(p) - 1)
+            wt = ((t - p[k - 1])/np.maximum(p[k] - p[k - 1], 1e-12)).astype(np.float32)
+            wt = wt.reshape((-1,) + (1,)*(Ev.ndim - 1))
+            blk = Ev[k - 1]*(1 - wt) + Ev[k]*wt
+            ny_c = min(blk.shape[1], Efull.shape[1])
+            if is3d:
+                nz_c = min(blk.shape[2], Efull.shape[2])
+                Efull[t, :ny_c, :nz_c] = blk[:, :ny_c, :nz_c]
+            else:
+                Efull[t, :ny_c] = blk[:, :ny_c]
+        prev = (gx0, Ev, xs_l)
+        print(f'  [vector] window {w+1}/{n_win} x0={gx0:.2f} um done', flush=True)
+        del sim
+
+    if cfg.get('view_x'):                         # Ausgabe auf [0, L] wie native
+        vx0, vx1 = cfg['view_x']
+        i0 = int(round((vx0 - base)*res)); n = int(round((vx1 - vx0)*res))
+        Efull = Efull[i0:i0 + n]
+        shp_full = Efull.shape
+        cfg['view_xr'] = (base + (i0 + x_off)/res, base + (i0 + x_off + Efull.shape[0] - 1)/res)
+    else:
+        cfg['view_xr'] = (base + x_off/res, base + (x_off + Efull.shape[0] - 1)/res)
+    Tr = (S_out/S_in) if (S_in and S_out is not None and abs(S_in) > 0) else float('nan')
+    print(f'[meep-stitch/vector Result] {cfg["label"]}: Transmission (flux, full '
+          f'cross-section) = {Tr:.4f}  ({n_win} windows)', flush=True)
+    return dict(Efull=Efull, transmission=Tr, n_win=n_win, shape=shp_full, C=C)

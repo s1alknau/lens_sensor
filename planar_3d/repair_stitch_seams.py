@@ -14,7 +14,7 @@ Aufruf (im Ordner planar_3d):
     python repair_stitch_seams.py --lowram   # speicherschonend (Memmap-Streaming)
 Erzeugt je Datei eine *_repariert.npz-Kopie (Original bleibt erhalten).
 """
-import numpy as np, os, sys, glob, zipfile, shutil
+import numpy as np, os, sys, glob, zipfile, shutil, gc
 
 
 def detect_seams(frames_npz):
@@ -65,9 +65,23 @@ def repair_frames(p, runs):
     np.savez_compressed(out, **kw); print('  Slice ->', os.path.basename(out))
 
 
+def _stream_copy(s, o, tp):
+    """Kopiert (dekomprimiert) mit schrumpfendem Puffer - robust bei knappem RAM."""
+    for shift in (24, 20, 16, 12):     # 16 MB -> 1 MB -> 64 KB -> 4 KB
+        try:
+            s.seek(0); o.seek(0); o.truncate()
+            shutil.copyfileobj(s, o, 1 << shift)
+            return
+        except MemoryError:
+            gc.collect()
+            print(f'    [RAM knapp bei Puffer {1 << shift} B -> kleinerer Puffer]')
+    raise MemoryError(f'Streaming-Kopie fehlgeschlagen (auch mit 4-KB-Puffer): {tp}')
+
+
 def repair_vol(p, runs, lowram=False):
     out = p.replace('.npz', '_repariert.npz')
     if not lowram:
+        d = kw = None
         try:
             d = np.load(p, allow_pickle=True); kw = {k: np.asarray(d[k]) for k in d.files}; d.close()
             for key, ax in (('Ez', 1), ('Ez_cw', 1), ('Iavg', 0)):
@@ -76,6 +90,8 @@ def repair_vol(p, runs, lowram=False):
             np.savez_compressed(out, **kw); print('  Volumen ->', os.path.basename(out)); return
         except MemoryError:
             print('  [RAM knapp -> Streaming-Modus]')
+        finally:
+            del d, kw; gc.collect()   # Speicher vor dem Streaming-Zweig sicher freigeben
     # Streaming: grosse Arrays per Memmap reparieren, kleine Metadaten kopieren
     zin = zipfile.ZipFile(p); big = {'Ez.npy': 1, 'Ez_cw.npy': 1, 'Iavg.npy': 0}; tmps = {}
     tdir = os.path.dirname(os.path.abspath(out))
@@ -84,8 +100,9 @@ def repair_vol(p, runs, lowram=False):
             continue
         tp = os.path.join(tdir, '_tmp_' + name)
         with zin.open(name) as s, open(tp, 'wb') as o:
-            shutil.copyfileobj(s, o, 1 << 24)
+            _stream_copy(s, o, tp)
         arr = np.lib.format.open_memmap(tp, mode='r+'); inpaint(arr, ax, runs); arr.flush(); del arr
+        gc.collect()
         tmps[name] = tp
     zo = zipfile.ZipFile(out, 'w', zipfile.ZIP_STORED)
     for name in zin.namelist():

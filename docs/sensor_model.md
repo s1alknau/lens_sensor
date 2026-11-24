@@ -10,7 +10,7 @@
 ## 1. Sensor-Prinzip
 
 Eine gekrümmte **PMMA-Kontaktlinse** (Dicke *t* = 250 µm, Krümmungsradius
-*R* = 8.3 mm, Durchmesser *D* = 14 mm, n ≈ 1.491 @ 850 nm) wirkt als
+*R* = 8.3 mm, Durchmesser *D* = 14 mm, n ≈ 1.4835 @ 850 nm, Sellmeier-Fit Sultanova 2009) wirkt als
 **Wellenleiter**. Ein **VCSEL (850 nm)** wird an der **Stirnfläche am Rand**
 *butt-gekoppelt* (End-Fire); das Licht läuft per **Totalreflexion (TIR)** entlang
 des Bogens zum Apex bzw. zu den Detektoren.
@@ -40,10 +40,16 @@ Linsenfläche** rotiert platziert.
 
 - **Geführte Moden:** Ausbreitungskonstante β = n_eff · k₀, mit
   n_clad < n_eff < n_core. k₀ = 2π/λ.
-- **Evaneszente Eindringtiefe** (Amplitude, 1/e):
-  δ = 1/γ = λ / (2π·√(n_eff² − n_clad²)). Für PMMA-Kern / Aqueous-Cladding liegt
-  δ theoretisch bei ~0.2 µm; ins Luft-Cladding ist δ noch kleiner (~0.06 µm).
-  Die **Intensitäts**-Eindringtiefe ist δ/2.
+- **Evaneszente Eindringtiefe** δ = 1/γ = λ / (2π·√(n_eff² − n_clad²)), angegeben
+  für die **Feldamplitude** (Abfall auf 1/e); die **Intensitäts**-Eindringtiefe ist
+  δ/2. Untergrenze (streifender Einfall, n_eff → n_Kern = 1,4835 bei 850 nm):
+
+  | Cladding | δ Feld | δ/2 Intensität |
+  |---|---|---|
+  | Tränenfilm (1,3313) | 0,21 µm | 0,10 µm |
+  | Luft (1,0) | 0,12 µm | 0,06 µm |
+
+  Für flachere Strahlen (n_eff kleiner) ist δ größer.
 - **Akzeptanzwinkel:** Geführt ist Licht, das an **beiden** Grenzflächen
   totalreflektiert. Die engere Grenze ist der Tränenfilm; kritischer Winkel
   θ_c = arcsin(n_clad/n_core), maximaler Strahlwinkel zur Linsenachse
@@ -71,8 +77,9 @@ Beide Wege bleiben im Repo erhalten und ergänzen sich.
   Wellenleiter. Vorteile: ganze 14-mm-Linse in **einem** Lauf; die vertikale
   Quellspalte ist im flattened Bild **automatisch orthogonale Fläche + tangentiale
   Richtung** → **korrekte Einkopplung by construction**; dünne y-Ausdehnung
-  (speichereffizient). Nachteil: die ~3 % Krümmung (t/R) wird vernachlässigt; die
-  Anzeige zeigt die Linse begradigt.
+  (speichereffizient). Nachteil: die Krümmung wird vernachlässigt (mit `--curved`
+  näherungsweise über die konforme Abbildung n·(1+u/R) berücksichtigt; zur Bedeutung
+  der Krümmung siehe §4); die Anzeige zeigt die Linse begradigt.
 - **`kontaktlinse/sliding_window_fdtd.py`** — **globale gekrümmte** Koordinaten
   mit **Co-Moving-Fenster** (nur ein Fenster im Speicher). Achtung: In globaler
   Krümmung liegt die Linse **diagonal** im Fenster; eine **vertikale** Quellspalte
@@ -114,9 +121,16 @@ asymmetrische Slab-Formel** (`tests/crossval.py`) an einem dünnen Few-Mode-Slab
 ## 4. Koordinaten & Einkopplung
 
 - **Flattened vs. curved:** Flattened rechnet die Krümmung heraus (Linse gerade),
-  curved behält die reale Geometrie. Für **einen** VCSEL ist die 2D-Meridian-Ebene
-  die **exakte** Reduktion (der Strahl bleibt in der Ebene); die Krümmung ist ein
-  ~3 %-Effekt (t/R).
+  curved behält die reale Geometrie. Die 2D-Meridian-Ebene ist eine
+  **Näherung mit Linienquelle**: 2D beschreibt einen in z unendlich ausgedehnten
+  Strahl ohne seitliches Auseinanderlaufen. Ein realer VCSEL-Strahl läuft auf der
+  Kugelschale seitlich auseinander (Breite ∝ R·sin(s/R) statt s); absolute
+  Intensitäten entlang des Wegs weichen daher um einen geometrischen Faktor ab,
+  lokale Größen (Abklingrate, Anteil im Film pro Reflexion) nicht.
+  Die Krümmung ist **nicht** einfach ein ~3 %-Effekt (t/R): Entscheidend ist t/R
+  gegenüber α²/2 (α = Winkel zur Tangente). In einer konzentrischen 250-µm-Schale mit
+  R = 8,3 mm erreichen Strahlen unter ~10° (Mitte der Dicke) die Innenseite (Tränenfilm)
+  gar nicht (Review F11, Strahloptik) — bei 5–10° VCSEL-Divergenz ist das wesentlich.
 - **Tangentiale Einkopplung (Pflicht bei curved):** Die Einkoppelfläche ist
   **orthogonal** zur Linse (Querschnitt), die Einkoppel**richtung** liegt
   **tangential** zur Linsenkrümmung. Eine vertikale Quellspalte auf einer geneigten
@@ -190,7 +204,7 @@ Linsenfläche und stimmt mit Panel B überein.
 
 ## 8. Bekannte Einschränkungen / offene Punkte
 
-- **Moden-Propagation:** aktuell 2D-Meridian (für **einen** VCSEL exakt); die
+- **Moden-Propagation:** aktuell 2D-Meridian (Linienquellen-Näherung, siehe §4); die
   **azimutale** Strahl-Aufweitung erfordert ein lokales 3D. Für einen dicken,
   hoch-multimodigen Kern hängt das Sensor-Signal von der **Moden-Verteilung** ab,
   die wiederum von der **Einkopplung** bestimmt wird (→ `--couple fdtd`,

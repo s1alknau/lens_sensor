@@ -181,7 +181,8 @@ def run_full_domain_lens(scenario_name, dx_nm=300, window_h_um=600.0,
     tilt_rad = np.radians(vcsel_tilt)
     k0 = 2*np.pi/LAM
     y_pix_offset_m = (ys_local - iy_lens_center)*dx
-    phase_y = float(np.sin(tilt_rad))*k0*y_pix_offset_m
+    # Neigungswinkel gilt im Medium an der Quelle (PMMA-Linse, s. Fresnel PMMA/GaAs oben)
+    phase_y = float(np.sin(tilt_rad))*k0*N_PMMA*y_pix_offset_m
 
     print(f'Source: ix={src_ix} (x={x_src_um:.0f}um), iy_lens={iy_lens_center}, '
           f'waist={vcsel_waist*1e6}um mode={vcsel_mode} tilt={vcsel_tilt}deg '

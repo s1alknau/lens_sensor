@@ -33,8 +33,25 @@ def _scenarios_dict():
     return {s[0]: s[1:] for s in SCENARIOS}   # name -> (t_lip, t_aq, t_mu, n_aq) in um,um,um,-
 
 
+def materials_at(lam_nm):
+    """Brechzahlen bei lam_nm aus der gemeinsamen Dispersionstabelle (common/physics,
+    dieselbe wie im FDTD, Sellmeier-Fits mit Quellen). Aqueous als VERSCHIEBUNG: die
+    Szenario-n_aq (1.336 normal, 1.340 hyperosmolar) sind Werte im Sichtbaren; genutzt
+    wird n_aq_szen + d_aq = n_aqueous(lam) + (n_aq_szen - 1.336) (= physics.tear_index_at)."""
+    import os
+    import sys
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from common.physics import n_at, N_TEAR_SCENARIO_REF
+    return dict(pmma=n_at('pmma', lam_nm), lipid=n_at('lipid', lam_nm),
+                mucin=n_at('mucin', lam_nm), cornea=n_at('cornea', lam_nm),
+                d_aq=n_at('aqueous', lam_nm) - N_TEAR_SCENARIO_REF)
+
+
 def build_index_profile(t_lip_um, t_aq_um, t_mu_um, n_aq, dy_um,
-                        core_um=None, air_um=8.0, cornea_um=15.0, r_bend_um=None):
+                        core_um=None, air_um=8.0, cornea_um=15.0, r_bend_um=None,
+                        mats=None):
     """n(y) des Schichtstapels. y=0 = Kern-UNTERKANTE; Kern nach oben [0, core].
     Reihenfolge (wie im Solver): Cornea | Mucin | Aqueous | Lipid | KERN | Luft.
 
@@ -49,12 +66,14 @@ def build_index_profile(t_lip_um, t_aq_um, t_mu_um, n_aq, dy_um,
     y_hi = core_um + air_um
     n_pts = int(round((y_hi - y_lo)/dy_um)) + 1
     y = y_lo + np.arange(n_pts)*dy_um
+    # mats (materials_at): wellenlaengenabhaengige Brechzahlen; None = Modell bei 850 nm
+    m = mats or materials_at(850.0)                # Default: Dispersionsmodell bei 850 nm
     n = np.full(n_pts, N_AIR)                          # Default Luft (oben)
-    n[y < core_um] = N_PMMA                            # Kern (bis Oberkante)
-    n[y < 0] = N_LIPID                                 # Lipid direkt unter dem Kern
-    n[y < -t_lip_um] = n_aq                            # Aqueous
-    n[y < -(t_lip_um + t_aq_um)] = N_MUCIN            # Mucin
-    n[y < -(t_lip_um + t_aq_um + t_mu_um)] = N_CORNEA  # Cornea
+    n[y < core_um] = m['pmma']                         # Kern (bis Oberkante)
+    n[y < 0] = m['lipid']                              # Lipid direkt unter dem Kern
+    n[y < -t_lip_um] = n_aq + m['d_aq']                # Aqueous
+    n[y < -(t_lip_um + t_aq_um)] = m['mucin']          # Mucin
+    n[y < -(t_lip_um + t_aq_um + t_mu_um)] = m['cornea']  # Cornea
     n[y >= core_um] = N_AIR                            # Luft ueber dem Kern
     if r_bend_um is not None and np.isfinite(r_bend_um) and r_bend_um > 0:
         u = y - core_um/2.0                            # radialer Versatz von der Kernmitte
@@ -129,20 +148,31 @@ def couple(y, profiles, y0_um, waist_um):
     return a
 
 
-def project_field(y, profiles, y_src, E_src):
-    """Projiziert ein (FDTD-)Feld E_src(y_src) auf die Moden -> Amplituden a_m
-    (a_m = <phi_m|E>, phi reell). y_src/E_src werden auf das Modengitter interpoliert."""
+def project_field(y, profiles, y_src, E_src, pol='s', n=None, betas=None, k0=None):
+    """Projiziert ein (FDTD-)Feld E_src(y_src) auf die Moden -> Amplituden a_m.
+    y_src/E_src werden auf das Modengitter interpoliert.
+      s/TE: E_src = Ez, Moden = Ez-Profile -> a_m = <phi_m|Ez>.
+      p/TM: E_src = Ey, Moden = Hz-Profile. Mit Ey = beta_m Hz_m/(k0 eps) und der
+            TM-Orthogonalitaet int Hz_m Hz_n/eps dy = N_m delta_mn gilt EXAKT
+            a_m = k0 int Hz_m Ey dy / (beta_m N_m)  (Entwicklung Hz = sum a_m Hz_m).
+            Braucht n(y), beta_m, k0."""
     E = (np.interp(y, y_src, np.real(E_src), left=0.0, right=0.0)
          + 1j*np.interp(y, y_src, np.imag(E_src), left=0.0, right=0.0))
     dy = y[1] - y[0]
-    return (profiles*E[:, None]).sum(axis=0)*dy
+    ov = (profiles*E[:, None]).sum(axis=0)*dy
+    if str(pol).lower() in ('p', 'tm'):
+        N = (profiles**2/(n**2)[:, None]).sum(axis=0)*dy
+        return k0*ov/(betas*N)
+    return ov
 
 
-def fdtd_coupling_field(lam_nm, offset_um, waist_um, dx_nm=50.0, length_um=30.0):
+def fdtd_coupling_field(lam_nm, offset_um, waist_um, dx_nm=50.0, length_um=30.0,
+                        pol='s'):
     """Lokales FDTD am Rand: VCSEL koppelt in den 250-um-Kern; Rueckgabe des
     komplexen CW-Feldes an einem Querschnitt NACH der Einkoppelzone (y so, dass
     Kern=[0,core]). Das ersetzt den analytischen Gauss-Overlap durch die reale
-    Einkopplungs-Physik (Fresnel, Nahfeld) -> realistische Moden-Verteilung."""
+    Einkopplungs-Physik (Fresnel, Nahfeld) -> realistische Moden-Verteilung.
+    pol: 's' -> Ez (TE), 'p' -> Ey (TM); passend zur Moden-Polarisation."""
     import os
     import sys
     import tempfile
@@ -159,14 +189,16 @@ def fdtd_coupling_field(lam_nm, offset_um, waist_um, dx_nm=50.0, length_um=30.0)
                           dx_nm=dx_nm, save_frames=True, n_snapshots=8,
                           wg_thickness_um=core, lambda_nm=lam_nm, vcsel_waist=waist_um,
                           vcsel_offset=offset_um, method='full', place_bead=False,
-                          length_um=length_um, polarization='s',
+                          length_um=length_um, polarization=pol,
                           t_aqueous_um=8.0, t_mucin_um=2.0)
         cwm = r['cw_frames_memmap']; cwf = r['cw_frames'] or []
         arr = np.asarray(np.load(cwm, mmap_mode='r')[:len(cwf)])
     finally:
         os.chdir(prev)
     nfr, Nx, Ny = arr.shape
-    E = arr[0].astype(np.float64) - 1j*arr[nfr//4 or 1].astype(np.float64)
+    # Komplexe Amplitude per DFT ueber alle Phasen (Frame k = Re(Ê e^{2πik/N}))
+    w = np.exp(-2j*np.pi*np.arange(nfr)/nfr)
+    E = (2.0/nfr)*np.tensordot(w, arr.astype(np.float64), axes=(0, 0))
     tear = f2d.TEAR_BUFFER*1e6
     y_src = -tear + np.arange(Ny)*(dx_nm/1000.0)
     return y_src, E[int(0.6*Nx), :]        # Querschnitt in der eingeschwungenen Zone
@@ -187,10 +219,11 @@ def validate_solver(lam_um, dy_um=0.005):
                                air_um=6.0, cornea_um=6.0)
     neff, _ = solve_te_modes(y, n, lam_um)
     n_num = float(neff.max())
-    n_ana = cv.slab_neff_analytic(N_PMMA, N_AIR, 1.336, d, lam_um*1000, 's', 0)
+    _m = materials_at(lam_um*1000.0)               # dieselben n wie build_index_profile
+    n_ana = cv.slab_neff_analytic(_m['pmma'], N_AIR, 1.336 + _m['d_aq'], d, lam_um*1000, 's', 0)
     dd = abs(n_num - n_ana)
-    print(f'[Validierung] duenner Slab d={d:g}um: Eigenloeser n_eff={n_num:.5f}  '
-          f'analytisch={n_ana:.5f}  Delta={dd:.2e}  -> {"OK" if dd < 2e-3 else "PRUEFEN"}')
+    print(f'[Validation] thin slab d={d:g}um: eigensolver n_eff={n_num:.5f}  '
+          f'analytic={n_ana:.5f}  Delta={dd:.2e}  -> {"OK" if dd < 2e-3 else "CHECK"}')
     return dd
 
 
@@ -211,17 +244,36 @@ def run_scenario(name, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
     r_bend_um: Biegeradius -> Bent-Mode via konformer Abbildung; zusaetzlich wird der
     Biege-/Strahlungsverlust ueber die Strahlungs-Kaustik abgeschaetzt (-> Durchsatz)."""
     core = T_LENS*1e6
-    y, n = build_index_profile(t_lip, t_aq, t_mu, n_aq, dy_um, r_bend_um=r_bend_um)
+    y, n = build_index_profile(t_lip, t_aq, t_mu, n_aq, dy_um, r_bend_um=r_bend_um,
+                               mats=materials_at(lam_um*1000.0))   # n(lambda) wie im FDTD
     dy = y[1] - y[0]
     neff, prof = solve_modes(y, n, lam_um, pol)
     k0 = 2*np.pi/lam_um
     betas = neff*k0
-    if coupling is not None:                              # reale FDTD-Einkopplung -> Projektion
-        a = project_field(y, prof, coupling[0], coupling[1])
-        a = a/np.sqrt(max(np.sum(np.abs(a)**2), 1e-30))  # auf Einheitsleistung normiert
-    else:                                                 # analytischer Gauss-Overlap
-        a = couple(y, prof, core/2 + offset_um, waist_um)
-    P = np.abs(a)**2
+    if str(pol).lower() in ('p', 'tm'):
+        # TM: Einfallsfeld ist Ey (VCSEL-Gauss bzw. FDTD-Ey), Moden sind Hz-Profile.
+        # Exakte Entwicklung (project_field) + LEISTUNGS-Gewichte aus dem Poynting-
+        # Fluss: P_m = beta_m N_m |a_m|^2/(2k0), P_in = int n|Ey|^2 dy/2.
+        if coupling is not None:
+            y_s, E_s = coupling
+        else:
+            y_s, E_s = y, np.exp(-((y - (core/2 + offset_um))/waist_um)**2)
+        Ey = (np.interp(y, y_s, np.real(E_s), left=0.0, right=0.0)
+              + 1j*np.interp(y, y_s, np.imag(E_s), left=0.0, right=0.0))
+        a = project_field(y, prof, y, Ey, pol='p', n=n, betas=betas, k0=k0)
+        N_m = (prof**2/(n**2)[:, None]).sum(axis=0)*dy
+        P_in = max(float(np.sum(n*np.abs(Ey)**2)*dy)/2.0, 1e-30)
+        P = betas*N_m*np.abs(a)**2/(2.0*k0)/P_in
+        a = a/np.sqrt(P_in)
+        if coupling is not None:                          # FDTD: auf Einheitsleistung
+            s = max(float(P.sum()), 1e-30); P = P/s; a = a/np.sqrt(s)
+    else:
+        if coupling is not None:                          # reale FDTD-Einkopplung -> Projektion
+            a = project_field(y, prof, coupling[0], coupling[1])
+            a = a/np.sqrt(max(np.sum(np.abs(a)**2), 1e-30))  # auf Einheitsleistung normiert
+        else:                                             # analytischer Gauss-Overlap
+            a = couple(y, prof, core/2 + offset_um, waist_um)
+        P = np.abs(a)**2
     eta = float(P.sum())
     # --- ATR: modaler Verlust durch Absorption im Aqueous (Traenenfilm-Analyt) ---
     aq_mask = (y <= -t_lip) & (y > -(t_lip + t_aq))    # Aqueous-Schicht unter dem Kern
@@ -256,7 +308,7 @@ def run_scenario(name, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
         bend_loss_perum = float(gam*np.exp(log_bend)) if log_bend > -700 else 0.0
     throughput_bend = float(np.exp(-bend_loss_perum*L_um))   # ueberlebt Biegung ueber L
     if verbose:
-        print(f'  Moden {len(neff)}  eta={eta:.3f}  Gamma_aq={Gamma_eff:.3e}  '
+        print(f'  modes {len(neff)}  eta={eta:.3f}  Gamma_aq={Gamma_eff:.3e}  '
               f'evan_ratio={evan_ratio:.3e}  delta={delta_um:.3f}um  '
               f'bend_loss={bend_loss_perum:.2e}/um  T_bend={throughput_bend:.3f}')
     return dict(name=name, n_modes=len(neff), neff_max=neff_max,
@@ -267,40 +319,61 @@ def run_scenario(name, t_lip, t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
                 throughput_bend=throughput_bend)
 
 
+_CLI_DESCRIPTION = '''Native mode propagation for the contact-lens sensor (resolution-robust).
+
+Analogous to the Meep mode handoff, but native and WITHOUT FDTD along the length:
+  1) Transverse eigenmodes of the layered slab (air | PMMA core | lipid |
+     aqueous | mucin | cornea) via a tridiagonal 1D eigensolver -> exact beta_m
+     (n_eff) + profiles phi_m(y). Fine in y (resolves the evanescent field),
+     no grid along the propagation -> NO accumulating dispersion.
+  2) VCSEL coupling via overlap integral -> mode amplitudes a_m.
+  3) Analytic propagation along the arc: a_m -> a_m * exp(i beta_m L).
+  4) Sensor: field at the detector y positions (D1 tear side, D2 air side)
+     -> R_tear = |E(D1)|^2 / |E(D2)|^2.
+
+Brute-force stitching (sliding_window_fdtd.py / full_domain_fdtd.py) is kept
+unchanged - this is an ADDITIONAL fast and accurate method.
+
+Usage:
+    python mode_propagation.py                 # test run: R_tear per scenario
+    python mode_propagation.py --scenario DED --L-mm 12 --offset-um 0
+'''
+
+
 def build_parser():
     """Argparse-Parser (auch vom GUI genutzt, um die Felder zu erzeugen)."""
-    ap = argparse.ArgumentParser(description=__doc__,
+    ap = argparse.ArgumentParser(description=_CLI_DESCRIPTION,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    g_case = ap.add_argument_group('Szenario & Physik')
-    g_case.add_argument('--scenario', default=None, help='nur dieses Szenario (sonst alle)')
+    g_case = ap.add_argument_group('Scenario & physics')
+    g_case.add_argument('--scenario', default=None, help='Only this scenario (otherwise all)')
     g_case.add_argument('--polarization', choices=('s', 'p'), default='s',
-                        help='s = TE (Ez-Moden) | p = TM (Hz-Moden)')
+                        help='s = TE (Ez modes) | p = TM (Hz modes)')
     g_case.add_argument('--r-bend-mm', type=float, default=0.0,
-                        help='Biegeradius in mm fuer ECHTE Kruemmung (Bent-Mode, konforme '
-                             'Abbildung). 0 = gerader Guide. Kontaktlinse: 8.3')
-    g_case.add_argument('--lambda-nm', type=float, default=LAM*1e9, help='Wellenlaenge (nm)')
+                        help='Bend radius in mm for TRUE curvature (bent mode, conformal '
+                             'mapping). 0 = straight guide. Contact lens: 8.3')
+    g_case.add_argument('--lambda-nm', type=float, default=LAM*1e9, help='Wavelength (nm)')
 
-    g_cpl = ap.add_argument_group('Einkopplung (VCSEL)')
-    g_cpl.add_argument('--offset-um', type=float, default=0.0, help='VCSEL-y-Offset (0=Kernmitte)')
-    g_cpl.add_argument('--waist-um', type=float, default=2.0, help='VCSEL-Taille (um)')
+    g_cpl = ap.add_argument_group('Coupling (VCSEL)')
+    g_cpl.add_argument('--offset-um', type=float, default=0.0, help='VCSEL y offset (0 = core center)')
+    g_cpl.add_argument('--waist-um', type=float, default=2.0, help='VCSEL waist (um)')
     g_cpl.add_argument('--couple', choices=('analytic', 'fdtd'), default='analytic',
-                       help='analytic = Gauss-Overlap; fdtd = lokales FDTD am Rand -> Moden-Projektion')
+                       help='analytic = Gaussian overlap; fdtd = local FDTD at the edge -> mode projection')
     g_cpl.add_argument('--offset-scan', default='',
-                       help='Komma-Liste VCSEL-Offsets (um), z.B. "-120,-60,0" -> evan/ATR vs Offset (Gesund)')
+                       help='Comma list of VCSEL offsets (um), e.g. "-120,-60,0" -> evan/ATR vs offset (Gesund)')
 
-    g_tear = ap.add_argument_group('Traenenfilm & ATR')
+    g_tear = ap.add_argument_group('Tear film & ATR')
     g_tear.add_argument('--t-lipid-nm', type=float, default=None,
-                        help='Lipiddicke (nm) ueberschreiben (sonst Szenario-Wert; Gesund=30)')
+                        help='Override lipid thickness (nm) (otherwise scenario value; Gesund=30)')
     g_tear.add_argument('--alpha-tear-permm', type=float, default=10.0,
-                        help='Absorptions-/Streukoeff. des Traenenfilm-Analyten (1/mm) fuer die '
-                             'ATR-Daempfung. Relative Szenario-Unterschiede sind ~alpha-unabhaengig.')
+                        help='Absorption/scattering coefficient of the tear-film analyte (1/mm) for the '
+                             'ATR attenuation. Relative scenario differences are ~independent of alpha.')
 
-    g_num = ap.add_argument_group('Numerik')
-    g_num.add_argument('--dy-nm', type=float, default=10.0, help='transversale Aufloesung (nm)')
+    g_num = ap.add_argument_group('Numerics')
+    g_num.add_argument('--dy-nm', type=float, default=10.0, help='Transverse resolution (nm)')
     g_num.add_argument('--L-mm', type=float, default=None,
-                       help='Propagationslaenge Rand->Detektor in mm (Default aus Geometrie)')
+                       help='Propagation length edge->detector in mm (default from geometry)')
     g_num.add_argument('--validate', action='store_true',
-                       help='Eigenloeser gegen analytische Slab-Formel pruefen und beenden')
+                       help='Check the eigensolver against the analytic slab formula and exit')
     return ap
 
 
@@ -316,27 +389,28 @@ def main():
     # Bogenlaenge Rand (s=0) -> Detektor D1 (s=D1_S_CENTER): L = D_LENS/2 - x_d1, x_d1<0
     x_d1_mm = (D1_S_CENTER - D_LENS/2)*1e3
     L_um = (args.L_mm*1000.0) if args.L_mm is not None else (D_LENS/2*1e6 - x_d1_mm*1e3)
-    print(f'Moden-Propagation  {"TM (Hz)" if _pol=="p" else "TE (Ez)"}  '
+    print(f'Mode propagation  {"TM (Hz)" if _pol=="p" else "TE (Ez)"}  '
           f'lam={args.lambda_nm:g}nm  dy={args.dy_nm:g}nm  '
-          f'L(Rand->D1)={L_um/1000:.2f}mm  Kern={T_LENS*1e6:g}um  waist={args.waist_um:g}um '
+          f'L(edge->D1)={L_um/1000:.2f}mm  core={T_LENS*1e6:g}um  waist={args.waist_um:g}um '
           f'offset={args.offset_um:g}um'
           + (f'  Lipid={args.t_lipid_nm:g}nm(override)' if args.t_lipid_nm is not None else ''))
-    print('  (brute-force-Stitching bleibt erhalten: sliding_window_fdtd.py / full_domain_fdtd.py)')
+    print('  (brute-force stitching is still available: sliding_window_fdtd.py / full_domain_fdtd.py)')
 
     r_bend_um = args.r_bend_mm*1000.0 if args.r_bend_mm > 0 else None
-    print(f'  ATR: Traenenfilm-Absorption alpha={args.alpha_tear_permm:g}/mm  Kopplung={args.couple}'
-          f'  Kruemmung={"R=%.1fmm (Bent-Mode)" % args.r_bend_mm if r_bend_um else "gerade"}')
+    print(f'  ATR: tear-film absorption alpha={args.alpha_tear_permm:g}/mm  coupling={args.couple}'
+          f'  curvature={"R=%.1fmm (bent mode)" % args.r_bend_mm if r_bend_um else "straight"}')
     scen = _scenarios_dict()
 
     # (C) Offset-Studie: Kopplungs-Abhaengigkeit des Signals (Gesund)
     if args.offset_scan.strip():
         offs = [float(s) for s in args.offset_scan.split(',')]
         t_lip, t_aq, t_mu, n_aq = scen.get('Gesund', list(scen.values())[0])
-        print(f'\nOffset-Studie (Gesund):')
+        print(f'\nOffset study (Gesund):')
         print(f'{"offset[um]":>11} {"evan_ratio":>11} {"delta[um]":>10} {"ATR[dB]":>9}')
         print('-'*44)
         for off in offs:
-            cf = fdtd_coupling_field(args.lambda_nm, off, args.waist_um) if args.couple == 'fdtd' else None
+            cf = (fdtd_coupling_field(args.lambda_nm, off, args.waist_um, pol=_pol)
+                  if args.couple == 'fdtd' else None)
             r = run_scenario('Gesund', _tl(t_lip), t_aq, t_mu, n_aq, lam_um, dy_um, L_um,
                              off, args.waist_um, args.alpha_tear_permm, coupling=cf, pol=_pol)
             print(f'{off:>11.0f} {r["evan_ratio"]:>11.4e} {r["delta_um"]:>10.3f} {r["ATR_dB"]:>9.4f}')
@@ -345,14 +419,14 @@ def main():
     # (B) FDTD-Kopplung: Einkoppelfeld EINMAL am Rand rechnen, auf alle Szenarien projizieren
     coupling = None
     if args.couple == 'fdtd':
-        print('  [FDTD-Kopplung] lokaler Rand-Lauf (VCSEL Butt-Coupling) ...', flush=True)
-        coupling = fdtd_coupling_field(args.lambda_nm, args.offset_um, args.waist_um)
+        print('  [FDTD coupling] local edge run (VCSEL butt coupling) ...', flush=True)
+        coupling = fdtd_coupling_field(args.lambda_nm, args.offset_um, args.waist_um, pol=_pol)
 
     names = [args.scenario] if args.scenario else list(scen.keys())
-    print(f'\n{"Szenario":<14} {"n_eff":>8} {"evan_ratio":>11} {"delta[um]":>10} '
+    print(f'\n{"Scenario":<14} {"n_eff":>8} {"evan_ratio":>11} {"delta[um]":>10} '
           f'{"T_bend":>8} {"ATR[dB]":>9}')
-    print('  (evan_ratio = DIREKT bestimmtes evan. Feld Tear/Kern; T_bend = Biege-Durchsatz; '
-          'ATR = messbare Daempfung)')
+    print('  (evan_ratio = DIRECTLY determined evan. field tear/core; T_bend = bend throughput; '
+          'ATR = measurable attenuation)')
     print('-'*64)
     for nm in names:
         t_lip, t_aq, t_mu, n_aq = scen[nm]
@@ -362,9 +436,9 @@ def main():
         print(f'{nm:<14} {r["neff_max"]:>8.4f} {r["evan_ratio"]:>11.4e} {r["delta_um"]:>10.3f} '
               f'{r["throughput_bend"]:>8.4f} {r["ATR_dB"]:>9.4f}')
     if r_bend_um:
-        print(f'\nBiege-Analyse (R={args.r_bend_mm}mm): Strahlungs-Kaustik ~{r["u_caustic_um"]/1000:.2f}mm '
-              f'oberhalb des Kerns -> Biegeverlust {r["bend_loss_perum"]:.2e}/um.')
-        print(f'  Durchsatz durch die Linse (Biege-limitiert, L={L_um/1000:.1f}mm): '
+        print(f'\nBend analysis (R={args.r_bend_mm}mm): radiation caustic ~{r["u_caustic_um"]/1000:.2f}mm '
+              f'above the core -> bend loss {r["bend_loss_perum"]:.2e}/um.')
+        print(f'  Throughput through the lens (bend-limited, L={L_um/1000:.1f}mm): '
               f'T_bend={r["throughput_bend"]:.4f}.')
 
 

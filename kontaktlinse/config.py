@@ -7,11 +7,19 @@ C0    = 2.99792458e8
 EPS0  = 8.8541878128e-12
 MU0   = 4*np.pi*1e-7
 
-N_PMMA   = 1.491
+# Brechzahlen bei 850 nm aus dem gemeinsamen Dispersionsmodell (common/physics.py,
+# Sellmeier-Fits mit Quellen; Review F5). Frueher Werte aus dem Sichtbaren (1.491 ...).
+import os as _os, sys as _sys
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
+from common.physics import n_at as _n_at          # noqa: E402
+
+N_PMMA   = _n_at('pmma', 850.0)
 N_AIR    = 1.000
-N_LIPID  = 1.480
-N_MUCIN  = 1.342
-N_CORNEA = 1.376
+N_LIPID  = _n_at('lipid', 850.0)
+N_MUCIN  = _n_at('mucin', 850.0)
+N_CORNEA = _n_at('cornea', 850.0)
 N_INGAAS = 3.5 + 0.05j
 N_BUFFER = 1.42
 
@@ -46,6 +54,8 @@ D3_XI_LO = -D3_QUERSCHN/2
 D3_XI_HI = +D3_QUERSCHN/2
 
 SCENARIOS = [
+    # n_aq: Szenariowerte im Sichtbaren (1.336 = normal); Umrechnung auf lambda per
+    # common.physics.tear_index_at bzw. mode_propagation.materials_at (d_aq)
     ('Gesund',         0.030, 3.5, 0.5, 1.336),
     ('DED',            0.010, 1.5, 0.3, 1.336),
     ('Frisch',         0.050, 6.0, 1.0, 1.336),

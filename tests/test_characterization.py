@@ -32,33 +32,35 @@ for _sub in ("planar_3d", "planar_beads"):
 RTOL = 1e-6
 
 # ---- Referenzwerte (auf CPU/NumPy erfasst) --------------------------------
+# Neu erfasst nach: exakter E/H-Poynting-Transmission, Eingangsebene stromab der
+# Quelle, versetzter eps-/Daempfungs-Mittelung in 3D und CPML als 3D-Standard.
 GOLD_3D = dict(
-    transmission=0.44737037646881866,
-    P_in=2.33725744772874e-16,
-    P_out=1.0456197442949568e-16,
-    Iavg=dict(shape=[40, 40, 19], sum=8107.286070867543,
-              absmax=7.147091865539551, mean=0.26668704180485336),
-    vols=dict(shape=[2, 40, 40, 19], sum=30.942123973122136,
-              absmax=3.7351722717285156, mean=0.0005089165127158246),
+    transmission=0.8938324575055383,
+    P_in=1.040518711672739e-15,
+    P_out=5.921577284545468e-16,
+    Iavg=dict(shape=[40, 40, 19], sum=15948.42095577363,
+              absmax=7.701944351196289, mean=0.5246191103872905),
+    vols=dict(shape=[2, 40, 40, 19], sum=1545.6698254427733,
+              absmax=3.9191524982452393, mean=0.025422201076361405),
 )
 GOLD_2D = dict(
-    transmission=1.0,
-    P_in=1.0003235367898137e-08,
-    P_out=1.0003235367898137e-08,
-    frames=dict(shape=[2, 80, 160], sum=-171.98446404082063,
-                absmax=3.620615243911743, mean=-0.006718143126594555),
+    transmission=0.8295025112003795,
+    P_in=2.521188276461206e-09,
+    P_out=1.3496680960337965e-09,
+    frames=dict(shape=[2, 80, 160], sum=127.42025666915892,
+                absmax=4.020036220550537, mean=0.004977353776139021),
 )
 # 3D-Stitch (Gebiets-Zerlegung). Die CW-Frames sind SIGNIERTE Phasen, deren
 # Volumen-Summe nahe Null liegt (Ausloeschung) -> fuer 'vols' nur shape+absmax
 # pinnen (robust), nicht sum/mean.
 GOLD_3D_STITCH = dict(
-    transmission=0.01413739343411249,
-    P_in=2.239417877197266e-19,
-    P_out=3.1659531593322763e-21,
-    Iavg=dict(shape=[40, 40, 19], sum=3965.8633829039554,
-              absmax=5.421854019165039, mean=0.13045603233236697),
+    transmission=0.8062997726593188,
+    P_in=2.363785552978516e-19,
+    P_out=1.86735336303711e-19,
+    Iavg=dict(shape=[40, 40, 19], sum=15937.366865052742,
+              absmax=7.78399133682251, mean=0.524255488981998),
     vols_shape=[2, 40, 40, 19],
-    vols_absmax=3.2742793560028076,
+    vols_absmax=3.686444044113159,
 )
 
 

@@ -1,4 +1,4 @@
-"""Reflexions-Benchmark der absorbierenden Raender (mur1 / mur2 / cpml).
+"""Reflexions-Benchmark der absorbierenden Raender (mur1 / cpml; Freiraum n=1).
 
 Eigenstaendiger 2D-TE-Loesungskern (Ez, Hx, Hy) im Freiraum: eine Ricker-
 Punktquelle in der Mitte eines NxN-Gitters. Die an den Raendern zurueck-
@@ -39,8 +39,6 @@ def _solve_te(N, dx, nsteps, boundary, src_ij, probe_ij, fp, t0):
         else:
             Hx -= Ch*(Ez[:, 1:] - Ez[:, :-1])
             Hy += Ch*(Ez[1:, :] - Ez[:-1, :])
-        if bnd is not None and not _cpml:
-            bnd.capture(Ez)
         ex1, ex2 = Ez[1, :].copy(), Ez[-2, :].copy()
         ey1, ey2 = Ez[:, 1].copy(), Ez[:, -2].copy()
         if _cpml:
@@ -53,8 +51,6 @@ def _solve_te(N, dx, nsteps, boundary, src_ij, probe_ij, fp, t0):
         Ez[sx, sy] += xp.float32((1.0 - 2.0*arg)*np.exp(-arg))
         if _cpml:
             bnd.terminate(Ez)
-        elif bnd is not None:
-            bnd.apply(Ez)
         else:
             Ez[0, :] = ex1 + mur*(Ez[1, :] - Ez[0, :]); Ez[-1, :] = ex2 + mur*(Ez[-2, :] - Ez[-1, :])
             Ez[:, 0] = ey1 + mur*(Ez[:, 1] - Ez[:, 0]); Ez[:, -1] = ey2 + mur*(Ez[:, -2] - Ez[:, -1])
@@ -86,13 +82,13 @@ def main():
     print(f'{"Rand":<8} {"Reflexion":>12} {"dB":>9}')
     print('-'*32)
     results = {}
-    for bnd in ('mur1', 'mur2', 'cpml'):
+    for bnd in ('mur1', 'cpml'):
         tr = _solve_te(N, dx, nsteps, bnd, src, probe, fp, t0)
         R = np.max(np.abs(tr - ref))/peak
         results[bnd] = R
         print(f'{bnd:<8} {R:>12.3e} {20*np.log10(max(R,1e-12)):>8.1f}')
-    ok = results['cpml'] < results['mur2'] < results['mur1']
-    print('\nOrdnung cpml < mur2 < mur1: ' + ('OK' if ok else 'NICHT erfuellt'))
+    ok = results['cpml'] < results['mur1']
+    print('\nOrdnung cpml < mur1 (Freiraum n=1; gefuehrter Fall: lokale Mur-Geschw. in planar_beads): ' + ('OK' if ok else 'NICHT erfuellt'))
     return results
 
 
