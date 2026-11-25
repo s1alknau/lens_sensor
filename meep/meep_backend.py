@@ -16,8 +16,50 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 
+def _custom_stack(cfg):
+    """Frei konfigurierter Stapel (--layers) als [(name, y_top, y_bot, n_re, n_im), ...]
+    vom Kern (y=0) abwaerts; None im Legacy-Fall (drei feste Schichten)."""
+    st = cfg.get('stack')
+    if st is None:
+        return None
+    out, y = [], 0.0
+    for L in st:
+        t = float(L['t_um'])
+        out.append((L['name'], y, y - t, float(L['n_re']), float(L.get('n_im') or 0.0)))
+        y -= t
+    return out
+
+
+def stack_bottom(cfg):
+    """y (phys) der Stapel-Unterseite = Oberkante des Substrats (Cornea)."""
+    cs = _custom_stack(cfg)
+    if cs is not None:
+        return cs[-1][2] if cs else 0.0
+    return _layer_bounds(cfg)[2]
+
+
+def n_below_core(cfg, y):
+    """Reelle Brechzahl des Stapels/Substrats an der Stelle y < 0 (phys. um)."""
+    cs = _custom_stack(cfg)
+    if cs is not None:
+        for _nm, yt, yb, nr, _ni in cs:
+            if yb <= y < yt:
+                return nr
+    else:
+        y_lip_bot, y_aq_bot, y_mu_bot = _layer_bounds(cfg)
+        if y >= y_lip_bot and (cfg['t_lip'] or 0.0) > 1e-6:
+            return float(cfg['n_lip'])
+        if y >= y_aq_bot:
+            return float(cfg['n_aq'])
+        if y >= y_mu_bot:
+            return float(cfg['n_mu'])
+    n_co = cfg['n_co']
+    yb = stack_bottom(cfg)
+    return float(n_co.at_depth(yb - y)) if hasattr(n_co, 'at_depth') else float(n_co)
+
+
 def _layer_bounds(cfg):
-    """y-Grenzen (phys) der Tear-Schichten unter dem WG (y<0)."""
+    """y-Grenzen (phys) der Tear-Schichten unter dem WG (y<0) - nur Legacy-Stapel."""
     t_lip = cfg['t_lip'] or 0.0
     y_lip_bot = -t_lip
     y_aq_bot = y_lip_bot - cfg['t_aq']
@@ -37,19 +79,26 @@ def _grid(cfg):
 
 
 def _layer_eps_y(cfg, y, core):
-    """Schichtstapel eps(y) (phys. um) wie native, mit oder ohne Kern."""
-    y_lip_bot, y_aq_bot, y_mu_bot = _layer_bounds(cfg)
+    """Schichtstapel eps(y) (phys. um) wie native, mit oder ohne Kern. Reelles Gitter
+    (epsilon_input_file) -> Absorption (n_im) der Schichten entfaellt hier."""
+    cs = _custom_stack(cfg)
+    y_sb = stack_bottom(cfg)
     e = np.full(y.shape, 1.0)
-    mc = y < y_mu_bot
+    mc = y < y_sb
     n_co = cfg['n_co']
     if hasattr(n_co, 'at_depth'):
-        e[mc] = n_co.at_depth(y_mu_bot - y[mc])**2
+        e[mc] = n_co.at_depth(y_sb - y[mc])**2
     else:
         e[mc] = float(n_co)**2
-    e[(y >= y_mu_bot) & (y < y_aq_bot)] = cfg['n_mu']**2
-    e[(y >= y_aq_bot) & (y < y_lip_bot)] = cfg['n_aq']**2
-    if (cfg['t_lip'] or 0.0) > 1e-6:
-        e[(y >= y_lip_bot) & (y < 0.0)] = cfg['n_lip']**2
+    if cs is not None:
+        for _nm, yt, yb, nr, _ni in cs:
+            e[(y >= yb) & (y < yt)] = nr**2
+    else:
+        y_lip_bot, y_aq_bot, y_mu_bot = _layer_bounds(cfg)
+        e[(y >= y_mu_bot) & (y < y_aq_bot)] = cfg['n_mu']**2
+        e[(y >= y_aq_bot) & (y < y_lip_bot)] = cfg['n_aq']**2
+        if (cfg['t_lip'] or 0.0) > 1e-6:
+            e[(y >= y_lip_bot) & (y < 0.0)] = cfg['n_lip']**2
     if core:
         e[(y >= 0.0) & (y < cfg['t_wg'])] = cfg['wg_n']**2
     return e
@@ -107,6 +156,15 @@ def _grid_material(cfg, g):
     return f
 
 
+def _med_nk(cfg, n, k):
+    """Meep-Medium fuer komplexe Brechzahl n + i k (Stapelschicht): wie _med, aber k direkt."""
+    k = float(k or 0.0)
+    if k <= 0:
+        return mp.Medium(index=n)
+    e1 = n*n - k*k
+    return mp.Medium(epsilon=e1, D_conductivity=2*np.pi*cfg['f0']*(2*n*k)/e1)
+
+
 def _med(cfg, n, key):
     """Meep-Medium fuer Brechzahl n und Absorption kappa = cfg['kappa'][key]:
     eps = (n + i kappa)^2 -> eps' = n^2 - kappa^2, Meep-D-Leitfaehigkeit
@@ -143,14 +201,16 @@ def build_geometry(cfg):
     x_inf = mp.inf
     z_size = lz if is3d else mp.inf
 
-    def blk(y0, y1, n, key=None):
+    def blk(y0, y1, n, key=None, mat=None):
         yc = 0.5*(y0 + y1) - cy
         return mp.Block(size=mp.Vector3(x_inf, y1 - y0, z_size),
                         center=mp.Vector3(0, yc, 0),
-                        material=_med(cfg, n, key))
+                        material=mat if mat is not None else _med(cfg, n, key))
 
     g = []
-    y_lip_bot, y_aq_bot, y_mu_bot = _layer_bounds(cfg)
+    cs = _custom_stack(cfg)
+    # Oberkante des Substrats: Legacy = Mucin-Unterseite, sonst Stapel-Unterseite
+    y_mu_bot = stack_bottom(cfg)
     y_bot = cfg['y_bot']
     # Cornea (Substrat) ganz unten, dann Mucin, Aqueous, (Lipid), WG-Kern.
     # Geschichtete Cornea (common.physics.CorneaProfile): als Folge von Bloecken,
@@ -171,10 +231,17 @@ def build_geometry(cfg):
             g.append(blk(y_mu_bot - d1, y_mu_bot - d0, nseg, 'co'))
     else:
         g.append(blk(y_bot, y_mu_bot, float(n_co), 'co'))
-    g.append(blk(y_mu_bot, y_aq_bot, cfg['n_mu'], 'mu'))
-    g.append(blk(y_aq_bot, y_lip_bot, cfg['n_aq'], 'aq'))
-    if (cfg['t_lip'] or 0.0) > 1e-6:
-        g.append(blk(y_lip_bot, 0.0, cfg['n_lip'], 'lip'))
+    if cs is not None:
+        # frei konfigurierter Stapel: ein Block je Schicht, Absorption (n_im = kappa)
+        # ueber Meeps D-Leitfaehigkeit wie bei den --kappa-*-Schichten (exakt bei f0)
+        for _nm, yt, yb, nr, ni in cs:
+            g.append(blk(yb, yt, nr, mat=_med_nk(cfg, nr, ni)))
+    else:
+        y_lip_bot, y_aq_bot, _ = _layer_bounds(cfg)
+        g.append(blk(y_mu_bot, y_aq_bot, cfg['n_mu'], 'mu'))
+        g.append(blk(y_aq_bot, y_lip_bot, cfg['n_aq'], 'aq'))
+        if (cfg['t_lip'] or 0.0) > 1e-6:
+            g.append(blk(y_lip_bot, 0.0, cfg['n_lip'], 'lip'))
     # WG-Kern y in [0, t_wg] wie native: Einkoppelabstand (Luft zwischen Quelle und
     # WG-Eintritt) und optionale Endfacette (Luftzone am Ausgang) -> endlicher Block in x
     # (gilt auch fuer den 3D-Rechteck-Kanal; frueher dort ignoriert)
@@ -234,6 +301,10 @@ def build_source(cfg):
     in_core = ('src_y' not in cfg and not (cfg.get('input_gap') or 0) > 0
                and 0.0 <= y_abs_c < cfg['t_wg'])
     n_src = float(cfg['wg_n']) if in_core else 1.0
+    if not in_core and cfg.get('stack') is not None and not (cfg.get('input_gap') or 0) > 0             and y_abs_c < 0.0:
+        # frei konfigurierter Stapel: Medium unter dem Kern am Quellpunkt (wie native
+        # _n_source_2d). Legacy-Pfad unveraendert (dort bisher Luft, s. Bericht).
+        n_src = n_below_core(cfg, y_abs_c)
     ky = 2*np.pi*f0*n_src*np.sin(np.radians(tilt))     # Neigung: Phasenrampe (wie native)
     core_only = bool(cfg.get('source_core_only')) and 'src_y' not in cfg
     if cfg.get('source_core_only') and not core_only:

@@ -73,6 +73,20 @@ def _build_cfg(args, layers):
     n_mu = layers['n_mu'] if layers['n_mu'] is not None else n_at('mucin', lam)
     n_co = layers['n_co'] if layers['n_co'] is not None else cornea_default(lam)
     n_lip = layers['n_lip'] if layers['n_lip'] is not None else n_at('lipid', lam)
+    # Frei konfigurierbarer Stapel (--layers): als reine JSON-Daten in die cfg, die
+    # drei Legacy-Schichten entfallen (None -> jeder vergessene Legacy-Zugriff faellt auf).
+    # Ohne --layers bleibt die cfg exakt wie bisher (identische Geometrie).
+    stack = None
+    if layers.get('stack_custom'):
+        stack = [dict(name=str(L['name']), t_um=float(L['t_um']),
+                      n_re=float(complex(L['n']).real), n_im=float(complex(L['n']).imag),
+                      mat=L.get('mat'))
+                 for L in (layers.get('stack') or [])]
+        t_lip = t_aq = t_mu = None
+        n_lip = n_aq = n_mu = None
+        t_stack = sum(L['t_um'] for L in stack)
+    else:
+        t_stack = t_lip + t_aq + t_mu
 
     lx = args.length_um
     t_wg = layers['t_wg_um']
@@ -85,9 +99,9 @@ def _build_cfg(args, layers):
         tear = args.tear
     elif getattr(args, 'cornea_full', False):       # bis ins Kammerwasser
         from common.physics import cornea_full_depth_um
-        tear = t_lip + t_aq + t_mu + cornea_full_depth_um() + dpml
+        tear = t_stack + cornea_full_depth_um() + dpml
     else:
-        tear = t_lip + t_aq + t_mu + 1.5 + dpml
+        tear = t_stack + 1.5 + dpml
     if args.dim == 2:
         # 2D wie native (fdtd2d_core: AIR_BUFFER 5 um, TEAR_BUFFER 10 um inkl. Absorber).
         # Eine kleinere Domaene laesst die Quellen-Abstrahlung anders im Gebiet stehen
@@ -140,6 +154,8 @@ def _build_cfg(args, layers):
         label = 'cad' + str(args.dim) + 'd_meep_' + cadd['stem']
         extra.update(cad=cadd, src_y=cadd['src_y'], src_z=cadd['src_z'] - (cadd['z0'] + lz/2.0),
                      cad_tilt=cadd['src_tilt'])
+    if stack is not None:
+        extra['stack'] = stack
     return dict(**extra,
         label=label, dim=args.dim, lx=lx, ly=ly, lz=lz, layer_names=layers.get('names'),
         y_bot=y_bot, y_top=y_top, cx=lx/2.0, cy=0.5*(y_top + y_bot),
@@ -198,6 +214,11 @@ def main(argv=None):
           f'resolution {cfg["resolution"]:g} px/um  (f0={cfg["f0"]:.3f})')
     bead_desc = 'none' if not cfg['bead'] else f'd={2*cfg["bead"]["r"]:g}um'
     print(f'  Waveguide : {cfg["t_wg"]:g} um  n={cfg["wg_n"]:.3f}   Bead: {bead_desc}')
+    if cfg.get('stack') is not None:
+        from common.layer_stack import describe
+        print('  Layers    : ' + describe([dict(name=L['name'], t_um=L['t_um'],
+                                                 n=complex(L['n_re'], L['n_im']))
+                                            for L in cfg['stack']]))
     if use_meep_stitch:
         print('  Method    : window stitch (Meep, ' + ('vector equivalence principle' if use_vector
               else 'mode cascade/field') + ', 1 window in RAM)')

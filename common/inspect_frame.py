@@ -39,6 +39,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, LogNorm, SymLogNorm
 from matplotlib.patches import Polygon as MPoly
+try:                                        # als Paket ...
+    from common.layer_stack import stack_from_npz, stack_bounds
+except ImportError:                         # ... oder als Skript aus common/
+    from layer_stack import stack_from_npz, stack_bounds
 
 T_LENS = 250e-6
 R_BEND = 8.3e-3
@@ -88,6 +92,22 @@ def get_detector_polygons():
     return polys
 
 
+def _legacy_layer_lines(ax, xs_out, y_lens_bot, layers):
+    """Alte Dateien: feste Schichten Lipid / Aqueous / Mucin (wie bisher)."""
+    t_lip = layers[0]*1e6
+    t_aq = layers[1]*1e6
+    t_mu = layers[2]*1e6
+    y_lipid_bot_o = y_lens_bot - t_lip
+    y_aq_bot_o = y_lipid_bot_o - t_aq
+    y_mu_bot_o = y_aq_bot_o - t_mu
+    ax.plot(xs_out, y_lipid_bot_o, ':', color='#88AAFF', lw=1.0, alpha=0.85,
+            label=f'Lipid {t_lip:.3f}um (n={N_LIPID})')
+    ax.plot(xs_out, y_aq_bot_o, '--', color='#56C4FF', lw=1.0, alpha=0.85,
+            label=f'Aqueous {t_aq:.2f}um (n={layers[3]})')
+    ax.plot(xs_out, y_mu_bot_o, '--', color='#D88AFF', lw=1.0, alpha=0.85,
+            label=f'Mucin {t_mu:.2f}um (n={N_MUCIN})')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -119,6 +139,8 @@ def main():
         layers = data['layers']
     else:
         layers = np.array([0.030e-6, 3.5e-6, 0.5e-6, 1.336])
+    # Frei konfigurierbarer Schichtstapel (neue Dateien); None = alte 3 Schichten
+    stack = stack_from_npz(data)
     print(f'  {n} Frames')
 
     # Frame auswaehlen
@@ -219,22 +241,18 @@ def main():
     y_mid_o = -sag
     y_lens_top = y_mid_o + T_LENS*1e6/2
     y_lens_bot = y_mid_o - T_LENS*1e6/2
-    t_lip = layers[0]*1e6
-    t_aq = layers[1]*1e6
-    t_mu = layers[2]*1e6
-    y_lipid_bot_o = y_lens_bot - t_lip
-    y_aq_bot_o = y_lipid_bot_o - t_aq
-    y_mu_bot_o = y_aq_bot_o - t_mu
     ax.plot(xs_out, y_lens_top, '-', color='#FFD75E', lw=1.0, alpha=0.8,
             label=f'PMMA top (n={N_PMMA})')
     ax.plot(xs_out, y_lens_bot, '-', color='#FFD75E', lw=1.0, alpha=0.8,
             label=f'PMMA bot')
-    ax.plot(xs_out, y_lipid_bot_o, ':', color='#88AAFF', lw=1.0, alpha=0.85,
-            label=f'Lipid {t_lip:.3f}um (n={N_LIPID})')
-    ax.plot(xs_out, y_aq_bot_o, '--', color='#56C4FF', lw=1.0, alpha=0.85,
-            label=f'Aqueous {t_aq:.2f}um (n={layers[3]})')
-    ax.plot(xs_out, y_mu_bot_o, '--', color='#D88AFF', lw=1.0, alpha=0.85,
-            label=f'Mucin {t_mu:.2f}um (n={N_MUCIN})')
+    if stack is not None:
+        # neue Dateien: eine Linie je Schicht (Unterkante), Farben zyklisch
+        cols = ('#88AAFF', '#56C4FF', '#D88AFF', '#7CFC00', '#FF8C69', '#40E0D0')
+        for k, (nm, _yt, yb, nn) in enumerate(stack_bounds(stack, 0.0)):
+            ax.plot(xs_out, y_lens_bot + yb, '--', color=cols[k % len(cols)], lw=1.0,
+                    alpha=0.85, label=f'{nm} {stack[k]["t_um"]:.3g}um (n={complex(nn).real:.3f})')
+    else:
+        _legacy_layer_lines(ax, xs_out, y_lens_bot, layers)
 
     # Detektoren (falls im Frame)
     polys = get_detector_polygons()

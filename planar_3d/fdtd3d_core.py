@@ -43,6 +43,8 @@ from common.physics import C0, EPS0, MU0, N_AIR, DISPERSION, n_at, cornea_defaul
 from common.physics import core_source_mask, SRC_CORE_RAMP_UM  # noqa: E402
 from common.subpixel import sphere_fraction, blend, cell_average_column  # noqa: E402
 from common.flux import PlaneFluxDFT, pairs_3d, guard_in_plane  # noqa: E402
+from common.layer_stack import (stack_total_um, legacy_stack, legacy_layers_tuple,  # noqa: E402
+                                stack_to_npz, describe as describe_stack)
 BEAD_SUBPIXEL = True     # Bead-Rand per Volumenanteil glaetten (False = harte Maske)
 # Absorption je Schicht (Extinktion kappa, n = n' + i kappa), gesetzt vom Treiber
 # (run_simulation: args.kappa). Schluessel wg, lip, aq, mu, co, bead. Leer = verlustfrei.
@@ -53,11 +55,70 @@ LAM_LOSS = 850e-9        # Wellenlaenge fuer kappa -> sigma (je Lauf gesetzt)
 from planar_3d.boundaries3d import make_boundary_3d, mur_speeds_3d               # noqa: E402
 
 
+def _stack_lossy(stack=None):
+    """Absorption aktiv? KAPPA (Legacy-Schluessel) oder eine Stapelschicht mit Im(n) > 0."""
+    if any(v > 0 for v in (KAPPA or {}).values()):
+        return True
+    return bool(stack) and any(complex(Ly['n']).imag > 0 for Ly in stack)
+
+
+def _stack_banner(stack, bead=None):
+    """Konsolen-Info zum Stapel + Hinweise (ignorierte kappa, Bead ausserhalb Schicht 1)."""
+    if stack is None:
+        return
+    print(f'Layers: {describe_stack(stack)}')
+    _ig = [k for k in ('lip', 'aq', 'mu') if (KAPPA or {}).get(k, 0) > 0]
+    if _ig:
+        print(f'  [Note] layer stack given: kappa for {", ".join(_ig)} ignored '
+              f'(set absorption as complex n in --layers)')
+    if bead and bead.get('d_um', 0) > 0:
+        r = 0.5*float(bead['d_um']); yc = float(bead.get('y_um', -r))
+        if not stack:
+            print(f'  [WARN] Bead d={bead["d_um"]:g}um: no layers below the core -> the bead '
+                  f'sits in the substrate.')
+        elif yc - r < -float(stack[0]['t_um']) - 1e-6 or yc + r > 1e-6:
+            print(f'  [WARN] Bead d={bead["d_um"]:g}um (y {yc - r:.3g}..{yc + r:.3g}um) sticks out '
+                  f'of the first layer "{stack[0]["name"]}" ({stack[0]["t_um"]:g}um below the core).')
+
+
+def _stack_n_below(stack, n_sub):
+    """Reelle Brechzahl direkt unter dem Kern: erste Stapelschicht, sonst Substrat."""
+    return float(complex(stack[0]['n']).real) if stack else float(n_sub)
+
+
+def stack_at_lambda(stack, lam_nm):
+    """Stapel bei einer anderen Wellenlaenge: Schichten mit Material (``mat``) folgen
+    n_at(mat, lambda) (kappa bleibt), numerische n bleiben konstant."""
+    if stack is None:
+        return None
+    out = []
+    for Ly in stack:
+        Ly = dict(Ly)
+        if Ly.get('mat'):
+            n = complex(n_at(Ly['mat'], lam_nm), complex(Ly['n']).imag)
+            Ly.update(n=n, kappa=n.imag)
+        out.append(Ly)
+    return out
+
+
+def _result_stack(stack, t_lip_um, t_aq_um, t_mu_um, n_lip, n_aq, n_mu):
+    """(stack, stack_custom, layers-4-Tupel) fuers Ergebnis-Dict. Legacy: Stapel aus den
+    drei festen Schichten (inkl. KAPPA), layers wie bisher."""
+    if stack is not None:
+        return [dict(Ly) for Ly in stack], True, legacy_layers_tuple(stack)
+    _kp = dict(KAPPA or {})
+    st = legacy_stack(t_lip_um, complex(float(np.real(n_lip)), _kp.get('lip', 0.0)),
+                      t_aq_um, complex(float(np.real(n_aq)), _kp.get('aq', 0.0)),
+                      t_mu_um, complex(float(np.real(n_mu)), _kp.get('mu', 0.0)))
+    return st, False, (t_lip_um*1e-6, t_aq_um*1e-6, t_mu_um*1e-6, n_aq)
+
+
 def build_eps3d(Nx, Ny, Nz, dx_um, y0_um, z0_um,
                 wg_n, t_wg_um, t_lip_um, t_aq_um, t_mu_um,
                 n_lip, n_aq, n_mu, n_co, bead=None,
                 wg_width_um=None, n_clad_side=N_AIR, end_facet_um=0.0,
-                x_wg_start_um=0.0, x0_um=None, x_wg_end_um=None, tensor_patch=None):
+                x_wg_start_um=0.0, x0_um=None, x_wg_end_um=None, tensor_patch=None,
+                stack=None):
     """eps_r auf (Nx,Ny,Nz). Schichtstapel in y, optional Bead-KUGEL.
     bead = dict(x_um=..., d_um=..., n=...) - Kugel-Zentrum bei
     (x_um, -d/2, 0), d.h. aufliegend an der WG-Unterseite wie im 2D-Setup.
@@ -67,7 +128,12 @@ def build_eps3d(Nx, Ny, Nz, dx_um, y0_um, z0_um,
       Endlicher Wert -> echter RECHTECK-KANAL: Kern nur bei |z|<wg_width/2,
       seitlich (in z) von Cladding n_clad_side umgeben -> Fuehrung in y UND z.
       Die Tear-/Cornea-Schichten UNTER dem Kern bleiben ueber die volle Tiefe
-      erhalten (Substrat)."""
+      erhalten (Substrat).
+
+    stack: frei konfigurierbarer Schichtstapel unter dem Kern (common.layer_stack, vom
+      Kern abwaerts, n komplex = absorbierend). None = Legacy Lipid/Aqueous/Mucin aus
+      t_*/n_* (unveraendert). Mit stack werden t_lip/aq/mu, n_lip/aq/mu und
+      KAPPA['lip'/'aq'/'mu'] ignoriert; das Substrat n_co beginnt am Stapelboden."""
     # Globaler x-Modus (Stitch): xs bezieht sich auf globale Koordinaten mit
     # Offset x0_um; der WG-KERN existiert nur im Bereich [x_wg_start, x_wg_end]
     # (endlicher Slab mit Facetten an BEIDEN Enden). Ist x0_um None -> altes
@@ -76,7 +142,7 @@ def build_eps3d(Nx, Ny, Nz, dx_um, y0_um, z0_um,
     xs_g = (float(x0_um) if _global_x else 0.0) + np.arange(Nx)*dx_um
     # Absorption: intern komplexes n (Rueckgabe complex, _split_eps3 trennt eps'/eps'')
     _k = dict(KAPPA or {})
-    lossy = any(v > 0 for v in _k.values())
+    lossy = _stack_lossy(stack)
     _k_co = _k.get('co', 0.0) if lossy else 0.0
     if lossy:
         wg_n = complex(wg_n, _k.get('wg', 0.0)); n_lip = complex(n_lip, _k.get('lip', 0.0))
@@ -88,6 +154,16 @@ def build_eps3d(Nx, Ny, Nz, dx_um, y0_um, z0_um,
     y_lip_bot = -t_lip_um
     y_aq_bot = y_lip_bot - t_aq_um
     y_mu_bot = y_aq_bot - t_mu_um
+    _sb = None
+    if stack is not None:
+        # Schichtgrenzen (um) vom Kern (y=0) abwaerts; Substrat beginnt am Stapelboden
+        _sb, _yt = [], 0.0
+        for Ly in stack:
+            _yb = _yt - float(Ly['t_um'])
+            _n = complex(Ly['n'])
+            _sb.append((_yt, _yb, _n if lossy else _n.real))
+            _yt = _yb
+        y_mu_bot = _yt
 
     def _eps_y(y, core, n_core=None):
         """Schichtstapel eps(y) exakt (um) - mit oder ohne Kern (n_core: Kern-Brechzahl,
@@ -99,10 +175,14 @@ def build_eps3d(Nx, Ny, Nz, dx_um, y0_um, z0_um,
                      else n_co.at_depth(y_mu_bot - y[mc])**2)
         else:
             e[mc] = (float(n_co) + 1j*_k_co)**2 if lossy else n_co**2
-        e[(y >= y_mu_bot) & (y < y_aq_bot)] = n_mu**2
-        e[(y >= y_aq_bot) & (y < y_lip_bot)] = n_aq**2
-        if t_lip_um > 1e-6:
-            e[(y >= y_lip_bot) & (y < 0.0)] = n_lip**2
+        if _sb is not None:                          # frei konfigurierbarer Stapel
+            for _yt_, _yb_, _n_ in _sb:
+                e[(y >= _yb_) & (y < _yt_)] = _n_**2
+        else:                                        # Legacy: Lipid / Aqueous / Mucin
+            e[(y >= y_mu_bot) & (y < y_aq_bot)] = n_mu**2
+            e[(y >= y_aq_bot) & (y < y_lip_bot)] = n_aq**2
+            if t_lip_um > 1e-6:
+                e[(y >= y_lip_bot) & (y < 0.0)] = n_lip**2
         if core:
             e[(y >= 0.0) & (y < t_wg_um)] = (wg_n if n_core is None else n_core)**2
         return e
@@ -622,15 +702,22 @@ def check_resources_3d(Nx, Ny, Nz, n_snapshots, vol_dtype, save_vector,
     return ok, '\n'.join(lines), hints
 
 
-def _resolve_tear_um(tear_um, t_lip_um, t_aq_um, t_mu_um, n_sponge, dx_um, cornea_um=1.5):
+def _resolve_tear_um(tear_um, t_lip_um, t_aq_um, t_mu_um, n_sponge, dx_um, cornea_um=1.5,
+                     stack=None):
     """tear_um (Gebiets-Hoehe unter dem WG) aufloesen. None -> AUTO aus den
     physikalischen Schichten + Cornea-Marge + Absorber-Zone (2D macht das ueber
     einen festen Puffer; 3D leitet es hier ab, damit man es nicht doppelt angeben
     muss). Explizit gesetzt -> unveraendert (zum Trimmen der Cornea-Marge)."""
     if tear_um is not None:
         return float(tear_um)
-    layers = t_lip_um + t_aq_um + t_mu_um
     absorber = n_sponge*dx_um
+    if stack is not None:                          # frei konfigurierbarer Stapel
+        layers = stack_total_um(stack)
+        tot = layers + cornea_um + absorber
+        print(f'  [Auto] tear = {tot:.2f}um (layer stack {layers:.2f} ({len(stack)} layers) + '
+              f'Cornea {cornea_um:g} + Absorber {absorber:.2f}um)')
+        return tot
+    layers = t_lip_um + t_aq_um + t_mu_um
     tot = layers + cornea_um + absorber
     print(f'  [Auto] tear = {tot:.2f}um (Lipid+Aqueous+Mucin {layers:.2f} + '
           f'Cornea {cornea_um:g} + Absorber {absorber:.2f}um)')
@@ -663,14 +750,14 @@ def _poynting_flux_3d(planes, eps_plane=None):
 
 def _eps_planes_3d(cad, ix, dx_um, Ny, Nz, y0_um, z0_um, wg_n, t_wg_um, t_lip_um, t_aq_um,
                    t_mu_um, n_lip, n_aq, n_mu, n_co, bead, wg_width_um, n_clad_side,
-                   end_facet_um, x_wg_start_um):
+                   end_facet_um, x_wg_start_um, stack=None):
     """eps(y,z) der x-Ebene ix (fuer die TM-Gewichtung des Poynting-Flusses)."""
     x0 = (ix - 1)*dx_um
     if cad is not None:
         return np.asarray(cad.eps3d(x0, 3, Ny, Nz)[0][1]).real
     e = build_eps3d(3, Ny, Nz, dx_um, y0_um, z0_um, wg_n, t_wg_um, t_lip_um, t_aq_um, t_mu_um,
                     n_lip, n_aq, n_mu, n_co, bead, wg_width_um=wg_width_um,
-                    n_clad_side=n_clad_side, x_wg_start_um=x_wg_start_um, x0_um=x0)
+                    n_clad_side=n_clad_side, x_wg_start_um=x_wg_start_um, x0_um=x0, stack=stack)
     return np.asarray(e[1]).real
 
 
@@ -688,8 +775,11 @@ def run_3d(label, wg_n, t_wg_um=5.0,
            pec_faces=(), end_facet_um=0.0,
            vcsel_tilt_deg=0.0, vcsel_offset_y_um=0.0, vcsel_offset_z_um=0.0,
            input_gap_um=0.0, polarization='s', allow_large=False, boundary='cpml',
-           cad=None, pulse_cycles=30.0):
+           cad=None, pulse_cycles=30.0, stack=None):
     """Volle 3D-FDTD-Simulation. Rueckgabe: result-dict mit 3D-Volumina.
+
+    stack: frei konfigurierbarer Schichtstapel unter dem Kern (common.layer_stack);
+    None = Legacy Lipid/Aqueous/Mucin aus t_*/n_* (unveraendert).
 
     cad: optional common.cad_geometry.CadRun (dim=3) -> freie CAD-Geometrie: Box,
     eps, Quelle (auf die Eintrittsflaeche) und Detektoren kommen aus der Szene.
@@ -732,7 +822,8 @@ def run_3d(label, wg_n, t_wg_um=5.0,
         tear_um = _resolve_tear_um(tear_um, t_lip_um, t_aq_um, t_mu_um,
                                    (10 if str(boundary or 'cpml').lower() == 'cpml' else
                                     0 if str(boundary or '').lower() == 'mur1' else
-                                    _sponge_cells(n_sponge, sponge_um, dx_um)), dx_um)
+                                    _sponge_cells(n_sponge, sponge_um, dx_um)), dx_um,
+                                   stack=stack)
         ly_um = t_wg_um + air_um + tear_um
         y0_um = -tear_um                  # y bei j=0
         z0_um = -lz_um/2.0                # z bei k=0
@@ -761,13 +852,15 @@ def run_3d(label, wg_n, t_wg_um=5.0,
               f'-> guiding in y AND z')
     else:
         print(f'Waveguide: SLAB (guided in cross-section/y only, unbounded in depth/z)')
+    if cad is None:
+        _stack_banner(stack, bead)
 
     # Ressourcen-Check IMMER (nicht nur bei --check-resources): verhindert den
     # rohen numpy/CuPy-MemoryError beim eps-Aufbau. Bei Nichtpassen harter Abbruch
     # mit konkreten Vorschlaegen, ausser --allow-large erzwingt es.
     ok, report, hints = check_resources_3d(
         Nx, Ny, Nz, n_snapshots, vol_dtype, save_vector, dx_nm, boundary=boundary,
-        bead=bool(bead and BEAD_SUBPIXEL))
+        bead=bool(bead and BEAD_SUBPIXEL), lossy=(None if stack is None else _stack_lossy(stack)))
     if check_resources or not ok:
         print(report)
     if not ok and not allow_large:
@@ -812,7 +905,7 @@ def run_3d(label, wg_n, t_wg_um=5.0,
                           t_lip_um, t_aq_um, t_mu_um, n_lip, n_aq, n_mu, n_co, bead,
                           wg_width_um=wg_width_um, n_clad_side=n_clad_side,
                           end_facet_um=end_facet_um, x_wg_start_um=x_wg_start_um,
-                          tensor_patch=_tp)
+                          tensor_patch=_tp, stack=stack)
     eps, _eim = _split_eps3(eps)                     # Absorption: eps' + eps''
     # eps ist float32 -> nur float32 uebertragen (halber Host-Puffer statt float64),
     # Division dann auf dem Device. Vermeidet grossen Pinned-Transfer.
@@ -863,7 +956,8 @@ def run_3d(label, wg_n, t_wg_um=5.0,
         vcsel_waist_um, vcsel_waist_z_um,
         vcsel_offset_y_um, vcsel_offset_z_um, vcsel_tilt_deg,
         center_y_um=_cy, center_z_um=_cz,
-        n_src_fn=_n_source_fn_3d(cad, x_src_um, Ny, Nz, y0_um, dx_um, wg_n, t_wg_um, n_aq,
+        n_src_fn=_n_source_fn_3d(cad, x_src_um, Ny, Nz, y0_um, dx_um, wg_n, t_wg_um,
+                                 n_aq if stack is None else _stack_n_below(stack, n_co),
                                  x_wg_start_um, _pol),
         pol=_pol, wg_width_um=wg_width_um)
     print(f'Polarization: {_pol}-pol -> source drives '
@@ -1116,7 +1210,8 @@ def run_3d(label, wg_n, t_wg_um=5.0,
             if _pol == 'p':
                 _e = _eps_planes_3d(cad, _ix, dx_um, Ny, Nz, y0_um, z0_um, wg_n, t_wg_um,
                                     t_lip_um, t_aq_um, t_mu_um, n_lip, n_aq, n_mu, n_co, bead,
-                                    wg_width_um, n_clad_side, end_facet_um, x_wg_start_um)
+                                    wg_width_um, n_clad_side, end_facet_um, x_wg_start_um,
+                                    stack=stack)
                 _e = 0.5*(_e[:-1] + _e[1:])           # auf das Ey-Gitter (Ny-1)
             _S.append(_poynting_flux_3d(_pl, _e))
         if abs(_S[0]) > 0:
@@ -1153,6 +1248,7 @@ def run_3d(label, wg_n, t_wg_um=5.0,
             tk = (k/nfr_cw)*(1.0/f0)
             _cw_vol[k] = to_np(xp.real(Ecw*np.exp(1j*_omega*tk)).astype(_vdt_xp))
         _cw_vol.flush()
+    _rs = _result_stack(stack, t_lip_um, t_aq_um, t_mu_um, n_lip, n_aq, n_mu)
     return dict(scenario=label, dim='3D', P_in=P_in, P_out=P_out, p_in_si=_p_si, p_in_unit='W',
                 transmission=Tr, vols_array=_va,
                 vols_ex=_vx, vols_ey=_vy, vector=bool(save_vector),
@@ -1164,7 +1260,7 @@ def run_3d(label, wg_n, t_wg_um=5.0,
                 total_time=total_time, steps_total=steps_total, dt=dt,
                 dx_nm=dx_nm, lx_um=lx_um, ly_um=ly_um, lz_um=lz_um,
                 y0_um=y0_um, z0_um=z0_um, t_wg_um=t_wg_um, wg_n=wg_n,
-                layers=(t_lip_um*1e-6, t_aq_um*1e-6, t_mu_um*1e-6, n_aq),
+                layers=_rs[2], stack=_rs[0], stack_custom=_rs[1],
                 n_lip=n_lip, n_aq=n_aq, n_mu=n_mu, n_co=n_co,
                 lam_nm=lam_nm, source_type=source_type,
                 bead=(bead if bead else {}),
@@ -1188,7 +1284,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
                     wg_width_um=None, n_clad_side=N_AIR,
                     vcsel_tilt_deg=0.0, vcsel_offset_y_um=0.0, vcsel_offset_z_um=0.0,
                     input_gap_um=0.0, polarization='s', boundary='cpml', cad=None,
-                    return_efull=False):
+                    return_efull=False, stack=None):
     """Voller gefuellter CW-Waveguide in 3D per GEBIETS-ZERLEGUNG (Stitch).
     cad: optional CadRun (dim=3) -> freie CAD-Geometrie (Box, eps je Fenster, Quelle,
     Detektoren aus der Szene).
@@ -1221,7 +1317,8 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
         tear_um = _resolve_tear_um(tear_um, t_lip_um, t_aq_um, t_mu_um,
                                    (10 if str(boundary or 'cpml').lower() == 'cpml' else
                                     0 if str(boundary or '').lower() == 'mur1' else
-                                    _sponge_cells(n_sponge, sponge_um, dx_um)), dx_um)
+                                    _sponge_cells(n_sponge, sponge_um, dx_um)), dx_um,
+                                   stack=stack)
         ly_um = t_wg_um + air_um + tear_um
         y0_um = -tear_um; z0_um = -lz_um/2.0
     Ny = int(round(ly_um/dx_um)); Nz = int(round(lz_um/dx_um))
@@ -1260,6 +1357,8 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
     print(f'Domain {lx_um}x{ly_um}x{lz_um}um -> {n_win} windows of {window_w_um}um '
           f'(overlap {O_cells*dx_um:.1f}um), grid/window {Nx_win}x{Ny}x{Nz}')
     print(f'dx={dx_nm}nm ({cpl:.1f} cells/lambda in WG), steps/window {steps_win}, Sponge {n_sp}')
+    if cad is None:
+        _stack_banner(stack, bead)
     if cpl < 8:
         print('!!! WARNING: <8 cells/wavelength in WG - distorted by numerical dispersion.')
     # Groesse des ASSEMBLIERTEN Ergebnisses abschaetzen. Der Stitch spart Speicher
@@ -1278,7 +1377,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
     # nicht in den freien VRAM -> sauber abbrechen statt mitten im Lauf OOM.
     _wcell = (Nx_win + _EXT)*Ny*Nz              # inkl. Absorber-Verlaengerung
     _nvol = 12.5                    # 6 Felder + ce_x/y/z + acc_re/im + acc_I + |E|^2-Temps
-    if any(v > 0 for v in (KAPPA or {}).values()):
+    if _stack_lossy(stack):
         _nvol += 5                  # Absorption: D_x/D_y/D_z (+2 kurzzeitig beim Aufbau)
     _bnd_kind = (boundary or 'cpml').lower()
     # CPML haelt psi NUR in den PML-Randstreifen (_PsiStrip): 4 psi je Achse,
@@ -1369,7 +1468,8 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
         vcsel_waist_um, vcsel_waist_z_um,
         vcsel_offset_y_um, vcsel_offset_z_um, vcsel_tilt_deg,
         center_y_um=_cy, center_z_um=_cz,
-        n_src_fn=_n_source_fn_3d(cad, x_src_um, Ny, Nz, y0_um, dx_um, wg_n, t_wg_um, n_aq,
+        n_src_fn=_n_source_fn_3d(cad, x_src_um, Ny, Nz, y0_um, dx_um, wg_n, t_wg_um,
+                                 n_aq if stack is None else _stack_n_below(stack, n_co),
                                  x_wg_start_um, _pol),
         pol=_pol, wg_width_um=wg_width_um)
     # cosinus-Taper fuer weiche Overlap-Einpraegung (1 -> 0 ueber O_cells)
@@ -1424,7 +1524,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
                               t_lip_um, t_aq_um, t_mu_um, n_lip, n_aq, n_mu, n_co, bead,
                               wg_width_um=wg_width_um, n_clad_side=n_clad_side,
                               x0_um=x0_um, x_wg_start_um=x_wg_start_um,
-                              x_wg_end_um=x_wg_end_um, tensor_patch=_tp)
+                              x_wg_end_um=x_wg_end_um, tensor_patch=_tp, stack=stack)
         eps, _eim = _split_eps3(eps)
         _msp3 = (mur_speeds_3d(eps, dx, LAM)
                  if str(boundary or 'cpml').lower() == 'mur1' else None)
@@ -1592,7 +1692,8 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
             if _pol == 'p':
                 _e = _eps_planes_3d(cad, _ix, dx_um, Ny, Nz, y0_um, z0_um, wg_n, t_wg_um,
                                     t_lip_um, t_aq_um, t_mu_um, n_lip, n_aq, n_mu, n_co, bead,
-                                    wg_width_um, n_clad_side, 0.0, x_wg_start_um)
+                                    wg_width_um, n_clad_side, 0.0, x_wg_start_um,
+                                    stack=stack)
                 _e = 0.5*(_e[:-1] + _e[1:])
             _S.append(_poynting_flux_3d(_pl, _e))
         if abs(_S[0]) > 0:
@@ -1615,6 +1716,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
         pass
     print(f'\n[Result] {label} [3D stitch]: total {total_time:.0f}s  '
           f'Transmission={Tr:.4f} ({tr_def})  [intensity: {Tr_I:.4f}]  ({n_win} windows)')
+    _rs = _result_stack(stack, t_lip_um, t_aq_um, t_mu_um, n_lip, n_aq, n_mu)
     return dict(scenario=label, dim='3D', P_in=P_in, P_out=P_out, p_in_si=_p_si, p_in_unit='W',
                 transmission=Tr, vols_array=vol_buf, vols_ex=None, vols_ey=None,
                 vector=False, _stream_paths=_stream_paths,
@@ -1622,7 +1724,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
                 total_time=total_time, steps_total=steps_win*n_win, dt=dt,
                 dx_nm=dx_nm, lx_um=lx_um, ly_um=ly_um, lz_um=lz_um,
                 y0_um=y0_um, z0_um=z0_um, t_wg_um=t_wg_um, wg_n=wg_n,
-                layers=(t_lip_um*1e-6, t_aq_um*1e-6, t_mu_um*1e-6, n_aq),
+                layers=_rs[2], stack=_rs[0], stack_custom=_rs[1],
                 n_lip=n_lip, n_aq=n_aq, n_mu=n_mu, n_co=n_co,
                 lam_nm=lam_nm, source_type=source_type,
                 bead=(bead if bead else {}),
@@ -1646,7 +1748,7 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
                        wg_width_um=None, n_clad_side=N_AIR, vcsel_tilt_deg=0.0,
                        vcsel_offset_y_um=0.0, vcsel_offset_z_um=0.0, input_gap_um=0.0,
                        polarization='s', boundary='cpml', cad=None, pulse_cycles=30.0,
-                       pulse_tmax_fs=None, t_eval_s=None):
+                       pulse_tmax_fs=None, t_eval_s=None, stack=None):
     """TRANSIENTER 3D-Stitch im ZEITBEREICH (Huygens-Ebenen, TF/SF) - wie
     planar_beads.run_beads_stitched_td, mit allen vier tangentialen Komponenten:
     Fenster w zeichnet an der i0-Ebene des Folgefensters Ey,Ez(n) und Hy,Hz(n+1/2) auf
@@ -1675,7 +1777,8 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
         tear_um = _resolve_tear_um(tear_um, t_lip_um, t_aq_um, t_mu_um,
                                    (10 if str(boundary or 'cpml').lower() == 'cpml' else
                                     0 if str(boundary or '').lower() == 'mur1' else
-                                    _sponge_cells(n_sponge, sponge_um, dx_um)), dx_um)
+                                    _sponge_cells(n_sponge, sponge_um, dx_um)), dx_um,
+                                   stack=stack)
         ly_um = t_wg_um + air_um + tear_um
         y0_um = -tear_um; z0_um = -lz_um/2.0
     Ny = int(round(ly_um/dx_um)); Nz = int(round(lz_um/dx_um))
@@ -1708,6 +1811,8 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
           f'(overlap {O_cells*dx_um:.1f}um), grid/window {Nx_win}x{Ny}x{Nz}, Sponge {n_sp}')
     print(f'Pulse {pulse_cycles:g} periods (s={sp*1e15:.1f} fs), t_max={t_max*1e15:.0f} fs = {N} steps, '
           f'{len(n_j)} frames; Huygens plane per seam {4*Ny*Nz*4*N/1e9:.2f} GB (disk)')
+    if cad is None:
+        _stack_banner(stack, bead)
     _cy = _cz = None
     cad_region = None
     if cad is not None:
@@ -1722,7 +1827,8 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
         n_sp, t_wg_um, y0_um, z0_um, dx_um, dx, LAM, _Nj, _Nk,
         vcsel_waist_um, vcsel_waist_z_um, vcsel_offset_y_um, vcsel_offset_z_um,
         vcsel_tilt_deg, center_y_um=_cy, center_z_um=_cz,
-        n_src_fn=_n_source_fn_3d(cad, x_src_um, Ny, Nz, y0_um, dx_um, wg_n, t_wg_um, n_aq,
+        n_src_fn=_n_source_fn_3d(cad, x_src_um, Ny, Nz, y0_um, dx_um, wg_n, t_wg_um,
+                                 n_aq if stack is None else _stack_n_below(stack, n_co),
                                  x_wg_start_um, _pol),
         pol=_pol, wg_width_um=wg_width_um)
     env_t = np.exp(-((np.arange(N)*dt - tc)/sp)**2)
@@ -1769,7 +1875,7 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
                               t_lip_um, t_aq_um, t_mu_um, n_lip, n_aq, n_mu, n_co, bead,
                               wg_width_um=wg_width_um, n_clad_side=n_clad_side,
                               x0_um=x0_um, x_wg_start_um=x_wg_start_um, x_wg_end_um=x_wg_end_um,
-                              tensor_patch=_tp)
+                              tensor_patch=_tp, stack=stack)
         eps, _eim = _split_eps3(eps)
         inv, _da = _inv_loss(eps, _eim, dt, dx, LAM); del eps, _eim
         ce_x, ce_y, ce_z = _ce_arrays(inv, _tp, dt, dx, dx_um, da=_da)   # versetzt; mit Bead: Tensor-Rand
@@ -1890,13 +1996,14 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
     total_time = time.time() - t_total
     print(f'\n[Result] {label} [3D time-domain stitch]: total {total_time:.0f}s  '
           f'Transmission={Tr:.4f} ({tr_def})  [intensity: {Tr_I:.4f}]  ({n_win} windows)')
+    _rs = _result_stack(stack, t_lip_um, t_aq_um, t_mu_um, n_lip, n_aq, n_mu)
     return dict(scenario=label, dim='3D', P_in=P_in, P_out=P_out, transmission=Tr,
                 vols_array=vol_buf, vols_ex=None, vols_ey=None, vector=False,
                 _stream_paths=_stream_paths, snap_steps=[int(n) for n in n_j],
                 snap_times=[float(n*dt) for n in n_j], Iavg=Iavg, total_time=total_time,
                 steps_total=N, dt=dt, dx_nm=dx_nm, lx_um=lx_um, ly_um=ly_um, lz_um=lz_um,
                 y0_um=y0_um, z0_um=z0_um, t_wg_um=t_wg_um, wg_n=wg_n,
-                layers=(t_lip_um*1e-6, t_aq_um*1e-6, t_mu_um*1e-6, n_aq),
+                layers=_rs[2], stack=_rs[0], stack_custom=_rs[1],
                 n_lip=n_lip, n_aq=n_aq, n_mu=n_mu, n_co=n_co, lam_nm=lam_nm,
                 source_type='pulse', bead=(bead if bead else {}),
                 det_in_um=iin*dx_um, det_out_um=iout*dx_um, x_wg_start_um=x_wg_start_um,
@@ -1926,7 +2033,7 @@ def _drop_stream_files(res):
 
 def run_3d_stitched_pulse(label, wg_n, window_w_um=20.0, slide_um=12.0, pulse_cycles=30.0,
                           pulse_tmax_fs=None, pulse_nfreq=None, pulse_dispersion=True,
-                          disp_map=None, t_eval_s=None, cad=None, **kw):
+                          disp_map=None, t_eval_s=None, cad=None, stack=None, **kw):
     """TRANSIENTER 3D-Stitch per Fourier-Synthese (wie planar_beads.run_beads_stitched_pulse).
 
     Je Frequenz w_k ein CW-run_3d_stitched (Hauptkomponente Ez bzw. Ey); H_k = i E_k;
@@ -1966,6 +2073,9 @@ def run_3d_stitched_pulse(label, wg_n, window_w_um=20.0, slide_um=12.0, pulse_cy
     print(f'Pulse {pulse_cycles:g} periods (s={sp*1e15:.1f} fs), band {lam_k.min():.1f}..{lam_k.max():.1f} nm, '
           f'{len(w_k)} frequencies, t_max={t_max*1e15:.0f} fs, {len(t_j)} frames, '
           f'dispersion {"on" if pulse_dispersion else "off"}')
+    if stack is not None and cad is None:
+        print(f'Layers: {describe_stack(stack)}'
+              + ('  (material layers follow n(lambda_k))' if pulse_dispersion else ''))
     disp_map = dict(disp_map or {}) if pulse_dispersion else {}
     lam_cad0 = cad.lam_nm if cad is not None else None
     fr = None; spec_T = []; r_c = None; E_c = None
@@ -1989,9 +2099,12 @@ def run_3d_stitched_pulse(label, wg_n, window_w_um=20.0, slide_um=12.0, pulse_cy
                 kwk[par] = n_at(mat, lk)
         if cad is not None and pulse_dispersion:
             cad.lam_nm = float(lk)
+        # Stapel: Material-Schichten folgen n(lambda_k), numerische n bleiben fest
+        _stk = stack_at_lambda(stack, float(lk)) if (stack is not None and pulse_dispersion) else stack
         with contextlib.redirect_stdout(io.StringIO()):
             r = run_3d_stitched(f'{label}_f{k}', wg_k, window_w_um=window_w_um, slide_um=slide_um,
-                                lam_nm=float(lk), n_snapshots=1, return_efull=True, cad=cad, **kwk)
+                                lam_nm=float(lk), n_snapshots=1, return_efull=True, cad=cad,
+                                stack=_stk, **kwk)
         E = r.pop('Efull')
         if fr is None:
             pth = os.path.join('results', f'_stream3d_{_safe}_fourier_ez.npy')
@@ -2041,6 +2154,9 @@ def run_3d_stitched_pulse(label, wg_n, window_w_um=20.0, slide_um=12.0, pulse_cy
                spectrum=dict(lam_nm=lam_k, T=np.array(spec_T), weight=np.abs(S_k)/np.abs(S_k).max()),
                pulse=dict(cycles=pulse_cycles, tmax_fs=t_max*1e15, nfreq=len(w_k),
                           dispersion=bool(pulse_dispersion)))
+    if stack is not None:                          # Stapel bei lambda0 (nicht lambda_k_c)
+        res.update(stack=[dict(Ly) for Ly in stack], stack_custom=True,
+                   layers=legacy_layers_tuple(stack))
     print(f'\n[Result] {label} [3D-Fourier-Stitch]: {len(w_k)} frequencies in {res["total_time"]:.0f}s  '
           f'T(weighted)={res["transmission"]:.4f}')
     return res
@@ -2052,6 +2168,31 @@ def save_results_3d(result, out_dir='results', prefix='fdtd3d',
     Slice-NPZ (z-Mittelebene, lesbar mit fdtd_analyzer.py)."""
     os.makedirs(out_dir, exist_ok=True)
     tag = result['scenario']
+    if material_names is None:
+        material_names = ['WG', 'Lipid', 'Aqueous', 'Mucin', 'Cornea']
+    # Kern, 3 Schichten unter dem Kern, Substrat (Namen: material_names); Bead getrennt
+    mat_idx = np.array([result['wg_n'], result['n_lip'],
+                        result['n_aq'], result['n_mu'], result['n_co']],
+                       dtype=np.float64)
+    # Schichtstapel (immer gespeichert): eigener Stapel -> Namen/Indizes variabler Laenge
+    # [Kern, *Schichten, Substrat]; Legacy -> wie bisher, Stapel aus den Legacy-Werten.
+    _stk = result.get('stack')
+    if _stk is None:                              # aeltere Ergebnis-Dicts
+        _l = result.get('layers') or (0.0, 3.5e-6, 0.5e-6, result.get('n_aq', 1.336))
+        _stk = legacy_stack(_l[0]*1e6, result.get('n_lip', 1.48), _l[1]*1e6,
+                            result.get('n_aq', 1.336), _l[2]*1e6, result.get('n_mu', 1.342))
+    _pos = {'lipid': 1, 'aqueous': 2, 'mucin': 3}
+    if result.get('stack_custom'):
+        material_names = ([str(material_names[0])] + [str(Ly['name']) for Ly in _stk]
+                          + [str(material_names[-1])])
+        mat_idx = np.array([float(np.real(result['wg_n']))]
+                           + [complex(Ly['n']).real for Ly in _stk]
+                           + [float(result['n_co'])], dtype=np.float64)
+    elif len(material_names) > 3:
+        _stk = [dict(Ly, name=str(material_names[_pos[Ly['mat']]]))
+                if Ly.get('mat') in _pos else dict(Ly) for Ly in _stk]
+    result['stack'] = _stk
+    _kw_stk = stack_to_npz(_stk)
     # ALLE grossen Feld-Arrays vom PKL-Summary ausschliessen (die kommen ins NPZ).
     # 'cw_vol' fehlte hier -> das volle CW-Volumen wurde ins Pickle geladen -> OOM.
     _big = ('vols', 'vols_array', 'vols_ex', 'vols_ey', 'Iavg', 'cw_vol', 'cad_region')
@@ -2118,10 +2259,6 @@ def save_results_3d(result, out_dir='results', prefix='fdtd3d',
     _bd = bead.get('d_um', 0.0)
     bead_yc = bead.get('y_um', -_bd/2.0)   # Default: aufliegend (Zentrum bei y=-r)
     bead_zc = bead.get('z_um', 0.0)        # Default: Domainmitte z=0
-    # Kern, 3 Schichten unter dem Kern, Substrat (Namen: material_names); Bead getrennt
-    mat_idx = np.array([result['wg_n'], result['n_lip'],
-                        result['n_aq'], result['n_mu'], result['n_co']],
-                       dtype=np.float64)
     # Freie CAD-Geometrie: Koerpertabelle statt Schichtstapel + Regionskarte
     _cad = result.get('cad'); _reg = result.get('cad_region')
     _kw_cad = {}
@@ -2169,7 +2306,7 @@ def save_results_3d(result, out_dir='results', prefix='fdtd3d',
         x_src_um=np.array([result.get('x_src_um', 0.0) or 0.0]),
         lam_nm=np.array([result.get('lam_nm', 850.0)]),
         polarization=np.array([str(result.get('polarization', 's'))]),
-        **kw_cw_fr, **_flags, **_kw_cad,
+        **_kw_stk, **kw_cw_fr, **_flags, **_kw_cad,
         **({'cad_region': np.asarray(_reg)[:, :ez_xy.shape[2], kmid].astype(np.int8)}
            if (_cad and _reg is not None) else {}))
     print(f'  Saved: {fr_path} (z mid-plane, compatible with fdtd_analyzer.py)'
@@ -2203,7 +2340,7 @@ def save_results_3d(result, out_dir='results', prefix='fdtd3d',
         lam_nm=np.array([result.get('lam_nm', 850.0)]),
         # Polarisation: fehlte im Volumen -> Analyzer hielt TM-Volumen fuer TE ('Ez')
         polarization=np.array([str(result.get('polarization', 's'))]),
-        **kw_cw_vol, **_flags)
+        **_kw_stk, **kw_cw_vol, **_flags)
     if _cad:
         vol_kw.update(_kw_cad)
         vol_kw.pop('t_wg_um', None)                 # kein Schichtstapel -> Analyzer nutzt Regionen

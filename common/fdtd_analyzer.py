@@ -35,6 +35,10 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import RadioButtons, Slider, Button
 from matplotlib.colors import SymLogNorm, LogNorm
 from matplotlib.patches import Polygon as MPoly, Circle, Rectangle
+try:                                        # als Paket (common.fdtd_analyzer) ...
+    from common.layer_stack import stack_from_npz, stack_bounds, stack_total_um
+except ImportError:                         # ... oder als Skript aus common/
+    from layer_stack import stack_from_npz, stack_bounds, stack_total_um
 
 # Geometrie-Parameter
 T_LENS = 250e-6
@@ -417,6 +421,7 @@ class Analyzer:
         else:
             self.mat_indices = [N_PMMA, N_LIPID, float(self.layers[3]),
                                 N_MUCIN, N_CORNEA]
+        self._build_stack(d)
         # Flat/Curved Flag (Full-Domain Flattened)
         self.flat_mode = ('flattened' in d.files and
                           float(np.asarray(d['flattened']).flat[0]) > 0)
@@ -448,7 +453,8 @@ class Analyzer:
                                          and self.cad_region.ndim == 2) else None
         # Bead-Info (nur planar_beads-Dateien): Position/Groesse fuer Marker
         # Alte Dateien: Bead stand auf Platz 2 der Namensliste (statt der Lipidschicht).
-        self._legacy_bead_slot = len(self.mat_names) > 1 and self.mat_names[1] == 'Bead'
+        self._legacy_bead_slot = (not self.stack_custom and len(self.mat_names) > 1
+                                  and self.mat_names[1] == 'Bead')
         if 'bead_diameter_um' in d.files:
             self.bead_d = float(np.asarray(d['bead_diameter_um']).flat[0])
         else:
@@ -578,6 +584,101 @@ class Analyzer:
               f'[{_kind}] - computing statistics ...', flush=True)
         self._sync_3d_controls()   # Schnitt-Regler an neue Datei anpassen (2D<->3D)
         gc.collect()
+
+    # ------- Schichtstapel unter dem Kern (frei konfigurierbar) -------
+    # Alte Dateien: feste Slots Lipid/Aqueous/Mucin mit ihren bisherigen Farben/Stilen.
+    _LEGACY_STYLE = {'lipid': ('#88AAFF', ':', 0.18, '.3f'),
+                     'aqueous': ('#56C4FF', '--', 0.15, '.2f'),
+                     'mucin': ('#D88AFF', '--', 0.15, '.2f')}
+    STACK_COLORS = ('#88AAFF', '#56C4FF', '#D88AFF', '#7CFC00', '#40E0D0', '#FFB6C1',
+                    '#F4A460', '#B0C4DE', '#E0E070', '#9AA0FF')
+    SUB_COLOR = '#553030'
+    CORE_COLOR = '#FFD75E'
+
+    def _build_stack(self, d):
+        """self.stack (Schichten vom Kern abwaerts, Dicke > 0), self.stack_report (fuer
+        Integrale/Balken: alte Dateien behalten ALLE drei Slots, auch Dicke 0),
+        Kern-/Substrat-Name und -Index. Neue Dateien: stack_* Schluessel und
+        material_names/indices = [Kern, *Stapel, Substrat]; alte: aus 'layers'."""
+        names = list(self.mat_names)
+        idx = list(self.mat_indices)
+        st = stack_from_npz(d)
+        self.stack_custom = st is not None
+        if st is None:
+            dn = ['PMMA', 'Lipid', 'Aqueous', 'Mucin', 'Cornea']
+            dv = [N_PMMA, N_LIPID, float(self.layers[3]), N_MUCIN, N_CORNEA]
+            names = names + dn[len(names):]
+            idx = idx + dv[len(idx):]
+            t3 = [float(self.layers[k])*1e6 for k in range(3)]
+            slots = ('lipid', 'aqueous', 'mucin')
+            full = [dict(name=str(names[1 + k]), t_um=t3[k], n=complex(float(idx[1 + k]), 0.0),
+                         kappa=0.0, mat=slots[k], slot=slots[k]) for k in range(3)]
+            # Gezeichnet wird wie bisher: Lipid nur ab 1 nm, Aqueous/Mucin IMMER (auch mit
+            # Dicke 0 - alte Plots zeigten dann die Linie + Legende "0.00um").
+            # (legacy_stack wuerde Null-Schichten verwerfen -> andere Legenden.)
+            st = [dict(L) for L in full if not (L['slot'] == 'lipid' and L['t_um'] <= 1e-3)]
+            for L in full + st:
+                c, ls, a, f = self._LEGACY_STYLE[L['slot']]
+                L.update(color=c, ls=ls, alpha=a, tfmt=f)
+            self.stack_report = full
+            self.core_name, self.core_n = str(names[0]), float(idx[0])
+            self.sub_name, self.sub_n = str(names[4]), float(idx[4])
+        else:
+            for k, L in enumerate(st):
+                L.update(slot=None, color=self.STACK_COLORS[k % len(self.STACK_COLORS)],
+                         ls='--', alpha=0.15, tfmt='.3f' if L['t_um'] < 0.1 else '.2f')
+            self.stack_report = st
+            self.core_name = str(names[0]) if names else 'Core'
+            self.core_n = float(np.real(idx[0])) if idx else N_POLYSTYR
+            self.sub_name = str(names[-1]) if len(names) >= 2 else 'Substrate'
+            self.sub_n = float(np.real(idx[-1])) if len(idx) >= 2 else N_CORNEA
+        self.stack = st
+
+    def _stack_bounds(self, y_top=0.0):
+        """[(name, y_top, y_bot, n), ...] der Stapel-Schichten ab y_top (Kern-Unterkante)
+        nach unten."""
+        return stack_bounds(getattr(self, 'stack', []), y_top)
+
+    def _stack_total(self):
+        """Gesamtdicke des Stapels (um); darunter beginnt das Substrat."""
+        return stack_total_um(getattr(self, 'stack', []))
+
+    @staticmethod
+    def _n_str(n):
+        n = complex(n)
+        return f'{n.real:.3f}' + (f'+{n.imag:.1e}i' if n.imag > 0 else '')
+
+    def _layer_label(self, L):
+        """'Name 3.50um (n=1.336)' (Dickenformat wie bisher je Slot)."""
+        return f'{L["name"]} {L["t_um"]:{L.get("tfmt", ".2f")}}um (n={self._n_str(L["n"])})'
+
+    def _clad_n(self, legacy=None):
+        """Brechzahl direkt unter dem Kern (Mantel fuer delta_min/Moden/Evanescent):
+        stack[0] bzw. das Substrat bei leerem Stapel. Alte Dateien: ``legacy``
+        (bisheriger Wert, i.d.R. Aqueous), damit sich nichts aendert."""
+        if not getattr(self, 'stack_custom', False) and legacy is not None:
+            return float(legacy)
+        # Thin films (< 0.1 um, e.g. the 30 nm lipid layer) are much thinner than the
+        # decay length; the evanescent tail lives in the first THICK layer below them.
+        # (Using a 30 nm lipid with n~1.47 would give delta_min ~1.3 um, far too long.)
+        for L in getattr(self, 'stack', []) or []:
+            if L['t_um'] >= 0.1:
+                return float(complex(L['n']).real)
+        return float(getattr(self, 'sub_n', 1.0))
+
+    def _tear_band(self):
+        """(Tiefe um, Beschriftung) des 'Tear'-Bands fuer die Sensor-Metrik: alte
+        Dateien wie bisher die Aqueous-Dicke; neue Dateien der ganze Stapel."""
+        if not getattr(self, 'stack_custom', False):
+            try:
+                t = float(self.layers[1])*1e6
+            except Exception:
+                t = 2.0
+            return max(0.5, min(t, 8.0)), (self.mat_names + [''] * 3)[2]
+        tot = self._stack_total()
+        lab = ' + '.join(L['name'] for L in self.stack) if self.stack else \
+            f'{self.sub_name} (no layers, 0.5um substrate band)'
+        return (tot if tot > 0 else 0.5), lab
 
     # ------- Ansichten: einlaufend (transient) / eingeschwungen (CW) -------
     def _make_illustrative_transient(self, cw_ezs, cw_meta, M=24):
@@ -1450,18 +1551,21 @@ class Analyzer:
             from mpl_toolkits.mplot3d.art3d import Poly3DCollection
         except Exception:
             return
-        t_lip = self.layers[0]*1e6
-        t_aq = self.layers[1]*1e6
-        t_mu = self.layers[2]*1e6
         t_wg = getattr(self, 't_wg_um', 0.0) or 5.0
-        nm = getattr(self, 'mat_names', ['WG', 'Lipid', 'Aqueous', 'Mucin', 'Cornea'])
-        levels = [(t_wg, '#FFD75E', f'{nm[0]}-Top'),
-                  (0.0, '#FFD75E', f'{nm[0]}-Bot')]
-        y = 0.0
-        if t_lip > 1e-3:
-            y -= t_lip; levels.append((y, '#88AAFF', nm[1]))
-        y -= t_aq; levels.append((y, '#56C4FF', f'{nm[2]} ({t_aq:.1f}um)'))
-        y -= t_mu; levels.append((y, '#D88AFF', f'{nm[3]} -> {nm[4]}'))
+        cn, sn = self.core_name, self.sub_name
+        levels = [(t_wg, '#FFD75E', f'{cn}-Top'),
+                  (0.0, '#FFD75E', f'{cn}-Bot' + ('' if self.stack else f' -> {sn}'))]
+        nst = len(self.stack)
+        for k, ((nm, _yt, yb, _n), L) in enumerate(zip(self._stack_bounds(0.0), self.stack)):
+            if k == nst - 1:
+                lab = f'{nm} -> {sn}'
+            elif L.get('slot') == 'lipid':
+                lab = nm
+            elif L.get('slot') == 'aqueous':
+                lab = f'{nm} ({L["t_um"]:.1f}um)'
+            else:
+                lab = f'{nm} ({L["t_um"]:.2g}um)'
+            levels.append((yb, L['color'], lab))
         for yv, col, lab in levels:
             if (y_lo is not None and yv < y_lo - 1e-9) or (y_hi is not None and yv > y_hi + 1e-9):
                 continue                        # ausserhalb des dargestellten Bereichs
@@ -1675,19 +1779,12 @@ class Analyzer:
             return rgba, frac
 
         def _layer_levels():
-            t_lip = self.layers[0]*1e6
-            t_aq = self.layers[1]*1e6
-            t_mu = self.layers[2]*1e6
-            nm = getattr(self, 'mat_names', ['WG', 'Lipid', 'Aqueous', 'Mucin', 'Cornea'])
-            lv = [(t_wg, '#FFD75E', f'{nm[0]} top'), (0.0, '#FFD75E', f'{nm[0]} bottom')]
-            y = 0.0
-            if t_lip > 1e-3:
-                y -= t_lip
-                lv.append((y, '#88AAFF', nm[1]))
-            y -= t_aq
-            lv.append((y, '#56C4FF', nm[2]))
-            y -= t_mu
-            lv.append((y, '#D88AFF', f'{nm[3]} -> {nm[4]}'))
+            cn, sn = self.core_name, self.sub_name
+            lv = [(t_wg, '#FFD75E', f'{cn} top'),
+                  (0.0, '#FFD75E', f'{cn} bottom' + ('' if self.stack else f' -> {sn}'))]
+            nst = len(self.stack)
+            for k, ((nm, _yt, yb, _n), L) in enumerate(zip(self._stack_bounds(0.0), self.stack)):
+                lv.append((yb, L['color'], f'{nm} -> {sn}' if k == nst - 1 else nm))
             return lv
 
         def _draw2d(sub, rg, lvl, vmax, signed):
@@ -2417,13 +2514,10 @@ class Analyzer:
             Nv = shape[1]
             yc = y0 + (np.arange(Nv) + 0.5)*(y1 - y0)/Nv
             t_wg = self._t_wg_eff()
-            t_lip, t_aq, t_mu = (float(self.layers[k])*1e6 for k in range(3))
-            n = [float(v) for v in self.mat_indices[:5]]
-            nv = np.full(Nv, n[4])                                    # Substrat
-            nv[yc >= -(t_lip + t_aq + t_mu)] = n[3]
-            nv[yc >= -(t_lip + t_aq)] = n[2]
-            nv[yc >= -t_lip] = n[1]
-            nv[yc >= 0.0] = n[0]
+            nv = np.full(Nv, float(self.sub_n))                      # Substrat
+            for _nm, _yt, yb, n_ in reversed(self._stack_bounds(0.0)):
+                nv[yc >= yb] = complex(n_).real
+            nv[yc >= 0.0] = float(self.core_n)
             nv[yc > t_wg] = 1.0                                       # Luft
             return np.broadcast_to(nv**2, shape)
         except Exception:
@@ -2505,7 +2599,8 @@ class Analyzer:
         lam/(2 pi sqrt(n_core^2 - n_clad^2)) (grazing incidence)."""
         try:
             n_hi = float(self.mat_indices[0])
-            n_lo = float(self.mat_indices[2])
+            # Medium direkt unter dem Kern: stack[0] (bzw. Substrat); alte Dateien Aqueous
+            n_lo = self._clad_n(legacy=self.mat_indices[2] if len(self.mat_indices) > 2 else None)
             if getattr(self, 'is_cad', False):           # Kern gegen das Medium darunter
                 n_hi = self._cad_n(self.cad_core)
                 _b = self._cad_below(getattr(self, 'x_um', 0.0)) if hasattr(self, 'ezs') else None
@@ -2686,7 +2781,7 @@ class Analyzer:
         neff = 2*np.pi*freq/k0
         power = (np.abs(F)**2).sum(axis=1)
         n_core = float(self.mat_indices[0])
-        n_aq = float(self.mat_indices[2])
+        n_aq = self._clad_n(legacy=self.mat_indices[2] if len(self.mat_indices) > 2 else None)
         lo = max(1.0, n_aq) + 0.002
         hi = n_core
         guided = find_neff_peaks(neff, power, lo, hi)
@@ -2735,12 +2830,8 @@ class Analyzer:
         eingeschwungenen Phasensatz (knotenfrei); sonst die letzten Transient-Frames."""
         x0, x1, y0, y1 = self.meta[0, :4]
         t_wg = self._t_wg_eff()
-        # Tear-Band aus dem Schichtstapel (Aqueous unter dem Kern), nicht hartkodiert.
-        try:
-            t_aq_um = float(self.layers[1])*1e6
-        except Exception:
-            t_aq_um = 2.0
-        tear_depth = max(0.5, min(t_aq_um, 8.0))
+        # Tear-Band aus dem Schichtstapel (alte Dateien: Aqueous; neue: ganzer Stapel).
+        tear_depth, tear_lab = self._tear_band()
 
         # Datenquelle: eingeschwungener Phasensatz (zeitgemittelt) bevorzugt.
         ps = self._cw_phase_stack()
@@ -2871,7 +2962,7 @@ class Analyzer:
             '',
             f'Detector x = {xd:6.2f} um     Input x = {xin:6.2f} um   (10% of length each)',
             (_cad_lbl if _cad_lbl is not None else
-             f'Core y = 0..{t_wg:g} um   Tear y = -{tear_depth:g}..0 um ({(self.mat_names+[""]*3)[2]})   '
+             f'Core y = 0..{t_wg:g} um   Tear y = -{tear_depth:g}..0 um ({tear_lab})   '
              f'Air y = {t_wg:g}..{y1:.1f} um'),
             '',
             f'I_guided (core,  detector) :  {P_guid:.3e}',
@@ -2932,16 +3023,10 @@ class Analyzer:
         if getattr(self, 'is_cad', False):
             self._cad_contours(ax)
             return
-        t_lip = self.layers[0]*1e6
-        t_aq = self.layers[1]*1e6
-        t_mu = self.layers[2]*1e6
-        # Material-Namen (aus NPZ wenn vorhanden, sonst Defaults)
-        n_lens, n_lip, n_aq, n_mu, n_cor = (
-            self.mat_names[0], self.mat_names[1], self.mat_names[2],
-            self.mat_names[3], self.mat_names[4])
-        i_lens, i_lip, i_aq, i_mu, i_cor = (
-            self.mat_indices[0], self.mat_indices[1], self.mat_indices[2],
-            self.mat_indices[3], self.mat_indices[4])
+        # Material-Namen/Indizes aus dem Schichtstapel (Kern, Schichten, Substrat)
+        n_lens, i_lens = self.core_name, self.core_n
+        n_cor, i_cor = self.sub_name, self.sub_n
+        t_tot = self._stack_total()
         if self.planar or self.flat_mode:
             # Planar/Flattened: gerade WG bei y=0..PS_TOP (planar) bzw. y_rel=+-T/2 (flat)
             if self.planar:
@@ -2951,9 +3036,7 @@ class Analyzer:
                 # Flattened Lens: y_rel=0 = Linsenmitte, body bei +-T_LENS/2
                 y_wg_top = T_LENS*1e6/2
                 y_wg_bot = -T_LENS*1e6/2
-            y_lipid_bot = y_wg_bot - t_lip
-            y_aq_bot = y_lipid_bot - t_aq
-            y_mu_bot = y_aq_bot - t_mu
+            y_mu_bot = y_wg_bot - t_tot             # Stapel-Unterkante = Substrat-Oberkante
             # WG-Kern NUR zwischen den Facetten zeichnen (nicht ueber die ganze
             # Breite) + vertikale Grenzlinien an Eintritt und Ende, wenn die
             # Facetten-x bekannt sind (2D-Beads). Substrat-Linien laufen weiter,
@@ -2975,14 +3058,12 @@ class Analyzer:
                 ax.axhline(y_wg_top, color='#FFD75E', lw=1.0, alpha=0.9,
                            label=f'{n_lens} (n={i_lens:.3f})')
                 ax.axhline(y_wg_bot, color='#FFD75E', lw=1.0, alpha=0.9)
-            if t_lip > 1e-3:
-                ax.axhline(y_lipid_bot, color='#88AAFF', ls=':', lw=0.9,
-                           label=f'{n_lip} {t_lip:.3f}um (n={i_lip:.3f})')
-            ax.axhline(y_aq_bot, color='#56C4FF', ls='--', lw=0.9,
-                       label=f'{n_aq} {t_aq:.2f}um (n={i_aq:.3f})')
-            ax.axhline(y_mu_bot, color='#D88AFF', ls='--', lw=0.9,
-                       label=f'{n_mu} {t_mu:.2f}um (n={i_mu:.3f})')
-            ax.axhspan(y_start, y_mu_bot, color='#553030', alpha=0.18,
+            for (_nm, _yt, yb, _n), L in zip(self._stack_bounds(y_wg_bot), self.stack):
+                if L.get('slot') == 'lipid' and L['t_um'] <= 1e-3:
+                    continue                        # wie bisher: Lipid ~0 nicht zeichnen
+                ax.axhline(yb, color=L['color'], ls=L['ls'], lw=0.9,
+                           label=self._layer_label(L))
+            ax.axhspan(y_start, y_mu_bot, color=self.SUB_COLOR, alpha=0.18,
                        label=f'{n_cor} (n={i_cor:.3f})')
         else:
             # Lens: gekruemmte Geometrie
@@ -2992,19 +3073,16 @@ class Analyzer:
             y_mid_o = -sag
             y_lens_top = y_mid_o + T_LENS*1e6/2
             y_lens_bot = y_mid_o - T_LENS*1e6/2
-            y_lipid_bot = y_lens_bot - t_lip
-            y_aq_bot = y_lipid_bot - t_aq
-            y_mu_bot = y_aq_bot - t_mu
+            y_mu_bot = y_lens_bot - t_tot
             ax.plot(xs_out, y_lens_top, '-', color='#FFD75E', lw=1.0, alpha=0.9,
                     label=f'{n_lens} (n={i_lens:.3f})')
             ax.plot(xs_out, y_lens_bot, '-', color='#FFD75E', lw=1.0, alpha=0.9)
-            ax.plot(xs_out, y_lipid_bot, ':', color='#88AAFF', lw=0.9,
-                    label=f'{n_lip} {t_lip:.3f}um (n={i_lip:.3f})')
-            ax.plot(xs_out, y_aq_bot, '--', color='#56C4FF', lw=0.9,
-                    label=f'{n_aq} {t_aq:.2f}um (n={i_aq:.3f})')
-            ax.plot(xs_out, y_mu_bot, '--', color='#D88AFF', lw=0.9,
-                    label=f'{n_mu} {t_mu:.2f}um (n={i_mu:.3f})')
-            ax.fill_between(xs_out, y_start, y_mu_bot, color='#553030', alpha=0.18,
+            # alte Linsen-Dateien: alle drei Slots (wie bisher, auch Lipid 0)
+            for (_nm, _yt, yb, _n), L in zip(stack_bounds(self.stack_report, 0.0),
+                                             self.stack_report):
+                ax.plot(xs_out, y_lens_bot + yb, L['ls'], color=L['color'], lw=0.9,
+                        label=self._layer_label(L))
+            ax.fill_between(xs_out, y_start, y_mu_bot, color=self.SUB_COLOR, alpha=0.18,
                             label=f'{n_cor} (n={i_cor:.3f})')
 
         # Einkoppelabstand + WG-Eintrittsfacette (x liegt auf der Horizontalen).
@@ -3069,18 +3147,16 @@ class Analyzer:
             return [(a[1], self._cad_color(b[2]),
                      f'{self._cad_name(a[2])} | {self._cad_name(b[2])}')
                     for a, b in zip(segs[:-1], segs[1:])]
-        t_lip = self.layers[0]*1e6; t_aq = self.layers[1]*1e6; t_mu = self.layers[2]*1e6
-        nm = self.mat_names; ix = self.mat_indices
-        marks = [(y_top, '#FFD75E', f'{nm[0]}-Top (n={ix[0]:.3f})'),
-                 (y_bot, '#FFD75E', f'{nm[0]} bottom (y=0)')]
-        y = y_bot
-        if t_lip > 1e-3:
-            y -= t_lip
-            marks.append((y, '#88AAFF', f'{nm[1]} {t_lip:.3f}um (n={ix[1]:.3f})'))
-        y -= t_aq
-        marks.append((y, '#56C4FF', f'{nm[2]} {t_aq:.2f}um (n={ix[2]:.3f})'))
-        y -= t_mu
-        marks.append((y, '#D88AFF', f'{nm[3]} {t_mu:.2f}um (n={ix[3]:.3f}) -> {nm[4]} below'))
+        cn, sn = self.core_name, self.sub_name
+        marks = [(y_top, '#FFD75E', f'{cn}-Top (n={self.core_n:.3f})'),
+                 (y_bot, '#FFD75E', f'{cn} bottom (y=0)'
+                  + ('' if self.stack else f' -> {sn} (n={self.sub_n:.3f}) below'))]
+        nst = len(self.stack)
+        for k, ((_nm, _yt, yb, _n), L) in enumerate(zip(self._stack_bounds(y_bot), self.stack)):
+            if L.get('slot') == 'lipid' and L['t_um'] <= 1e-3:
+                continue                            # wie bisher: Lipid ~0 ueberspringen
+            marks.append((yb, L['color'], self._layer_label(L)
+                          + (f' -> {sn} below' if k == nst - 1 else '')))
         return marks
 
     def _draw_intavg(self):
@@ -3138,14 +3214,14 @@ class Analyzer:
         if getattr(self, 'is3d', False) and getattr(self, 'is_bead', False) and self.bead_d > 0:
             self._bead_cut(self.ax)          # Bead-Schnittkreis in JEDER Ebene
         self.ax.set_xlim(x_start, x_end)
-        t_lip = self.layers[0]*1e6; t_aq = self.layers[1]*1e6; t_mu = self.layers[2]*1e6
+        t_tot = self._stack_total()
         if getattr(self, 'is3d', False):
             self.ax.set_ylim(y_start, y_end)
             xl, yl = self.PLANE_LABELS[self.plane]
             self.ax.set_xlabel(xl, color='#cccccc', fontsize=9)
             self.ax.set_ylabel(yl, color='#cccccc', fontsize=9)
         elif self.planar and not getattr(self, 'is_cad', False):
-            self.ax.set_ylim(max(y_start, -(t_lip+t_aq+t_mu)-2), min(y_end, self.wg_top_um+2))
+            self.ax.set_ylim(max(y_start, -t_tot-2), min(y_end, self.wg_top_um+2))
         self._style_axes()
         _pl = f' | plane {self.plane}' if getattr(self, 'is3d', False) else ''
         _src = ('solver time average, exact' if getattr(self, '_intavg_src', '') == 'solver'
@@ -3217,14 +3293,12 @@ class Analyzer:
         self.ax.axvline(self.x_um, color='#FFFFFF', lw=0.5, ls=':', alpha=0.5)
         self.ax.set_xlim(x_start, x_end)
         # Auto-Zoom y-Range auf interessante Region (WG/Linse + Tear-Stack)
-        t_lip = self.layers[0]*1e6
-        t_aq = self.layers[1]*1e6
-        t_mu = self.layers[2]*1e6
+        t_tot = self._stack_total()
         if getattr(self, 'is3d', False) or getattr(self, 'is_cad', False):
             # 3D-Schnitt bzw. CAD: volle Extents zeigen (Achsen je nach Ebene, s.u.)
             self.ax.set_ylim(y_start, y_end)
         elif self.planar:
-            y_tear_bot = -(t_lip + t_aq + t_mu) - 2
+            y_tear_bot = -t_tot - 2
             y_top_view = self.wg_top_um + 2
             self.ax.set_ylim(max(y_start, y_tear_bot), min(y_end, y_top_view))
         else:
@@ -3238,7 +3312,7 @@ class Analyzer:
             y_mid_top = float(y_mid_sample_um.max())
             y_mid_bot = float(y_mid_sample_um.min())
             half_thick = T_LENS*1e6/2
-            tear_total = t_lip + t_aq + t_mu
+            tear_total = t_tot
             # Zeige: hoechster Lens-Top + 30um Luft  bis  tiefster Cornea + 50um
             zoom_top = y_mid_top + half_thick + 30
             zoom_bot = y_mid_bot - half_thick - tear_total - 50
@@ -3372,9 +3446,7 @@ class Analyzer:
         y_um = np.linspace(y_start, y_end, Ny)
         # Auto-Zoom: y-Range auf WG-Region + Tear-Region
         y_lens_bot, y_lens_top = self._wg_y_bounds(self.x_um)
-        y_lipid_bot = y_lens_bot - self.layers[0]*1e6
-        y_aq_bot = y_lipid_bot - self.layers[1]*1e6
-        y_mu_bot = y_aq_bot - self.layers[2]*1e6
+        y_mu_bot = y_lens_bot - self._stack_total()     # Stapel-Unterkante
         # Bei planar Demo enger zoomen (Schichten sind nur ~5 um) als bei Lens
         if self.planar:
             zoom_top = y_lens_top + 2
@@ -3467,8 +3539,10 @@ class Analyzer:
             # CAD: Bereich unter dem Kern = Region direkt darunter (z.B. der Film)
             y_aq_bot_z = y_mu_bot_z = (_cad_b[1] if _cad_b else y_lens_bot_um - 5.0)
         else:
-            y_aq_bot_z = y_lens_bot_um - self.layers[0]*1e6 - self.layers[1]*1e6
-            y_mu_bot_z = y_aq_bot_z - self.layers[2]*1e6
+            _tt = self._stack_total()
+            if _tt <= 0:                    # kein Stapel: Substrat direkt unter dem Kern
+                _tt = max(1.0, 3.0*getattr(self, '_delta_min_um', 0.3))
+            y_mu_bot_z = y_lens_bot_um - _tt
         if self.planar:
             # WG-Top an der tatsaechlichen Kerndicke (nicht fest 5um)
             _top = y_lens_top_um if getattr(self, 'is_cad', False) else self.wg_top_um
@@ -3552,7 +3626,7 @@ class Analyzer:
         # z.B. PMMA/532nm falsches d_min und falscher Winkel).
         _mi = getattr(self, 'mat_indices', None)
         n_high = float(_mi[0]) if _mi else (N_POLYSTYR if self.planar else N_PMMA)
-        n_low = float(self.layers[3])   # n_aqueous
+        n_low = self._clad_n(legacy=self.layers[3])   # Medium unter dem Kern (alt: n_aqueous)
         if getattr(self, 'is_cad', False):              # Kern gegen die Region darunter
             n_high = self._cad_n(self.cad_core)
             n_low = self._cad_n(_cad_b[0]) if _cad_b else 1.0
@@ -3655,13 +3729,7 @@ class Analyzer:
             intensity = _iv[ix, :]
         y_um = np.linspace(y_start, y_end, Ny)
         # Schicht-Grenzen
-        t_lip = self.layers[0]*1e6
-        t_aq = self.layers[1]*1e6
-        t_mu = self.layers[2]*1e6
         y_wg_bot, y_wg_top = self._wg_y_bounds(self.x_um)
-        y_lipid_bot = y_wg_bot - t_lip
-        y_aq_bot = y_lipid_bot - t_aq
-        y_mu_bot = y_aq_bot - t_mu
         if not np.any(np.asarray(intensity) > 0):       # z.B. erstes Bild vor dem Puls
             self.ax.text(0.5, 0.5, f'No field at x={self.x_um:.1f} um in this image\n'
                          f'(move the frame slider or use "Steady state")', color='#FFAA55',
@@ -3695,8 +3763,7 @@ class Analyzer:
                              label=self._cad_name(reg))
             self.ax.set_xlim(y_start, y_end)
         else:
-            self._resonance_layers(y_um, intensity, y_start, y_wg_bot, y_wg_top,
-                                   y_lipid_bot, y_aq_bot, y_mu_bot, t_lip, t_aq, t_mu)
+            self._resonance_layers(y_um, intensity, y_start, y_wg_bot, y_wg_top)
         self.ax.set_ylim(ymin_y, ymax_y)
         from matplotlib.ticker import LogLocator, NullFormatter
         self.ax.yaxis.set_major_locator(LogLocator(base=10, numticks=15))
@@ -3715,38 +3782,29 @@ class Analyzer:
             t.set_color('#dddddd')
         self._style_axes()
 
-    def _resonance_layers(self, y_um, intensity, y_start, y_wg_bot, y_wg_top,
-                          y_lipid_bot, y_aq_bot, y_mu_bot, t_lip, t_aq, t_mu):
-        """Schichtstapel: Bereiche faerben, Integral je Schicht, Zoom."""
-        self.ax.axvspan(y_wg_bot, y_wg_top, color='#FFD75E', alpha=0.10,
-                        label=f'{self.mat_names[0]}')
-        if t_lip > 0:
-            self.ax.axvspan(y_lipid_bot, y_wg_bot, color='#88AAFF', alpha=0.18,
-                            label=f'{self.mat_names[1]}')
-        if t_aq > 0:
-            self.ax.axvspan(y_aq_bot, y_lipid_bot, color='#56C4FF', alpha=0.15,
-                            label=f'{self.mat_names[2]}')
-        if t_mu > 0:
-            self.ax.axvspan(y_mu_bot, y_aq_bot, color='#D88AFF', alpha=0.15,
-                            label=f'{self.mat_names[3]}')
-        self.ax.axvspan(y_start, y_mu_bot, color='#553030', alpha=0.18,
-                        label=f'{self.mat_names[4]}')
+    def _resonance_layers(self, y_um, intensity, y_start, y_wg_bot, y_wg_top):
+        """Schichtstapel: Bereiche faerben (ein Band je Schicht), Integral je Schicht, Zoom."""
+        self.ax.axvspan(y_wg_bot, y_wg_top, color=self.CORE_COLOR, alpha=0.10,
+                        label=f'{self.core_name}')
+        rep = self.stack_report
+        bnds = stack_bounds(rep, y_wg_bot)
+        y_mu_bot = y_wg_bot - stack_total_um(rep)          # Substrat-Oberkante
+        for (nm, yt, yb, _n), L in zip(bnds, rep):
+            if L['t_um'] > 0:
+                self.ax.axvspan(yb, yt, color=L['color'], alpha=L.get('alpha', 0.15),
+                                label=f'{nm}')
+        self.ax.axvspan(y_start, y_mu_bot, color=self.SUB_COLOR, alpha=0.18,
+                        label=f'{self.sub_name}')
         # Schicht-integrierte Intensitaeten als Annotation
         dy = float(y_um[1] - y_um[0])
         def integ(y_lo, y_hi):
             m = (y_um >= y_lo) & (y_um <= y_hi)
             return float(intensity[m].sum())*dy if m.any() else 0.0
-        I_lens = integ(y_wg_bot, y_wg_top)
-        I_lip = integ(y_lipid_bot, y_wg_bot) if t_lip > 0 else 0
-        I_aq = integ(y_aq_bot, y_lipid_bot) if t_aq > 0 else 0
-        I_mu = integ(y_mu_bot, y_aq_bot) if t_mu > 0 else 0
-        I_cor = integ(y_start, y_mu_bot)
+        rows = [(self.core_name, integ(y_wg_bot, y_wg_top))]
+        rows += [(nm, integ(yb, yt) if L['t_um'] > 0 else 0) for (nm, yt, yb, _n), L in zip(bnds, rep)]
+        rows.append((self.sub_name, integ(y_start, y_mu_bot)))
         annot = (f'Integrated |{self.prim}|^2 per layer:\n'
-                 f'  {self.mat_names[0]}: {I_lens:.2e}\n'
-                 f'  {self.mat_names[1]}: {I_lip:.2e}\n'
-                 f'  {self.mat_names[2]}: {I_aq:.2e}\n'
-                 f'  {self.mat_names[3]}: {I_mu:.2e}\n'
-                 f'  {self.mat_names[4]}: {I_cor:.2e}')
+                 + '\n'.join(f'  {nm}: {v:.2e}' for nm, v in rows))
         self.ax.text(0.02, 0.98, annot, color='#dddddd', va='top', ha='left',
                      transform=self.ax.transAxes, fontsize=8,
                      bbox=dict(facecolor='#1a1a1a', edgecolor='#444', alpha=0.85))
@@ -3757,9 +3815,10 @@ class Analyzer:
 
     def _draw_layer_power(self):
         """Bar-Chart: integrierte |Ez|^2 pro Schicht."""
-        layer_names = self.mat_names if hasattr(self, 'mat_names') else \
-                      ['Lens', 'Lipid', 'Aqueous', 'Mucin', 'Cornea']
-        layer_colors = ['#FFD75E', '#88AAFF', '#56C4FF', '#D88AFF', '#553030']
+        # Balken: Kern, je Stapel-Schicht einer (alte Dateien: alle 3 Slots), Substrat
+        rep = self.stack_report
+        layer_names = [self.core_name] + [L['name'] for L in rep] + [self.sub_name]
+        layer_colors = [self.CORE_COLOR] + [L['color'] for L in rep] + [self.SUB_COLOR]
         i = -1
         x_start, x_end, y_start, y_end = self.meta[i, :4]
         Nx, Ny = self.ezs[i].shape
@@ -3794,25 +3853,20 @@ class Analyzer:
             self.ax.grid(True, alpha=0.25, axis='y', which='both')
             self._style_axes()
             return
-        t_lip = self.layers[0]*1e6
-        t_aq = self.layers[1]*1e6
-        t_mu = self.layers[2]*1e6
         y_wg_bot, y_wg_top = self._wg_y_bounds((x_start + x_end)/2)
-        y_lipid_bot = y_wg_bot - t_lip
-        y_aq_bot = y_lipid_bot - t_aq
-        y_mu_bot = y_aq_bot - t_mu
+        bnds = stack_bounds(rep, y_wg_bot)
+        y_mu_bot = y_wg_bot - stack_total_um(rep)          # Substrat-Oberkante
         def integ_layer(y_lo, y_hi):
             m = (y_um >= y_lo) & (y_um <= y_hi)
             if not m.any():
                 return 0.0
             return float(intensity[:, m].sum())
         I_lens = integ_layer(y_wg_bot, y_wg_top)
-        I_lip = integ_layer(y_lipid_bot, y_wg_bot) if t_lip > 0 else 0
+        I_lay = [integ_layer(yb, yt) if L['t_um'] > 0 else 0
+                 for (_nm, yt, yb, _n), L in zip(bnds, rep)]
         # Bead: LOKALES Integral ueber die Bead-Scheibe (x=Bead_x +- r, y 0..-d).
         # Alte Dateien (Slot 1 hiess 'Bead'): ersetzt den Slot; neue Dateien:
         # eigener zusaetzlicher Balken, die Schichtnamen bleiben unveraendert.
-        layer_names = list(layer_names)[:5]
-        layer_colors = list(layer_colors)
         I_bead = None
         if getattr(self, 'is_bead', False) and self.bead_d > 0:
             _r = self.bead_d/2.0
@@ -3821,12 +3875,10 @@ class Analyzer:
             _yc = getattr(self, 'bead_y', -_r)          # Bead-Mitte (auch verschoben, --bead-y-um)
             _ym = (y_um >= _yc - _r) & (y_um <= _yc + _r)
             I_bead = float(intensity[np.ix_(_xm, _ym)].sum()) if (_xm.any() and _ym.any()) else 0.0
-            if getattr(self, '_legacy_bead_slot', False):
-                I_lip, I_bead = I_bead, None
-        I_aq = integ_layer(y_aq_bot, y_lipid_bot) if t_aq > 0 else 0
-        I_mu = integ_layer(y_mu_bot, y_aq_bot) if t_mu > 0 else 0
+            if getattr(self, '_legacy_bead_slot', False) and I_lay:
+                I_lay[0], I_bead = I_bead, None
         I_cor = integ_layer(y_start, y_mu_bot)
-        I_all = [I_lens, I_lip, I_aq, I_mu, I_cor]
+        I_all = [I_lens] + I_lay + [I_cor]
         if I_bead is not None:
             I_all.append(I_bead)
             _bm = getattr(self, 'bead_material', '')
@@ -3846,7 +3898,11 @@ class Analyzer:
         _mx = float(powers_safe.max())
         self.ax.set_ylim(_mx*1e-7, _mx*30)
         self.ax.set_xticks(x_pos)
-        self.ax.set_xticklabels(layer_names, color='#cccccc')
+        if len(layer_names) > 6:             # viele Schichten: schraeg + kleiner
+            self.ax.set_xticklabels(layer_names, color='#cccccc', rotation=12, ha='right',
+                                    fontsize=8)
+        else:
+            self.ax.set_xticklabels(layer_names, color='#cccccc')
         self.ax.set_ylabel('Integrated <|E|^2> (time avg., log)' if _lp_avg else
                            f'Integrated |{self._disp_comp()}|^2 (log)',
                            color='#cccccc')

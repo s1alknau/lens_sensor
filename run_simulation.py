@@ -218,6 +218,34 @@ def _resolve_layers(args):
     base['n_co'] = args.n_cornea
     base['n_lip'] = args.n_lipid
     base['names'] = _layer_names(args)
+    # Freely configurable stack (common/layer_stack.py). 'stack' is ALWAYS present:
+    # with --layers the user's layers (stack_custom=True, solvers take the general path),
+    # otherwise the three legacy layers with their resolved values (stack_custom=False,
+    # solvers keep the legacy path -> identical results; stack only for saving/analyzer).
+    from common.layer_stack import parse_layer_stack, legacy_stack
+    spec = getattr(args, 'layers', None)
+    if spec is not None:
+        if args.geometry != 'planar':
+            raise SystemExit('--layers is only available for --geometry planar')
+        _given = [o for o in ('t_lipid', 't_aqueous', 't_mucin', 'n_lipid', 'n_aqueous', 'n_mucin',
+                              'kappa_lipid', 'kappa_aqueous', 'kappa_mucin')
+                  if getattr(args, o, None) is not None]
+        if _given:
+            print(f'  [WARN] --layers given: ignoring {", ".join("--" + o.replace("_", "-") for o in _given)}')
+        try:
+            base['stack'] = parse_layer_stack(spec, args.lambda_nm)
+        except ValueError as e:
+            raise SystemExit(f'[ERROR] {e}')
+        base['stack_custom'] = True
+    else:
+        lam = args.lambda_nm
+        _n = lambda v, mat: v if v is not None else n_at(mat, lam)
+        base['stack'] = legacy_stack(
+            base['t_lip_um'] or 0.0, _n(base['n_lip'], 'lipid'),
+            base['t_aq_um'] if base['t_aq_um'] is not None else 3.5, _n(base['n_aq'], 'aqueous'),
+            base['t_mu_um'] if base['t_mu_um'] is not None else 0.5, _n(base['n_mu'], 'mucin'),
+            names=base['names'][1:4])
+        base['stack_custom'] = False
     return base
 
 
@@ -246,6 +274,9 @@ def _cornea_full_tear(layers, absorber_um):
     """Gebietstiefe unter dem Kern fuer --cornea-full: Lipid + Aqueous + Mucin + Cornea bis
     zur Rueckseite (~545 um) + 5 um Kammerwasser + Absorber."""
     from common.physics import cornea_full_depth_um
+    if layers.get('stack_custom'):                   # frei konfigurierbarer Stapel
+        from common.layer_stack import stack_total_um
+        return stack_total_um(layers['stack']) + cornea_full_depth_um() + absorber_um
     t = (layers['t_lip_um'] or 0.0) + (layers['t_aq_um'] if layers['t_aq_um'] is not None else 3.5) \
         + (layers['t_mu_um'] if layers['t_mu_um'] is not None else 0.5)
     return t + cornea_full_depth_um() + absorber_um
@@ -280,7 +311,9 @@ def _run_2d(args, layers):
                           if (args.geometry == 'lens' and args.n_aqueous is None
                               and layers['n_aq'] is not None) else None),
         pulse_mode=args.pulse_stitch,
-        tear_buffer_um=(_cornea_full_tear(layers, 0.2) if args.cornea_full else None))
+        tear_buffer_um=(_cornea_full_tear(layers, 0.2) if args.cornea_full else None),
+        # eigener Stapel (--layers) -> allgemeiner Pfad; sonst Legacy-Pfad (unveraendert)
+        stack=(layers['stack'] if layers.get('stack_custom') else None))
     result['layer_names'] = layers['names']
     if args.bead_y_um is not None:
         result['bead_y_um'] = args.bead_y_um          # Bead-Zentrum y (Analyzer-Marker)
@@ -337,7 +370,9 @@ def _run_3d(args, layers):
         vol_dtype=args.vol_dtype, wg_width_um=args.wg_width,
         n_clad_side=args.wg_clad_n, vcsel_tilt_deg=args.vcsel_tilt,
         vcsel_offset_y_um=args.vcsel_offset, vcsel_offset_z_um=args.vcsel_offset_z,
-        input_gap_um=args.input_gap, polarization=args.polarization)
+        input_gap_um=args.input_gap, polarization=args.polarization,
+        # eigener Stapel (--layers) -> allgemeiner Pfad; sonst Legacy-Pfad (unveraendert)
+        stack=(layers['stack'] if layers.get('stack_custom') else None))
     if args.method == 'stitch' and args.source_type == 'pulse' and args.pulse_stitch == 'td':
         result = f3d.run_3d_stitched_td(window_w_um=args.window_um, slide_um=args.slide_um,
                                         pulse_cycles=args.pulse_cycles,
@@ -556,6 +591,14 @@ def build_parser():
                        help='Refractive index of layer 3 (lens: mucin)')
     g_mat.add_argument('--kappa-mucin', type=float, default=None,
                        help='Absorption of layer 3 (lens: mucin): extinction coefficient kappa, n = n_real + i*kappa (intensity decays as exp(-4 pi kappa z/lambda))')
+    g_mat.add_argument('--layers', default=None,
+                       help='Freely configurable layer stack below the core (planar only), from the '
+                            'core downward: "Name:thickness_um:n,Name:thickness_um:n,...". n is a '
+                            'number, a complex number (1.333+0.0001j = absorbing) or a material '
+                            '(aqueous, mucin, lipid, pmma, polystyrol; evaluated at the wavelength). '
+                            '"none" = core directly on the substrate. Replaces --t/--n-lipid, '
+                            '-aqueous, -mucin. Example: "Lipid:0.03:lipid,Aqueous:3.5:aqueous,'
+                            'Mucin:0.5:mucin"')
     g_mat.add_argument('--n-cornea', type=parse_n, default=None,
                        help='Refractive index of the substrate (lens: cornea), semi-infinite')
     g_mat.add_argument('--kappa-cornea', type=float, default=None,
@@ -815,9 +858,14 @@ def main(argv=None):
         print(f'  Bead      : {"none" if not _place_bead(args) else f"{args.bead_material} d={args.bead_diameter:g} um"}')
     print(f'  Waveguide : thickness {layers["t_wg_um"]:g} um, n={layers["wg_n"]:.3f}')
     if args.geometry != 'cad':
+        from common.layer_stack import describe as _describe_stack
+        print(f'  Layers    : {_describe_stack(layers["stack"])}'
+              + ('  [--layers]' if layers.get('stack_custom') else ''))
+        _below = ((f'"{layers["stack"][-1]["name"]}"' if layers['stack'] else 'the core')
+                  if layers.get('stack_custom') else 'the mucin')
         print('  Cornea    : ' + ('constant n=%.4f (--n-cornea)' % layers['n_co'] if layers['n_co'] is not None
               else ('layered, FULL thickness down to the aqueous humour (depth %.0f um)' % _cornea_full_tear(layers, 0.2)
-                    if args.cornea_full else 'layered (epithelium directly below the mucin)')))
+                    if args.cornea_full else f'layered (epithelium directly below {_below})')))
     print(f'  Length    : {args.length_um:g} um   Resolution: {args.resolution_nm:g} nm   '
           f'Lambda: {args.lambda_nm:g} nm   Pol: {args.polarization}')
     if args.method == 'stitch':

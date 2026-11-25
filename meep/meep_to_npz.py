@@ -7,18 +7,47 @@ import numpy as np
 _MAT_NAMES = ['WG', 'Lipid', 'Aqueous', 'Mucin', 'Cornea']
 
 
+def _stack(cfg):
+    """Stapel im common.layer_stack-Format: frei konfiguriert (cfg['stack']) oder aus den
+    drei Legacy-Schichten (legacy_stack, Nullschichten entfallen)."""
+    from common.layer_stack import legacy_stack
+    if cfg.get('stack') is not None:
+        return [dict(name=L['name'], t_um=float(L['t_um']),
+                     n=complex(L['n_re'], L.get('n_im') or 0.0),
+                     kappa=float(L.get('n_im') or 0.0), mat=L.get('mat'))
+                for L in cfg['stack']]
+    nm = list(cfg.get('layer_names') or _MAT_NAMES)
+    return legacy_stack(cfg['t_lip'] or 0.0, cfg['n_lip'], cfg['t_aq'], cfg['n_aq'],
+                        cfg['t_mu'], cfg['n_mu'], names=nm[1:4])
+
+
+def _stack_kw(cfg):
+    from common.layer_stack import stack_to_npz
+    return stack_to_npz(_stack(cfg))
+
+
 def _names(cfg):
     """Schichtnamen (Kern, 3 Schichten unter dem Kern, Substrat) - vom Nutzer
-    vergebbar (--layer-names); Linse: Traenenfilm-Namen."""
-    return np.array(cfg.get('layer_names') or _MAT_NAMES)
+    vergebbar (--layer-names); Linse: Traenenfilm-Namen. Frei konfigurierter Stapel:
+    [Kern, *Stapel, Substrat]."""
+    nm = list(cfg.get('layer_names') or _MAT_NAMES)
+    if cfg.get('stack') is not None:
+        return np.array([nm[0]] + [str(L['name']) for L in cfg['stack']] + [nm[-1]])
+    return np.array(nm)
 
 
 def _mat_indices(cfg):
+    if cfg.get('stack') is not None:
+        return np.array([cfg['wg_n']] + [float(L['n_re']) for L in cfg['stack']]
+                        + [float(cfg['n_co'])], dtype=np.float64)
     return np.array([cfg['wg_n'], cfg['n_lip'], cfg['n_aq'], cfg['n_mu'], float(cfg['n_co'])],
                     dtype=np.float64)
 
 
 def _layers_m(cfg):
+    if cfg.get('stack') is not None:
+        from common.layer_stack import legacy_layers_tuple
+        return np.array(legacy_layers_tuple(_stack(cfg)), dtype=np.float64)
     return np.array([(cfg['t_lip'] or 0.0)*1e-6, cfg['t_aq']*1e-6,
                      cfg['t_mu']*1e-6, cfg['n_aq']], dtype=np.float64)
 
@@ -111,7 +140,7 @@ def save_2d(cfg, result, out_dir, prefix='meep'):
         _base = {}
     np.savez_compressed(
         path, Ez=ez, meta=_meta(cfg, result['times']),
-        scenario=cfg['label'], layers=_layers_m(cfg), **_base,
+        scenario=cfg['label'], layers=_layers_m(cfg), **_base, **_stack_kw(cfg),
         t_wg_um=np.array([cfg['t_wg']]),
         **_wg_x_kw(cfg),
         polarization=np.array([cfg['pol']]), lam_nm=np.array([cfg['lam_nm']]),
@@ -136,7 +165,7 @@ def save_3d(cfg, result, out_dir, prefix='meep'):
     fr_path = os.path.join(out_dir, f'{prefix}_{cfg["label"]}_frames.npz')
     np.savez_compressed(
         fr_path, Ez=ez_slice, meta=meta, scenario=cfg['label'],
-        layers=_layers_m(cfg), **({} if cfg.get('cad') else
+        layers=_layers_m(cfg), **_stack_kw(cfg), **({} if cfg.get('cad') else
                                   dict(material_names=_names(cfg),
                                        material_indices=_mat_indices(cfg))),
         t_wg_um=np.array([cfg['t_wg']]),
@@ -156,7 +185,7 @@ def save_3d(cfg, result, out_dir, prefix='meep'):
         vol_path, Ez=vol, Iavg=Iavg, steps=steps,
         times=np.asarray(result['times'], dtype=np.float64), dx_um=dx_um,
         x0_um=0.0, y0_um=cfg['y_bot'], z0_um=-cfg['lz']/2.0,
-        scenario=cfg['label'], layers=_layers_m(cfg),
+        scenario=cfg['label'], layers=_layers_m(cfg), **_stack_kw(cfg),
         material_names=_names(cfg), material_indices=_mat_indices(cfg),
         t_wg_um=np.array([cfg['t_wg']]),
         wg_width_um=np.array([cfg.get('wg_width') or 0.0]),

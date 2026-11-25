@@ -27,6 +27,8 @@ from common.physics import (C0, EPS0, MU0, N_AIR, DISPERSION, n_at, cornea_defau
                             loss_sigma, core_source_mask, SRC_CORE_RAMP_UM)
 from common.subpixel import circle_fraction, blend, cell_average_column  # noqa: E402
 from common.flux import PlaneFluxDFT, pairs_2d, pairs_3d, guard_in_plane  # noqa: E402,F401
+from common.layer_stack import (stack_total_um, legacy_stack, legacy_layers_tuple,  # noqa: E402
+                                stack_to_npz, describe as describe_stack)
 BEAD_SUBPIXEL = True     # Bead-Rand per Volumenanteil glaetten (False = harte Maske)
 from planar_beads.boundaries import (make_boundary, mur1_coeff, mur_speeds, MurSet,     # noqa: E402
                                      CPML_TE, CPML_TM)
@@ -56,6 +58,52 @@ T_MU = 0.5e-6            # Mucin-Dicke (physiologisch ~0.2-0.5 um)
 T_AQ = 3.5e-6            # Aqueous(Wasser)-Dicke (physiologisch ~3-4 um; > typ. Bead)
 
 
+def _stack_bead_warn(stack, place_bead, bead_d_um, bead_y_um=None):
+    """Warnung, wenn der Bead (Default: aufliegend, Zentrum y=-r) nicht ganz in der
+    ersten Stapelschicht unter dem Kern liegt (allgemeiner Stapel, ersetzt die
+    Aqueous-Warnung des Legacy-Pfads)."""
+    if not place_bead or not bead_d_um or bead_d_um <= 0:
+        return
+    r = 0.5*float(bead_d_um)
+    yc = float(bead_y_um) if bead_y_um is not None else -r
+    if not stack:
+        print(f'  [WARN] Bead d={bead_d_um:g}um: no layers below the core -> the bead sits '
+              f'in the substrate.')
+        return
+    L0 = stack[0]
+    if yc - r < -float(L0['t_um']) - 1e-6 or yc + r > 1e-6:
+        print(f'  [WARN] Bead d={bead_d_um:g}um (y {yc - r:.3g}..{yc + r:.3g}um) sticks out of the '
+              f'first layer "{L0["name"]}" ({L0["t_um"]:g}um below the core).')
+
+
+def stack_at_lambda(stack, lam_nm):
+    """Stapel bei einer anderen Wellenlaenge: Schichten mit Material (``mat``) folgen
+    n_at(mat, lambda) (Absorption kappa bleibt), numerische n bleiben konstant."""
+    if stack is None:
+        return None
+    out = []
+    for Ly in stack:
+        Ly = dict(Ly)
+        if Ly.get('mat'):
+            n = complex(n_at(Ly['mat'], lam_nm), complex(Ly['n']).imag)
+            Ly.update(n=n, kappa=n.imag)
+        out.append(Ly)
+    return out
+
+
+def _stack_n_below(stack, n_sub):
+    """Reelle Brechzahl direkt unter dem Kern: erste Stapelschicht, sonst Substrat."""
+    return float(complex(stack[0]['n']).real) if stack else float(n_sub)
+
+
+def _stack_note_kappa(stack):
+    """Hinweis: KAPPA fuer lip/aq/mu gilt nur im Legacy-Pfad (Stapel: komplexes n)."""
+    _ig = [k for k in ('lip', 'aq', 'mu') if (KAPPA or {}).get(k, 0) > 0]
+    if stack is not None and _ig:
+        print(f'  [Note] layer stack given: kappa for {", ".join(_ig)} ignored '
+              f'(set absorption as complex n in --layers)')
+
+
 def aqueous_thickness(bead_d_um):
     """Wasserdicke je nach Bead-Groesse: >=1um -> 4um (Mucin @ -4um),
     <1um -> 1um (Mucin @ -1um). Bead bleibt in Wasser eingebettet."""
@@ -71,24 +119,34 @@ def build_materials(Nx, Ny, dx, wg_n, bead_n, wg_top, bead_x_um, bead_d_um, x_st
                     n_aq=N_AQ, n_mucin=N_MUCIN, n_cornea=N_CORNEA, t_aq_um=None,
                     t_mu_um=None, t_lip_um=0.0, n_lip=N_LIPID, input_gap_um=0.0,
                     length_um=None, bead_y_um=None, curved=False, r_bend_m=8.3e-3,
-                    tm_patch=None):
+                    tm_patch=None, stack=None):
     """Flache Schichten. AQUEOUS grenzt an den WG (y=0), feste Dicke (t_aq_um).
     Optional Lipidschicht (t_lip_um) direkt unter dem WG; freie Mucin-Dicke
     (t_mu_um). Bead liegt in der Aqueous (Default Oberkante an y=0). Optionaler
     Einkoppelabstand (input_gap_um): Luftzone bei x<gap vor dem WG-Eintritt.
-    length_um: Propagationslaenge (Default L_DEMO) -> Position der End-Facette."""
+    length_um: Propagationslaenge (Default L_DEMO) -> Position der End-Facette.
+    stack: frei konfigurierbarer Schichtstapel unter dem Kern (common.layer_stack;
+    Liste von Schichten vom Kern abwaerts, n komplex = absorbierend). None = die drei
+    festen Schichten Lipid/Aqueous/Mucin (t_*/n_* wie bisher, Legacy-Pfad unveraendert).
+    Mit stack werden t_*/n_aq/n_mucin/n_lip und KAPPA['lip'/'aq'/'mu'] ignoriert."""
     t_aq = (t_aq_um*1e-6) if t_aq_um is not None else T_AQ
     t_mu = (t_mu_um*1e-6) if t_mu_um is not None else T_MU
     t_lip = (t_lip_um or 0.0)*1e-6
     L = (length_um*1e-6) if length_um is not None else L_DEMO
     x_wg_start = (input_gap_um or 0.0)*1e-6      # WG-Eintrittsfacette (global, x)
     x_wg_end = L                                 # WG-Endfacette (global, x)
-    if place_bead and bead_d_um*1e-6 > t_aq + 1e-12:
-        print(f'  [WARN] Bead d={bead_d_um}um > Aqueous {t_aq*1e6:g}um -> extends into mucin. '
-              f'Increase T_AQUEOUS.')
+    if stack is None:
+        if place_bead and bead_d_um*1e-6 > t_aq + 1e-12:
+            print(f'  [WARN] Bead d={bead_d_um}um > Aqueous {t_aq*1e6:g}um -> extends into mucin. '
+                  f'Increase T_AQUEOUS.')
+    else:
+        stack = list(stack)
+        _stack_bead_warn(stack, place_bead, bead_d_um, bead_y_um)
     # Absorption (KAPPA): intern mit komplexem n rechnen, am Ende eps' + sigma trennen
     _k = dict(KAPPA or {})
     lossy = any(v > 0 for v in _k.values())
+    if stack is not None:                        # Stapel: kappa steckt im komplexen n
+        lossy = lossy or any(complex(Ly['n']).imag > 0 for Ly in stack)
     if lossy:
         wg_n = complex(wg_n, _k.get('wg', 0.0)); bead_n_c = complex(bead_n, _k.get('bead', 0.0))
         n_aq = complex(n_aq, _k.get('aq', 0.0)); n_mucin = complex(n_mucin, _k.get('mu', 0.0))
@@ -103,6 +161,16 @@ def build_materials(Nx, Ny, dx, wg_n, bead_n, wg_top, bead_x_um, bead_d_um, x_st
     y_lip_bot = -t_lip
     y_aq_bot = y_lip_bot - t_aq
     y_mu_bot = y_aq_bot - t_mu
+    _sb = None
+    if stack is not None:
+        # Schichtgrenzen (m) vom Kern (y=0) abwaerts; Substrat beginnt am Stapelboden
+        _sb, _yt = [], 0.0
+        for Ly in stack:
+            _yb = _yt - float(Ly['t_um'])*1e-6
+            _n = complex(Ly['n'])
+            _sb.append((_yt, _yb, _n if lossy else _n.real))
+            _yt = _yb
+        y_mu_bot = _yt                               # Oberkante des Substrats
     # SUBSTRAT (unter y=0) ueber die GANZE Laenge: Wasser ist ueberall unter dem Slab
     # und daneben/dahinter. Ueber y=0 ist standardmaessig LUFT.
     def _eps_y(y, core):
@@ -113,10 +181,14 @@ def build_materials(Nx, Ny, dx, wg_n, bead_n, wg_top, bead_x_um, bead_d_um, x_st
             e[mc] = (n_cornea.at_depth((y_mu_bot - y[mc])*1e6) + 1j*_k_co)**2 if lossy                 else n_cornea.at_depth((y_mu_bot - y[mc])*1e6)**2
         else:
             e[mc] = (float(n_cornea) + 1j*_k_co)**2 if lossy else n_cornea**2
-        e[(y >= y_mu_bot) & (y < y_aq_bot)] = n_mucin**2
-        e[(y >= y_aq_bot) & (y < y_lip_bot)] = n_aq**2
-        if t_lip > 1e-12:
-            e[(y >= y_lip_bot) & (y < 0.0)] = n_lip**2
+        if _sb is not None:                          # frei konfigurierbarer Stapel
+            for _yt_, _yb_, _n_ in _sb:
+                e[(y >= _yb_) & (y < _yt_)] = _n_**2
+        else:                                        # Legacy: Lipid / Aqueous / Mucin
+            e[(y >= y_mu_bot) & (y < y_aq_bot)] = n_mucin**2
+            e[(y >= y_aq_bot) & (y < y_lip_bot)] = n_aq**2
+            if t_lip > 1e-12:
+                e[(y >= y_lip_bot) & (y < 0.0)] = n_lip**2
         if core:
             e[(y >= 0.0) & (y < wg_top)] = wg_n**2
         return e
@@ -417,15 +489,25 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
               n_cornea=None, n_lipid=None, polarization='s', curved=False, boundary='cpml',
               cad=None, pulse_cycles=30.0, pulse_tmax_fs=None, pulse_nfreq=None,
               pulse_dispersion=True, pulse_mode='fourier', n_aq_tear_offset=None,
-              tear_buffer_um=None):
+              tear_buffer_um=None, stack=None):
     """cad: optional common.cad_geometry.CadRun -> freie CAD-Geometrie statt des
     eingebauten Schichtstapels (Rechenbox, eps, Quelle und Detektoren aus der Szene).
     pulse_cycles: Gauss-Puls exp(-((t-3s)/s)^2) sin(w0 t) mit s = pulse_cycles/f0
-    (source_type='pulse'). Mit method='stitch' -> Fourier-Stitch (run_beads_stitched_pulse)."""
+    (source_type='pulse'). Mit method='stitch' -> Fourier-Stitch (run_beads_stitched_pulse).
+    stack: frei konfigurierbarer Schichtstapel unter dem Kern (common.layer_stack), None =
+    Legacy Lipid/Aqueous/Mucin aus t_*/n_* (unveraendert)."""
+    global TEAR_BUFFER
+    if stack is not None and tear_buffer_um is None and cad is None:
+        # Gebietstiefe unter dem Kern: mindestens Stapel + Cornea-Marge + Absorber (wie 3D
+        # _resolve_tear_um); der feste Puffer (10 um) bleibt, solange er reicht.
+        _need = stack_total_um(stack) + 1.5 + 10*dx_nm*1e-3
+        if _need*1e-6 > TEAR_BUFFER + 1e-12:
+            print(f'  [Auto] tear buffer {TEAR_BUFFER*1e6:g} um -> {_need:.2f} um '
+                  f'(stack {stack_total_um(stack):.2f} + cornea 1.5 + absorber)')
+            tear_buffer_um = _need
     if tear_buffer_um is not None:
         # Tiefe unter dem Kern (z.B. --cornea-full bis ins Kammerwasser): Modul-Puffer
         # fuer DIESEN Lauf setzen (alle Builder lesen ihn zur Laufzeit), danach zuruecksetzen.
-        global TEAR_BUFFER
         _old = TEAR_BUFFER
         TEAR_BUFFER = float(tear_buffer_um)*1e-6
         try:
@@ -443,7 +525,8 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
                                  bead_x_um=bead_x_um, bead_y_um=bead_y_um, wg_n=wg_n, bead_n=bead_n,
                                  n_aqueous=n_aqueous, n_mucin=n_mucin, n_cornea=n_cornea,
                                  n_lipid=n_lipid, polarization=polarization, curved=curved,
-                                 boundary=boundary, pulse_cycles=pulse_cycles, cad=cad)
+                                 boundary=boundary, pulse_cycles=pulse_cycles, cad=cad,
+                                 stack=stack)
     if method == 'stitch' and str(source_type).lower() == 'pulse' and pulse_mode == 'td':
         return run_beads_stitched_td(
             wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapshots,
@@ -453,7 +536,7 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
             t_mucin_um=t_mucin_um, t_lipid_um=t_lipid_um, input_gap_um=input_gap_um,
             length_um=length_um, bead_x_um=bead_x_um, bead_y_um=bead_y_um, wg_n=wg_n, bead_n=bead_n,
             n_aqueous=n_aqueous, n_mucin=n_mucin, n_cornea=n_cornea, n_lipid=n_lipid,
-            polarization=polarization, curved=curved, boundary=boundary)
+            polarization=polarization, curved=curved, boundary=boundary, stack=stack)
     if method == 'stitch' and str(source_type).lower() == 'pulse':
         return run_beads_stitched_pulse(
             wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapshots,
@@ -464,7 +547,7 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
             n_aqueous=n_aqueous, n_mucin=n_mucin, n_cornea=n_cornea, n_lipid=n_lipid,
             polarization=polarization, curved=curved, boundary=boundary, cad=cad,
             pulse_cycles=pulse_cycles, pulse_tmax_fs=pulse_tmax_fs, pulse_nfreq=pulse_nfreq,
-            pulse_dispersion=pulse_dispersion, n_aq_tear_offset=n_aq_tear_offset)
+            pulse_dispersion=pulse_dispersion, n_aq_tear_offset=n_aq_tear_offset, stack=stack)
     if method == 'stitch':
         return run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapshots,
                                   wg_thickness_um, lambda_nm, vcsel_waist, vcsel_tilt,
@@ -474,7 +557,7 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
                                   bead_x_um=bead_x_um, bead_y_um=bead_y_um, wg_n=wg_n, bead_n=bead_n,
                                   n_aqueous=n_aqueous, n_mucin=n_mucin, n_cornea=n_cornea,
                                   n_lipid=n_lipid, polarization=polarization, curved=curved,
-                                  boundary=boundary, cad=cad)
+                                  boundary=boundary, cad=cad, stack=stack)
     _pol = 'p' if str(polarization).lower() in ('p', 'tm') else 's'
     t_aq_um = t_aqueous_um if t_aqueous_um is not None else T_AQ*1e6   # feste Aqueous-Dicke
     t_total = time.time()
@@ -515,12 +598,18 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
         del _eps_np
     else:
         print(f'Grid: dx={dx_nm}nm  {Nx}x{Ny}  WG n={wg_n:.3f} t={wg_thickness_um}um  Bead d={bead_d_um}um n={bead_n:.3f}')
-        print(f'Length={L_um:g}um  Aqueous={t_aq_um:g}um (fixed, at WG)  Lipid={(t_lipid_um or 0):g}um  '
-              f'Gap={input_gap_um:g}um  Bead-x={bx_um:g}um')
+        if stack is None:
+            print(f'Length={L_um:g}um  Aqueous={t_aq_um:g}um (fixed, at WG)  Lipid={(t_lipid_um or 0):g}um  '
+                  f'Gap={input_gap_um:g}um  Bead-x={bx_um:g}um')
+        else:
+            print(f'Length={L_um:g}um  Gap={input_gap_um:g}um  Bead-x={bx_um:g}um')
+            print(f'Layers: {describe_stack(stack)}')
+            _stack_note_kappa(stack)
         eps_r, sig = build_materials(Nx, Ny, dx, wg_n, bead_n, T_WG, bx_um, bead_d_um, 0.0, place_bead,
                                      n_aq=n_aq_l, n_mucin=n_mu_l, n_cornea=n_co_l, t_aq_um=t_aq_um,
                                      t_mu_um=t_mucin_um, t_lip_um=t_lipid_um, n_lip=n_lip_l,
-                                     input_gap_um=input_gap_um, length_um=length_um, curved=curved, tm_patch=_bp, bead_y_um=bead_y_um)
+                                     input_gap_um=input_gap_um, length_um=length_um, curved=curved, tm_patch=_bp, bead_y_um=bead_y_um,
+                                     stack=stack)
     Ce_E, Ce_H = _coeffs(eps_r, sig, dt, dx)
     if _pol == 'p':                                  # TM-Koeffizienten aus eps_r
         Ca_ex, Ca_ey, Ch_tm = _tm_coeffs(eps_r, dt, dx)
@@ -563,7 +652,8 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
         iy_src, src_p, ys_idx = _src_setup(Ny, dx, T_WG, vcsel_offset, vcsel_waist)
     src_p_ey = 0.5*(src_p[:-1] + src_p[1:])           # Ey-Gitter (Ny-1)
     f0 = C0/LAM; sigma_t = 4/(2*np.pi*f0); k0 = 2*np.pi/LAM
-    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, iy_src, y0_m, dx, wg_n, T_WG, n_aq_l, input_gap_um)
+    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, iy_src, y0_m, dx, wg_n, T_WG,
+                          n_aq_l if stack is None else _stack_n_below(stack, n_co_l), input_gap_um)
     phase_y = float(np.sin(np.radians(tilt)))*k0*_n_src*(ys_idx - iy_src)*dx   # Winkel im Medium an der Quelle
     phase_y_ey = 0.5*(phase_y[:-1] + phase_y[1:])
     mur = mur1_coeff(dx, dt)
@@ -768,7 +858,7 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
                        frames_memmap=mm_path, t_aq_um=t_aq_um, t_mu_um=t_mucin_um,
                        t_lip_um=t_lipid_um, bead_x_um=bx_um,
                        x_wg_start_um=(input_gap_um or 0.0), x_wg_end_um=L_um,
-                       polarization=_pol)
+                       polarization=_pol, stack=stack, n_lip=n_lip_l)
     res['Iavg'] = (to_np(acc_I)/max(1, nacc_I)) if nacc_I else None
     res['cw_frames'] = cw_frames
     res['cw_frames_memmap'] = cw_path
@@ -793,7 +883,7 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
                       length_um=None, bead_x_um=None, bead_y_um=None, wg_n=None, bead_n=None,
                       n_aqueous=None, n_mucin=None, n_cornea=None, n_lipid=None,
                       polarization='s', curved=False, boundary='cpml', pulse_cycles=30.0,
-                      cad=None):
+                      cad=None, stack=None):
     _bnd_kind = (boundary or 'cpml').lower()
     _use_bnd = _bnd_kind == 'cpml'                   # Rand-Objekt (sonst inline Mur-1)
     _is_cpml = _bnd_kind == 'cpml'
@@ -829,6 +919,9 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
     N_shift = int(round(slide_um*1e-6/dx))
     print(f'\n===== Bead-Demo [sliding]: {label} =====')
     print(f'Window {window_w_um}um = {Nx}x{Ny}, {n_slides} Slides, shift={N_shift} cells')
+    if stack is not None and cad is None:
+        print(f'Layers: {describe_stack(stack)}')
+        _stack_note_kappa(stack)
     Ch = xp.float32(dt/(MU0*dx))
     Ez = xp.zeros((Nx, Ny), dtype=xp.float32)
     Hx = xp.zeros((Nx, Ny-1), dtype=xp.float32)
@@ -857,7 +950,8 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
         iy_src, src_p, ys_idx = _src_setup(Ny, dx, T_WG, vcsel_offset, vcsel_waist)
     src_p_ey = 0.5*(src_p[:-1] + src_p[1:])
     f0 = C0/LAM; sigma_t = 4/(2*np.pi*f0); k0 = 2*np.pi/LAM
-    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, iy_src, y0_m, dx, wg_n, T_WG, n_aq_l, input_gap_um)
+    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, iy_src, y0_m, dx, wg_n, T_WG,
+                          n_aq_l if stack is None else _stack_n_below(stack, n_co_l), input_gap_um)
     phase_y = float(np.sin(np.radians(tilt)))*k0*_n_src*(ys_idx - iy_src)*dx   # Winkel im Medium an der Quelle
     phase_y_ey = 0.5*(phase_y[:-1] + phase_y[1:])
     mur = mur1_coeff(dx, dt)
@@ -898,7 +992,8 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
                                          place_bead, n_aq=n_aq_l, n_mucin=n_mu_l, n_cornea=n_co_l,
                                          t_aq_um=t_aq_um, t_mu_um=t_mucin_um, t_lip_um=t_lipid_um,
                                          n_lip=n_lip_l, input_gap_um=input_gap_um,
-                                         length_um=length_um, curved=curved, tm_patch=_bp, bead_y_um=bead_y_um)
+                                         length_um=length_um, curved=curved, tm_patch=_bp, bead_y_um=bead_y_um,
+                                         stack=stack)
         Ce_E, Ce_H = _coeffs(eps_r, sig, dt, dx)
         if _pol == 'p':
             Ca_ex, Ca_ey, Ch_tm = _tm_coeffs(eps_r, dt, dx)
@@ -1027,7 +1122,7 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
                         frames_memmap=mm_path, t_aq_um=t_aq_um, t_mu_um=t_mucin_um,
                         t_lip_um=t_lipid_um, bead_x_um=bx_um,
                         x_wg_start_um=(input_gap_um or 0.0), x_wg_end_um=L_um,
-                        polarization=_pol)
+                        polarization=_pol, stack=stack, n_lip=n_lip_l)
     res['transmission_intensity'] = Tr_I; res['transmission_def'] = tr_def
     if cad is not None:
         res['cad'] = dict(cad.meta(), cad_tilt_deg=tilt,
@@ -1046,7 +1141,7 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                        length_um=None, bead_x_um=None, bead_y_um=None, wg_n=None, bead_n=None,
                        n_aqueous=None, n_mucin=None, n_cornea=None, n_lipid=None,
                        polarization='s', curved=False, boundary='cpml', cad=None,
-                       return_efull=False):
+                       return_efull=False, stack=None):
     _bnd_kind = (boundary or 'cpml').lower()
     if _bnd_kind not in ('cpml', 'mur1'):
         raise ValueError(f"stitch: unknown boundary '{_bnd_kind}' (cpml|mur1)")
@@ -1109,6 +1204,9 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
     print(f'\n===== Bead-Demo [stitch/domain decomposition]: {label} =====')
     print(f'Length {L_um:g}um -> {n_win} windows of {window_w_um}um (overlap {O_cells*dx*1e6:.1f}um), '
           f'grid/window {Nx_win}x{Ny}, steps/window {steps_win}')
+    if stack is not None and cad is None:
+        print(f'Layers: {describe_stack(stack)}')
+        _stack_note_kappa(stack)
     Ch = xp.float32(dt/(MU0*dx))
     mur = xp.float32((C0*dt - dx)/(C0*dt + dx))
     NPML_ST = 10
@@ -1129,7 +1227,8 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
             cad_region[_x0:_x1] = cad.eps2d(_x0*dx*1e6, _x1 - _x0, Ny, smooth=1)[1]
     else:
         iy_src, src_p, ys_idx = _src_setup(Ny, dx, T_WG, vcsel_offset, vcsel_waist)
-    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, iy_src, y0_m, dx, wg_n, T_WG, n_aq_l, input_gap_um)
+    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, iy_src, y0_m, dx, wg_n, T_WG,
+                          n_aq_l if stack is None else _stack_n_below(stack, n_co_l), input_gap_um)
     phase_y = float(np.sin(np.radians(tilt)))*k0*_n_src*(ys_idx - iy_src)*dx   # Winkel im Medium an der Quelle
     src_p_ey = 0.5*(src_p[:-1] + src_p[1:])
     phase_y_ey = 0.5*(phase_y[:-1] + phase_y[1:])
@@ -1201,7 +1300,8 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                                          n_cornea=n_co_l, t_aq_um=t_aq_um, t_mu_um=t_mucin_um,
                                          t_lip_um=t_lipid_um, n_lip=n_lip_l,
                                          input_gap_um=input_gap_um, length_um=_len_mat,
-                                         curved=curved, tm_patch=_bp, bead_y_um=bead_y_um)
+                                         curved=curved, tm_patch=_bp, bead_y_um=bead_y_um,
+                                         stack=stack)
         Ce_E, Ce_H = _coeffs(eps_r, sig, dt, dx)
         if _pol == 'p':
             Ca_ex, Ca_ey, Ch_tm = _tm_coeffs(eps_r, dt, dx)
@@ -1385,7 +1485,7 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                                            n_cornea=n_co_l, t_aq_um=t_aq_um, t_mu_um=t_mucin_um,
                                            t_lip_um=t_lipid_um, n_lip=n_lip_l,
                                            input_gap_um=input_gap_um, length_um=L_um,
-                                           curved=curved, bead_y_um=bead_y_um)[0])[1]
+                                           curved=curved, bead_y_um=bead_y_um, stack=stack)[0])[1]
             _ec[_ix] = _eps_col_ey(_e)
     if not (_flux.has('in') and _flux.has('out')):
         S_in = poynting_flux(Efull, ix_in, _ec.get(ix_in))
@@ -1399,7 +1499,7 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                        n_aq_l, n_mu_l, n_co_l, frames_memmap=mm_path, t_aq_um=t_aq_um,
                        t_mu_um=t_mucin_um, t_lip_um=t_lipid_um, bead_x_um=bx_um,
                        x_wg_start_um=(input_gap_um or 0.0), x_wg_end_um=L_um,
-                       polarization=_pol)
+                       polarization=_pol, stack=stack, n_lip=n_lip_l)
     res['transmission_intensity'] = Tr_I; res['transmission_def'] = 'poynting'
     # Stitch = eingeschwungener Hauptsatz; 'einlaufend' erzeugt der Analyzer
     # illustrativ aus diesem CW-Feld (kein echter Transient vorhanden).
@@ -1427,7 +1527,7 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
                           t_mucin_um=None, t_lipid_um=0.0, input_gap_um=0.0, length_um=None,
                           bead_x_um=None, bead_y_um=None, wg_n=None, bead_n=None, n_aqueous=None, n_mucin=None,
                           n_cornea=None, n_lipid=None, polarization='s', curved=False,
-                          boundary='cpml', **_ignored):
+                          boundary='cpml', stack=None, **_ignored):
     """TRANSIENTER Stitch direkt im ZEITBEREICH (Huygens-Ebenen, TF/SF).
 
     Alle Fenster laufen auf derselben absoluten Zeitachse t = n dt. Fenster w zeichnet in
@@ -1493,6 +1593,9 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
     print(f'\n===== Time-domain stitch (Huygens/TF-SF): {label} =====')
     print(f'Pulse {pulse_cycles:g} periods (s={sp*1e15:.1f} fs), t_max={t_max*1e15:.0f} fs = {N} steps, '
           f'{n_win} windows of {window_w_um}um (overlap {O_cells*dx*1e6:.2f}um), {len(n_j)} frames')
+    if stack is not None and cad is None:
+        print(f'Layers: {describe_stack(stack)}')
+        _stack_note_kappa(stack)
     # Quelle (nur Fenster 0)
     tilt = vcsel_tilt
     src_ix = NPML + 2
@@ -1503,7 +1606,8 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
                                            y0_m=y0_m, y_center_m=_s['y_um']*1e-6)
     else:
         iy_src, src_p, ys_idx = _src_setup(Ny, dx, T_WG, vcsel_offset, vcsel_waist)
-    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, iy_src, y0_m, dx, wg_n, T_WG, n_aq_l, input_gap_um)
+    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, iy_src, y0_m, dx, wg_n, T_WG,
+                          n_aq_l if stack is None else _stack_n_below(stack, n_co_l), input_gap_um)
     phase_y = float(np.sin(np.radians(tilt)))*k0*_n_src*(ys_idx - iy_src)*dx   # Winkel im Medium an der Quelle
     src_p_ey = 0.5*(src_p[:-1] + src_p[1:]); phase_y_ey = 0.5*(phase_y[:-1] + phase_y[1:])
     env_t = np.exp(-((np.arange(N)*dt - tc)/sp)**2)
@@ -1543,7 +1647,8 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
                                          x_start_um, place_bead, n_aq=n_aq_l, n_mucin=n_mu_l,
                                          n_cornea=n_co_l, t_aq_um=t_aq_um, t_mu_um=t_mucin_um,
                                          t_lip_um=t_lipid_um, n_lip=n_lip_l,
-                                         input_gap_um=input_gap_um, length_um=_len_mat, curved=curved, tm_patch=_bp, bead_y_um=bead_y_um)
+                                         input_gap_um=input_gap_um, length_um=_len_mat, curved=curved, tm_patch=_bp, bead_y_um=bead_y_um,
+                                         stack=stack)
         Ce_E, Ce_H = _coeffs(eps_r, sig, dt, dx)
         if _pol == 'p':
             Ca_ex, Ca_ey, Ch_tm = _tm_coeffs(eps_r, dt, dx)
@@ -1666,7 +1771,8 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
                        vcsel_waist, tilt, vcsel_offset, 'pulse', 'stitch-td', place_bead,
                        n_aq_l, n_mu_l, n_co_l, frames_memmap=mm_path, t_aq_um=t_aq_um,
                        t_mu_um=t_mucin_um, t_lip_um=t_lipid_um, bead_x_um=bx_um,
-                       x_wg_start_um=(input_gap_um or 0.0), x_wg_end_um=L_um, polarization=_pol)
+                       x_wg_start_um=(input_gap_um or 0.0), x_wg_end_um=L_um, polarization=_pol,
+                       stack=stack, n_lip=n_lip_l)
     res['transmission_intensity'] = Tr_I; res['transmission_def'] = tr_def
     res.update(view_primary='transient', cw_only=False,
                pulse=dict(cycles=pulse_cycles, s_fs=sp*1e15, tmax_fs=t_max*1e15, dispersion=False))
@@ -1681,7 +1787,7 @@ def run_beads_stitched_pulse(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_
                              wg_thickness_um, lambda_nm, vcsel_waist, vcsel_tilt, vcsel_offset,
                              window_w_um, slide_um, place_bead, pulse_cycles=30.0,
                              pulse_tmax_fs=None, pulse_nfreq=None, pulse_dispersion=True,
-                             cad=None, t_eval_s=None, n_aq_tear_offset=None, **kw):
+                             cad=None, t_eval_s=None, n_aq_tear_offset=None, stack=None, **kw):
     """TRANSIENTER Stitch per Fourier-Synthese.
 
     Der Quellpuls s(t) = exp(-((t-t_c)/s)^2) sin(w0 t), s = pulse_cycles/f0, t_c = 3 s
@@ -1753,6 +1859,10 @@ def run_beads_stitched_pulse(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_
     print(f'Pulse: {pulse_cycles:g} periods (s={sp*1e15:.1f} fs), Band {lam_k.min():.1f}..{lam_k.max():.1f} nm, '
           f'{len(w_k)} frequencies, dw/2pi={dw/2/np.pi/1e12:.2f} THz, t_max={t_max*1e15:.0f} fs, '
           f'{n_t} time frames, dispersion {"on" if pulse_dispersion else "off (n at lambda0)"}')
+    if stack is not None and cad is None:
+        print(f'Layers: {describe_stack(stack)}'
+              + ('  (material layers follow n(lambda_k))' if pulse_dispersion else ''))
+        _stack_note_kappa(stack)
     frames_t = None; spec_T = []; spec_P = []; r_c = None; E_c = None
     k_c = int(np.argmin(np.abs(w_k - w0)))
     for k, (wk, lk, Sk) in enumerate(zip(w_k, lam_k, S_k)):
@@ -1763,10 +1873,13 @@ def run_beads_stitched_pulse(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_
             _kwk = dict(kw2)
             if _tear_disp:
                 _kwk['n_aqueous'] = n_at('aqueous', float(lk)) + float(n_aq_tear_offset)
+            # Stapel: Material-Schichten folgen n(lambda_k), numerische n bleiben fest
+            _stk = (stack_at_lambda(stack, float(lk)) if (stack is not None and pulse_dispersion)
+                    else stack)
             r = run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, False, 4,
                                    wg_thickness_um, float(lk), vcsel_waist, vcsel_tilt,
                                    vcsel_offset, 'cw', window_w_um, slide_um, place_bead,
-                                   cad=cad, return_efull=True, **over, **_kwk)
+                                   cad=cad, return_efull=True, stack=_stk, **over, **_kwk)
         E = np.asarray(r.pop('Efull'))
         if pol == 'p':                                   # Ey (Nx,Ny-1) -> Knotengitter (Nx,Ny)
             En = np.empty((E.shape[0], E.shape[1] + 1), dtype=np.complex64)
@@ -1814,6 +1927,9 @@ def run_beads_stitched_pulse(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_
                              weight=np.abs(S_k)/np.abs(S_k).max()),
                pulse=dict(cycles=pulse_cycles, s_fs=sp*1e15, tmax_fs=t_max*1e15,
                           nfreq=len(w_k), dispersion=bool(pulse_dispersion)))
+    if stack is not None:                                # Stapel bei lambda0 (nicht lambda_k_c)
+        res['stack'] = [dict(Ly) for Ly in stack]; res['stack_custom'] = True
+        res['layers'] = legacy_layers_tuple(stack)
     w = np.abs(S_k)**2
     res['transmission'] = float(np.sum(w*np.array(spec_T))/np.sum(w))   # spektral gewichtet
     print(f'\n[Result] {label} [Fourier-Stitch]: {len(w_k)} frequencies in {res["total_time"]:.0f}s  '
@@ -1825,13 +1941,25 @@ def _result_dict(label, P_in, P_out, Tr, frames, total_time, bead_d_um,
                  wg_mat, bead_mat, wg_n, bead_n, wg_th, lam, waist, tilt, off, src, method, place_bead=True,
                  n_aq=N_AQ, n_mucin=N_MUCIN, n_cornea=N_CORNEA, frames_memmap=None, t_aq_um=None,
                  t_mu_um=None, t_lip_um=0.0, bead_x_um=None, x_wg_start_um=0.0, x_wg_end_um=None,
-                 polarization='s'):
+                 polarization='s', stack=None, n_lip=None):
     _t_aq = (t_aq_um*1e-6) if t_aq_um is not None else T_AQ
     _t_mu = (t_mu_um*1e-6) if t_mu_um is not None else T_MU
     _t_lip = (t_lip_um or 0.0)*1e-6
+    if stack is None:
+        # Legacy: Stapel aus den drei festen Schichten (inkl. kappa) - nur fuers Speichern
+        _kp = dict(KAPPA or {})
+        _nl = float(n_lip) if n_lip is not None else N_LIPID
+        stack_out = legacy_stack(_t_lip*1e6, complex(_nl, _kp.get('lip', 0.0)),
+                                 _t_aq*1e6, complex(float(n_aq), _kp.get('aq', 0.0)),
+                                 _t_mu*1e6, complex(float(n_mucin), _kp.get('mu', 0.0)))
+        layers = (_t_lip, _t_aq, _t_mu, n_aq)
+    else:
+        stack_out = [dict(Ly) for Ly in stack]
+        layers = legacy_layers_tuple(stack)
     return dict(scenario=label, P_in=P_in, P_out=P_out, transmission=Tr,
                 frames=frames, frames_memmap=frames_memmap,
-                total_time=total_time, layers=(_t_lip, _t_aq, _t_mu, n_aq), n_aq=n_aq, n_mucin=n_mucin, n_cornea=n_cornea,
+                stack=stack_out, stack_custom=stack is not None,
+                total_time=total_time, layers=layers, n_aq=n_aq, n_mucin=n_mucin, n_cornea=n_cornea,
                 wg_material=wg_mat, bead_material=bead_mat, wg_n=wg_n, bead_n=bead_n,
                 bead_diameter_um=(bead_d_um if place_bead else 0.0),
                 bead_x_um=(bead_x_um if bead_x_um is not None else BEAD_X_UM),
@@ -1841,9 +1969,43 @@ def _result_dict(label, P_in, P_out, Tr, frames, total_time, bead_d_um,
                 polarization=polarization)
 
 
+_LEGACY_MAT_POS = {'lipid': 1, 'aqueous': 2, 'mucin': 3}
+
+
+def _stack_save_keys(result):
+    """(material_names, material_indices, stack-npz-keys) fuer save_results.
+    Legacy (stack_custom False): Namen/Indizes wie bisher (Kern, 3 Schichten, Substrat),
+    Stapel aus den Legacy-Werten mit den --layer-names. Eigener Stapel: variable Laenge
+    [Kern, *Schichten, Substrat]."""
+    names5 = list(result.get('layer_names') or ['WG', 'Lipid', 'Aqueous', 'Mucin', 'Cornea'])
+    stack = result.get('stack')
+    custom = bool(result.get('stack_custom', False))
+    if stack is None:                                    # aeltere Ergebnis-Dicts
+        _l = result.get('layers') or (0.0, T_AQ, T_MU, N_AQ)
+        stack = legacy_stack(_l[0]*1e6, result.get('n_lip', N_LIPID), _l[1]*1e6,
+                             result.get('n_aq', N_AQ), _l[2]*1e6, result.get('n_mucin', N_MUCIN))
+        custom = False
+    if not custom:
+        stack = [dict(Ly, name=str(names5[_LEGACY_MAT_POS[Ly['mat']]]))
+                 if Ly.get('mat') in _LEGACY_MAT_POS and len(names5) > 3 else dict(Ly)
+                 for Ly in stack]
+        names = np.array(names5)
+        idx = np.array([result['wg_n'], result.get('n_lip', N_LIPID),
+                        result['n_aq'], result['n_mucin'], result['n_cornea']], dtype=np.float64)
+    else:
+        names = np.array([str(names5[0])] + [str(Ly['name']) for Ly in stack]
+                         + [str(names5[-1])])
+        idx = np.array([float(np.real(result['wg_n']))]
+                       + [complex(Ly['n']).real for Ly in stack]
+                       + [float(result['n_cornea'])], dtype=np.float64)
+    result['stack'] = stack; result['stack_custom'] = custom   # auch ins PKL
+    return names, idx, stack_to_npz(stack)
+
+
 def save_results(result, out_dir='results'):
     os.makedirs(out_dir, exist_ok=True)
     tag = f"{result['scenario']}_{result.get('method','full')}"
+    _mat_names, _mat_idx, _stk_kw = _stack_save_keys(result)   # setzt result['stack']
     summary = {k: v for k, v in result.items()
                if k not in ('frames', 'cad_region', 'Iavg', 'Ex_cw_amp')}
     with open(f'{out_dir}/beads_{tag}.pkl', 'wb') as f:
@@ -1945,13 +2107,11 @@ def save_results(result, out_dir='results'):
     npz = f'{out_dir}/beads_{tag}_frames.npz'
     kw = dict(Ez=ezs, meta=meta, scenario=result['scenario'],
               layers=np.array(result['layers'], dtype=np.float64),
-              # Kern, 3 Schichten unter dem Kern, Substrat - Namen frei (--layer-names);
-              # der Bead steht getrennt (bead_n/bead_material), nicht mehr auf Platz 2.
-              material_names=np.array(result.get('layer_names')
-                                      or ['WG', 'Lipid', 'Aqueous', 'Mucin', 'Cornea']),
-              material_indices=np.array([result['wg_n'], result.get('n_lip', N_LIPID),
-                                         result['n_aq'], result['n_mucin'], result['n_cornea']],
-                                        dtype=np.float64),
+              # Kern, Schichten unter dem Kern, Substrat - Namen frei (--layer-names /
+              # --layers); der Bead steht getrennt (bead_n/bead_material).
+              material_names=_mat_names,
+              material_indices=_mat_idx,
+              **_stk_kw,
               bead_n=np.array([result.get('bead_n', 0.0)]),
               bead_material=np.array([str(result.get('bead_material', ''))]),
               bead_x_um=np.array([result.get('bead_x_um', BEAD_X_UM)]),
