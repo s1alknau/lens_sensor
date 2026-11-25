@@ -21,6 +21,7 @@ import run_simulation as rs                     # noqa: E402  (Parser + Aufloesu
 from common.physics import n_at, cornea_default   # noqa: E402
 import meep_backend as mb                        # noqa: E402
 import meep_to_npz as mnpz                       # noqa: E402
+from common import vcsel                         # noqa: E402
 
 
 def _load_cad(args):
@@ -36,6 +37,8 @@ def _load_cad(args):
                 lz=float(d['lz_um']), y0=float(d['y0_um']), z0=float(d['z0_um']),
                 x_src=float(d['x_src_um']), src_y=float(d['src_y_um']),
                 src_z=float(d['src_z_um']), src_tilt=float(d['src_tilt_deg']),
+                src_air=(float(d['src_air_um']) if 'src_air_um' in d.files else None),
+                facet_x=(float(d['facet_x_um']) if 'facet_x_um' in d.files else None),
                 det_in_x=float(d['det_in_x_um']), det_out_x=float(d['det_out_x_um']),
                 meta=json.loads(str(d['meta_json'])),
                 stem=os.path.splitext(os.path.basename(path))[0].replace('_meep_cad_', ''))
@@ -136,10 +139,15 @@ def _build_cfg(args, layers):
     # Flussebenen wie native bei 10 % / 90 % der Laenge (ganzer Querschnitt),
     # mindestens 0.5 um hinter der Quelle bzw. vor dem rechten PML
     _fi, _fo = (0.1, 0.9) if args.dim == 2 else (0.2, 0.8)     # wie native (2D/3D)
-    det_in_x = max(src_x + 0.5, _fi*lx)
+    # VCSEL in Luft vor der Facette (wie native): Facette den Luftweg hinter der Quelle,
+    # input_gap = Luftweg Quelle -> Facette (Geometrie), Strahltaille distance davor
+    _vd = float(args.input_gap or 0.0)
+    _air = vcsel.air_path_um(_vd, 1.0/resolution)
+    det_in_x = max(src_x + _air + 0.5, _fi*lx)        # Eingangsebene im WG
     det_out_x = max(det_in_x + 0.5, min(_fo*lx, lx - dpml - 0.5))
     # GUI-Parameter, die native kennt: Einkoppelabstand, Endfacette (3D full)
-    extra = dict(input_gap=float(args.input_gap or 0.0),
+    extra = dict(input_gap=_air, vcsel_distance=_vd, vcsel_z=vcsel.z_at_source(_vd, _air),
+                 laser_power_mw=float(getattr(args, 'laser_power', 20.0) or 20.0),
                  end_facet=float(getattr(args, 'end_facet', 0.0) or 0.0),
                  curved=bool(getattr(args, 'curved', False) and args.geometry == 'lens'),
                  r_bend_um=8300.0, lx_total=lx)   # R wie native (R_BEND = 8.3 mm)
@@ -151,6 +159,9 @@ def _build_cfg(args, layers):
         y_bot, y_top = cadd['y0'], cadd['y0'] + cadd['ly']
         src_x = cadd['x_src']
         det_in_x, det_out_x = cadd['det_in_x'], cadd['det_out_x']
+        if cadd.get('src_air') is not None:        # Taillenlage relativ zur CAD-Facette
+            extra.update(vcsel_z=vcsel.z_at_source(_vd, cadd['src_air']), input_gap=0.0,
+                         x_facet=cadd['facet_x'])
         label = 'cad' + str(args.dim) + 'd_meep_' + cadd['stem']
         extra.update(cad=cadd, src_y=cadd['src_y'], src_z=cadd['src_z'] - (cadd['z0'] + lz/2.0),
                      cad_tilt=cadd['src_tilt'])
@@ -164,7 +175,8 @@ def _build_cfg(args, layers):
         lam_nm=lam, f0=1000.0/lam, resolution=resolution,
         pol=args.polarization, source_type=args.source_type,
         n_snapshots=args.snapshots, vcsel_waist=args.vcsel_waist,
-        vcsel_waist_z=args.vcsel_waist_z, wg_width=args.wg_width,
+        vcsel_waist_z=(args.vcsel_waist_z if args.vcsel_waist_z is not None else args.vcsel_waist),
+        wg_width=args.wg_width,
         src_x=src_x, det_in_x=det_in_x, det_out_x=det_out_x, run_time=None, dpml=dpml,
         vcsel_offset=args.vcsel_offset, vcsel_offset_z=args.vcsel_offset_z,
         vcsel_tilt=args.vcsel_tilt, pulse_cycles=args.pulse_cycles,

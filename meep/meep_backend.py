@@ -10,6 +10,10 @@ import os
 import sys
 import numpy as np
 import meep as mp
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+from common import vcsel                         # noqa: E402  (gemeinsames VCSEL-Modell)
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -282,45 +286,39 @@ def build_geometry(cfg):
     return g
 
 
-def build_source(cfg):
-    """Gauss-Spot (Taille y, in 3D auch z) an x=src_x auf der getriebenen Komponente
-    (Ez fuer s/TE, Ey fuer p/TM). CW oder Puls."""
-    f0 = cfg['f0']
-    comp = mp.Ez if cfg['pol'] == 's' else mp.Ey
+def _src_center(cfg):
+    """Quellmitte (Meep-Koordinaten) und Strahlparameter wie native (WG-Mitte + Versatz,
+    CAD: auf die Eintrittsflaeche ausgerichtet)."""
     is3d = cfg['dim'] == 3
-    wy = max(cfg['vcsel_waist'], 2.0/cfg['resolution'])
-    wz = max(cfg.get('vcsel_waist_z', cfg['vcsel_waist']), 2.0/cfg['resolution'])
-    # Spot-Mitte wie native: WG-Mitte + Versatz (y, in 3D auch z)
-    y_c = cfg['src_y'] if 'src_y' in cfg else cfg['t_wg']/2   # CAD: auf die Eintrittsflaeche
+    y_c = cfg['src_y'] if 'src_y' in cfg else cfg['t_wg']/2
     y_off = y_c + (cfg.get('vcsel_offset') or 0.0) - cfg['cy']
     z_off = ((cfg.get('src_z') or 0.0) + (cfg.get('vcsel_offset_z') or 0.0)) if is3d else 0.0
     tilt = (cfg.get('vcsel_tilt') or 0.0) + (cfg.get('cad_tilt') or 0.0)
-    # Neigung wie native: Winkel im MEDIUM an der Quelle (k0*n*sin). Kern, wenn die Quelle
-    # ohne Einkoppelabstand im Kern sitzt; sonst Luft (CAD: Quelle vor der Facette).
-    y_abs_c = y_c + (cfg.get('vcsel_offset') or 0.0)
-    in_core = ('src_y' not in cfg and not (cfg.get('input_gap') or 0) > 0
-               and 0.0 <= y_abs_c < cfg['t_wg'])
-    n_src = float(cfg['wg_n']) if in_core else 1.0
-    if not in_core and cfg.get('stack') is not None and not (cfg.get('input_gap') or 0) > 0             and y_abs_c < 0.0:
-        # frei konfigurierter Stapel: Medium unter dem Kern am Quellpunkt (wie native
-        # _n_source_2d). Legacy-Pfad unveraendert (dort bisher Luft, s. Bericht).
-        n_src = n_below_core(cfg, y_abs_c)
-    ky = 2*np.pi*f0*n_src*np.sin(np.radians(tilt))     # Neigung: Phasenrampe (wie native)
-    core_only = bool(cfg.get('source_core_only')) and 'src_y' not in cfg
-    if cfg.get('source_core_only') and not core_only:
-        print('[meep] Note: --source-core-only applies to the layer stack only, not to CAD')
-    from common.physics import core_source_mask
+    return mp.Vector3(cfg['src_x'] - cfg['cx'], y_off, z_off), tilt
 
-    def amp(p):
-        a = np.exp(-((p.y)/wy)**2)       # p ist relativ zum Quell-Zentrum
-        if is3d:
-            a *= np.exp(-((p.z)/wz)**2)
-        if core_only:                    # nur durch den Kern einkoppeln (weiche Kante)
-            a *= float(core_source_mask(p.y + y_off + cfg['cy'], cfg['t_wg'],
-                                        z_um=(p.z + z_off) if is3d else None,
-                                        wg_width_um=cfg.get('wg_width') if is3d else None))
-        return complex(a)*np.exp(1j*ky*p.y)
 
+def _plain_air_background(cfg):
+    """GaussianBeamSource braucht ein homogenes Medium an der Quelle; Meep nimmt dafuer
+    default_material. Gilt fuer den eingebauten Stapel (Luft vor der Facette); CAD/gekruemmt
+    (Gitter-Material) -> Fallback auf die weiche Quelle."""
+    return _grid(cfg) is None
+
+
+def build_source(cfg):
+    """VCSEL (common/vcsel.py): Gauss-Strahl TEM00 in Luft vor der Facette, Taille
+    vcsel_waist im Abstand vcsel_distance vor der Facette (Standard 0 = ebene Wellenfront
+    auf der Facette), einseitig abstrahlend. Meep >= 1.24: GaussianBeam2D/3DSource (exakter
+    Strahl ueber aequivalente E- und H-Stroeme). Fallback (Gitter-Material): weiche
+    Quelle mit demselben Profil (Taille, Kruemmung, Neigung), beidseitig.
+    Konvention wie native: positive Neigung -> Strahl Richtung -y (native Phasenrampe
+    sin(w t + k sin(theta) y)); Meep-Felder ~ exp(-i w t) -> Phase konjugiert."""
+    f0 = cfg['f0']
+    comp = mp.Ez if cfg['pol'] == 's' else mp.Ey
+    is3d = cfg['dim'] == 3
+    center, tilt = _src_center(cfg)
+    w0 = float(cfg['vcsel_waist'])
+    w0z = float(cfg.get('vcsel_waist_z') or w0)
+    zprop = float(cfg.get('vcsel_z', 0.0))          # Quellebene relativ zur Taille
     if cfg['source_type'] == 'pulse':
         # wie native: Huellkurve exp(-(t/sp)^2), sp = Perioden/f0 -> Meep-Breite
         # exp(-(t^2)/(2 w^2)) mit w = sp/sqrt(2), fwidth = 1/w
@@ -329,7 +327,35 @@ def build_source(cfg):
     else:
         src = mp.ContinuousSource(frequency=f0)
     size = mp.Vector3(0, cfg['ly'] - 2*cfg.get('dpml', 0.0), cfg['lz'] if is3d else 0)
-    center = mp.Vector3(cfg['src_x'] - cfg['cx'], y_off, z_off)
+    th = np.radians(tilt)
+    kdir = mp.Vector3(np.cos(th), -np.sin(th), 0)
+    if cfg.get('source_core_only'):
+        print('[meep] Note: --source-core-only is not applied to the VCSEL beam (source in air)')
+    gb = getattr(mp, 'GaussianBeam3DSource' if is3d else 'GaussianBeam2DSource', None)         or getattr(mp, 'GaussianBeamSource', None)
+    if gb is not None and _plain_air_background(cfg):
+        if is3d and abs(w0z - w0) > 1e-9:
+            print(f'[meep] Note: GaussianBeam source is round -> waist_z {w0z:g} ignored, '
+                  f'w0 = {w0:g} um')
+        pol = mp.Vector3(0, 0, 1) if cfg['pol'] == 's' else mp.Vector3(np.sin(th), np.cos(th), 0)
+        x0 = kdir.scale(-zprop)                     # Fokus (Taille) relativ zur Quellmitte
+        cfg['vcsel_impl'] = 'meep-gaussianbeam'
+        return [gb(src=src, center=center, size=size, beam_x0=x0, beam_kdir=kdir,
+                   beam_w0=w0, beam_E0=pol)]
+    # Fallback: weiche Quelle mit dem VCSEL-Profil (beidseitig -> Leistung nicht exakt)
+    print('[meep] Note: grid material (CAD/curved) -> VCSEL as soft source (emits both ways; '
+          'emitted power not measured)')
+    cfg['vcsel_impl'] = 'soft'
+    lam_nm = cfg['lam_nm']
+
+    def amp(p):                                      # p relativ zur Quellmitte
+        if is3d:
+            a, ph = vcsel.profile_2d([p.y], [p.z], 0.0, 0.0, zprop, w0, w0z, lam_nm, 1.0, tilt)
+            a, ph = float(a[0, 0]), float(ph[0, 0])
+        else:
+            a, ph = vcsel.profile_1d([p.y], 0.0, zprop, w0, lam_nm, 1.0, tilt)
+            a, ph = float(a[0]), float(ph[0])
+        return complex(a)*np.exp(-1j*ph)             # native sin(wt+ph) <-> Meep exp(-i(wt+ph))
+
     return [mp.Source(src=src, component=comp, center=center, size=size, amp_func=amp)]
 
 
@@ -377,9 +403,12 @@ def run(cfg, progress=True):
     # Puls: Fluss-DFT ueber den ganzen Lauf. CW: erst NACH dem Einschwingen (s. u.),
     # sonst zaehlt die Eingangsebene den Einschaltvorgang laenger als die
     # Ausgangsebene (Laufzeit) und T wird systematisch zu klein.
+    _dsrc = 2.0/cfg['resolution']                    # Ebenen um die VCSEL-Quelle
     if not is_cw:
         f_in = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['det_in_x']))
         f_out = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['det_out_x']))
+        f_up = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['src_x'] - _dsrc))
+        f_dn = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['src_x'] + _dsrc))
 
     n_grp = max(cfg['wg_n'], 1.4)
     T = cfg.get('run_time') or (2.2*cfg['lx']*n_grp + 20.0)
@@ -451,6 +480,8 @@ def run(cfg, progress=True):
         # Fluss im eingeschwungenen Zustand (komplexes Feld -> DFT bei f0 exakt)
         f_in = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['det_in_x']))
         f_out = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['det_out_x']))
+        f_up = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['src_x'] - _dsrc))
+        f_dn = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['src_x'] + _dsrc))
         sim.run(until=4*Tp)
 
     pin = float(mp.get_fluxes(f_in)[0])
@@ -461,6 +492,14 @@ def run(cfg, progress=True):
     out = dict(frames=frames, times=times, P_in=pin, P_out=pout, transmission=Tr,
                transmission_def='poynting', cw_rel_change=cw_rel,
                shape=frames[0].shape if frames else None)
+    # VCSEL: abgestrahlte Leistung = Netto-Fluss aus dem Bereich um die Quelle
+    pup = float(mp.get_fluxes(f_up)[0]); pdn = float(mp.get_fluxes(f_dn)[0])
+    p_emit = pdn - pup
+    if cfg.get('vcsel_impl') == 'meep-gaussianbeam' and p_emit > 0:
+        eta = pin/p_emit
+        out.update(p_emit=p_emit, coupling_efficiency=eta, facet_reflection=-pup/p_emit)
+        print(f'[meep VCSEL] emitted P={p_emit:.4e} (Meep units)  facet reflection='
+              f'{-100*pup/p_emit:.2f}%  coupled through input plane: eta={100*eta:.2f}%')
     if cw_frames is not None:
         out.update(cw_frames=cw_frames, cw_times=cw_times)
     return out

@@ -27,6 +27,7 @@ from common.physics import (C0, EPS0, MU0, N_AIR, DISPERSION, n_at, cornea_defau
                             loss_sigma, core_source_mask, SRC_CORE_RAMP_UM)
 from common.subpixel import circle_fraction, blend, cell_average_column  # noqa: E402
 from common.flux import PlaneFluxDFT, pairs_2d, pairs_3d, guard_in_plane  # noqa: E402,F401
+from common import vcsel                                                  # noqa: E402
 from common.layer_stack import (stack_total_um, legacy_stack, legacy_layers_tuple,  # noqa: E402
                                 stack_to_npz, describe as describe_stack)
 BEAD_SUBPIXEL = True     # Bead-Rand per Volumenanteil glaetten (False = harte Maske)
@@ -53,6 +54,9 @@ TEAR_BUFFER = 10.0e-6
 KAPPA = {}
 # Quelle nur im Kern einpraegen (--source-core-only), gesetzt vom Treiber
 SRC_CORE_ONLY = False
+# optische VCSEL-Leistung [mW] (--laser-power), gesetzt vom Treiber; nur fuer die
+# Skalierung im Analyzer (FDTD ist linear) und die Ausgabe der eingekoppelten Leistung
+LASER_POWER_MW = vcsel.VCSEL_DEFAULTS['power_mw']
 LAM_LOSS = 850e-9       # Wellenlaenge, bei der kappa -> sigma umgerechnet wird (je Lauf gesetzt)
 T_MU = 0.5e-6            # Mucin-Dicke (physiologisch ~0.2-0.5 um)
 T_AQ = 3.5e-6            # Aqueous(Wasser)-Dicke (physiologisch ~3-4 um; > typ. Bead)
@@ -364,27 +368,71 @@ def _n_source_2d(cad, src_x_um, Ny, iy_src, y0_m, dx, wg_n, T_WG, n_below, gap_u
     return float(N_AIR) if y >= T_WG else float(np.real(n_below))
 
 
-def _src_setup(Ny, dx, T_WG, vcsel_offset, vcsel_waist, y0_m=None, y_center_m=None):
-    """Gauss-Profil der Quelle in y. Standard: WG-Mitte + Versatz. y_center_m
-    (CAD: automatisch ausgerichtete Mitte) ersetzt die WG-Mitte; y0_m = y bei j=0."""
-    if y0_m is None:                                 # zur Laufzeit (TEAR_BUFFER variabel)
+def _vcsel_geom_2d(src_ix, dx, distance_um):
+    """VCSEL vor der Facette: (x_facette_um, Luftweg_um, z_um an der Quellebene).
+    Die Facette (WG-Eintritt) liegt den Luftweg hinter der Quellebene src_ix."""
+    air = vcsel.air_path_um(distance_um, dx*1e6)
+    return src_ix*dx*1e6 + air, air, vcsel.z_at_source(distance_um, air)
+
+
+def _vcsel_source_2d(Ny, dx, dt, T_WG, src_ix, vcsel_offset, vcsel_waist, lambda_nm, tilt,
+                     n_src, z_um, f0, y0_m=None, y_center_m=None):
+    """VCSEL-Gauss-Strahl (Taille, Kruemmung, Neigung) als einseitige Huygens-Quelle in der
+    Spalte src_ix. Rueckgabe (iy_src, src_TE, src_TM_ey). Siehe common/vcsel.py."""
+    if y0_m is None:
         y0_m = -TEAR_BUFFER
-    y_wg_center = (T_WG/2 if y_center_m is None else y_center_m) + vcsel_offset*1e-6
-    iy_src = int(round((y_wg_center - y0_m)/dx))
-    waist_pix = max(2, int(round(vcsel_waist*1e-6/dx)))
-    ys_idx = xp.arange(Ny, dtype=xp.float32)
-    src_p = xp.exp(-((ys_idx - iy_src)/waist_pix)**2)
+    yc = (T_WG/2 if y_center_m is None else y_center_m) + vcsel_offset*1e-6
+    iy_src = int(round((yc - y0_m)/dx))
+    y_um = (y0_m + np.arange(Ny)*dx)*1e6
+    amp, ph = vcsel.profile_1d(y_um, yc*1e6, z_um, vcsel_waist, lambda_nm, n_src, tilt)
     if SRC_CORE_ONLY:
         if y_center_m is None:
-            # nur durch den Kern einkoppeln (weiche Kante), kein direkter Ausläufer in
-            # Luft/Traenenfilm. Gewicht auf den Knoten y_j (Ez bzw. Mittel fuer Ey).
-            y_um = (y0_m + np.arange(Ny)*dx)*1e6
-            src_p = src_p*xp.asarray(core_source_mask(y_um, T_WG*1e6).astype(np.float32))
+            amp = amp*core_source_mask(y_um, T_WG*1e6)
             print('  Source in core only (--source-core-only, soft edge '
                   f'{SRC_CORE_RAMP_UM:g} um)')
         else:
             print('  [Note] --source-core-only applies to the layer stack only, not to CAD')
-    return iy_src, src_p, ys_idx
+    kdx = vcsel.numerical_kx_dx(lambda_nm, dx, C0*dt, n_src, tilt)
+    src = vcsel.HuygensSource(src_ix, amp, ph, 2*np.pi*f0, kdx)
+    return iy_src, src, src.to_ey()
+
+
+def _cad_air_um(_s, src_x_um):
+    """CAD: Abstand Quellebene -> Facettenmitte [um] (Luftweg des Strahls)."""
+    fc = np.asarray(_s['facet_center'], dtype=float)
+    return float(np.hypot(fc[0] - src_x_um, fc[1] - _s['y_um']))
+
+
+def _emit_power(flux, dx):
+    """Abgestrahlte VCSEL-Leistung [W/m] aus den Ebenen um das Huygens-Paar
+    (P_emit = S_dn - S_up) und reflektierter Anteil [W/m]; (None, None) ohne Daten."""
+    if not (flux.has('src_up') and flux.has('src_dn')):
+        return None, None
+    up, dn = flux.flux('src_up'), flux.flux('src_dn')
+    return (dn - up)*dx, -up*dx
+
+
+def _vcsel_result(res, p_emit, p_refl, distance_um, air_um, x_facet_um, vcsel_waist,
+                  p_in=None, energy=False):
+    """VCSEL-Kennwerte ins Ergebnis (Leistungsskalierung im Analyzer, Kopplung).
+    p_emit/p_refl: abgestrahlte/reflektierte Leistung [W/m] (energy=True: Pulsenergie
+    [J/m], dann nur Kopplungseffizienz, keine Leistungsskalierung). p_in: Fluss durch die
+    Eingangsebene im WG (Standard: res['p_in_si'])."""
+    res['laser_power_mw'] = LASER_POWER_MW
+    res['vcsel_distance_um'] = float(distance_um or 0.0)
+    res['vcsel_air_um'] = float(air_um)
+    res['vcsel_waist_um'] = float(vcsel_waist)
+    res['x_facet_um'] = float(x_facet_um)
+    res['p_src_si'] = None if energy else p_emit
+    if p_emit and p_emit > 0:
+        if p_in is None:
+            p_in = res.get('p_in_si')
+        eta = (p_in/p_emit) if p_in is not None else float('nan')
+        res['coupling_efficiency'] = eta
+        res['facet_reflection'] = (p_refl/p_emit) if p_refl is not None else float('nan')
+        print(f'[VCSEL] emitted {"energy" if energy else "P"}={p_emit:.4e} {"J/m" if energy else "W/m"}  '
+              f'facet reflection={100*res["facet_reflection"]:.2f}%  coupled through input plane: '
+              f'eta={100*eta:.2f}%  -> at {LASER_POWER_MW:g} mW: {LASER_POWER_MW*eta:.3f} mW')
 
 
 # ------------------------------------------------------------------ TM (p-Pol)
@@ -481,7 +529,7 @@ _RUN_BEADS_ARGS = None
 
 
 def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snapshots=12,
-              wg_thickness_um=5.0, lambda_nm=850.0, vcsel_waist=2.0, vcsel_tilt=0.0,
+              wg_thickness_um=5.0, lambda_nm=850.0, vcsel_waist=3.0, vcsel_tilt=0.0,
               vcsel_offset=0.0, source_type='cw', method='full',
               window_w_um=350.0, slide_um=150.0, place_bead=True, t_aqueous_um=None,
               t_mucin_um=None, t_lipid_um=0.0, input_gap_um=0.0, length_um=None,
@@ -576,6 +624,13 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
     label = f'WG-{wg_mat}_Bead-{bead_mat}_d{bead_d_um:g}_L{lambda_nm:g}' + ('' if place_bead else '_ref')
     dx = dx_nm*1e-9
     dt = 0.5*dx/(C0*np.sqrt(2))
+    NPML = 10
+    _cpml = boundary.lower() == 'cpml'
+    src_ix = (NPML + 2) if _cpml else 5              # Quelle nicht in die PML legen
+    # VCSEL in Luft vor der Facette: input_gap_um = Abstand Taille -> Facette
+    _vd = float(input_gap_um or 0.0)
+    x_facet_um, _air, _zsrc = _vcsel_geom_2d(src_ix, dx, _vd)
+    input_gap_um = x_facet_um                        # ab hier: Facettenposition (Geometrie)
     if cad is not None:                              # freie CAD-Geometrie
         _cm = cad.meta()
         label = f'CAD-{os.path.splitext(_cm["cad_file"])[0]}_z{cad.z0_um:g}_L{lambda_nm:g}'
@@ -633,29 +688,28 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
     Ex_t = xp.zeros((Nx-1, Ny), dtype=xp.float32)
     Ey_t = xp.zeros((Nx, Ny-1), dtype=xp.float32)
     Hz_t = xp.zeros((Nx-1, Ny-1), dtype=xp.float32)
-    NPML = 10
-    _cpml = boundary.lower() == 'cpml'
-    src_ix = (NPML + 2) if _cpml else 5              # Quelle nicht in die PML legen
     tilt = vcsel_tilt
+    _yc = None
     if cad is not None:
         # Quelle automatisch auf die Eintrittsflaeche des Kerns: Zentrum so, dass der
         # Strahl die Facettenmitte trifft, Neigung = Innennormale (Versatz/Neigung
         # der Eingabe wirken als Korrektur obendrauf).
         _s = cad.source(src_ix*dx*1e6)
         tilt = vcsel_tilt + _s['tilt_deg']
-        iy_src, src_p, ys_idx = _src_setup(Ny, dx, T_WG, vcsel_offset, vcsel_waist,
-                                           y0_m=y0_m, y_center_m=_s['y_um']*1e-6)
+        _yc = _s['y_um']*1e-6
+        _air = _cad_air_um(_s, src_ix*dx*1e6); _zsrc = vcsel.z_at_source(_vd, _air)
+        x_facet_um = float(_s['facet_center'][0])
         print(f'Source (auto): facet {np.round(_s["facet_center"][:2], 2)} um, '
               f'normal {np.round(_s["facet_normal"][:2], 3)} -> spot y={_s["y_um"] + vcsel_offset:.2f}um '
               f'at x={src_ix*dx*1e6:.2f}um, tilt {tilt:.2f} deg')
-    else:
-        iy_src, src_p, ys_idx = _src_setup(Ny, dx, T_WG, vcsel_offset, vcsel_waist)
-    src_p_ey = 0.5*(src_p[:-1] + src_p[1:])           # Ey-Gitter (Ny-1)
-    f0 = C0/LAM; sigma_t = 4/(2*np.pi*f0); k0 = 2*np.pi/LAM
-    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, iy_src, y0_m, dx, wg_n, T_WG,
+    f0 = C0/LAM; sigma_t = 4/(2*np.pi*f0)
+    _iy0 = int(round(((T_WG/2 if _yc is None else _yc) + vcsel_offset*1e-6 - y0_m)/dx))
+    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, _iy0, y0_m, dx, wg_n, T_WG,
                           n_aq_l if stack is None else _stack_n_below(stack, n_co_l), input_gap_um)
-    phase_y = float(np.sin(np.radians(tilt)))*k0*_n_src*(ys_idx - iy_src)*dx   # Winkel im Medium an der Quelle
-    phase_y_ey = 0.5*(phase_y[:-1] + phase_y[1:])
+    iy_src, _vs, _vs_ey = _vcsel_source_2d(Ny, dx, dt, T_WG, src_ix, vcsel_offset, vcsel_waist,
+                                           lambda_nm, tilt, _n_src, _zsrc, f0, y0_m=y0_m,
+                                           y_center_m=_yc)
+    print('  ' + vcsel.describe(vcsel_waist, lambda_nm, _vd, _air, LASER_POWER_MW))
     mur = mur1_coeff(dx, dt)
     bnd = make_boundary(boundary, _pol, Nx, Ny, dx, dt, npml=NPML, lam_m=LAM)
     if not _cpml:
@@ -688,13 +742,14 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
         iyi0, iyi1, iyo0, iyo1 = iy_lo, iy_hi, iy_lo, iy_hi
     # Eingangsfenster stromab der Quelle halten (sonst misst es die Rueckwaerts-Haelfte)
     _ci = (ixin0 + ixin1)//2
-    _sh = guard_in_plane(_ci, src_ix, Nx) - _ci
+    _sh = guard_in_plane(_ci, max(src_ix, int(round(x_facet_um/(dx*1e6)))), Nx) - _ci   # im WG
     ixin0, ixin1 = ixin0 + _sh, min(Nx, ixin1 + _sh)
     P_in = 0.0; P_out = 0.0
     P_in_d = xp.zeros((), dtype=xp.float64); P_out_d = xp.zeros((), dtype=xp.float64)
     # Exakter CW-Poynting-Fluss (E und H) durch die Mitten der Detektorfenster
     _flux = PlaneFluxDFT(2*np.pi*f0, dt)
-    _fl_planes = {'in': max(1, (ixin0 + ixin1)//2), 'out': max(1, (ixout0 + ixout1)//2)}
+    _fl_planes = {'in': max(1, (ixin0 + ixin1)//2), 'out': max(1, (ixout0 + ixout1)//2),
+                  'src_up': _vs.plane_up, 'src_dn': _vs.plane_dn}   # VCSEL-Leistung
     # CW-Steady per laufendem DFT bei f0 (letzte ~8 Perioden) -> zweiter,
     # eingeschwungener Frame-Satz (Phasen ueber 1 Periode), zusaetzlich zum
     # transienten (einlaufenden) Satz. Akkumulation auf dem Device.
@@ -745,10 +800,7 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
             else:
                 Ex_t[:, 1:-1] += Ca_ex[:, 1:-1]*(Hz_t[:, 1:] - Hz_t[:, :-1])
                 Ey_t[1:-1, :] += -Ca_ey[1:-1, :]*(Hz_t[1:, :] - Hz_t[:-1, :])
-            if tilt != 0.0:
-                Ey_t[src_ix, :] += envelope*xp.sin(2*np.pi*f0*t_phys + phase_y_ey)*src_p_ey
-            else:
-                Ey_t[src_ix, :] += envelope*float(np.sin(2*np.pi*f0*t_phys))*src_p_ey
+            _vs_ey.inject(Ey_t, t_phys, envelope)     # VCSEL (einseitig, Huygens)
             if _cpml:
                 bnd.terminate(Ex_t, Ey_t)            # PEC hinter der PML
             else:                                    # Mur 1. Ordnung (Default)
@@ -773,10 +825,7 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
                 Ez[1:-1, 1:-1] = (Ce_E[1:-1, 1:-1]*Ez[1:-1, 1:-1]
                                   + Ce_H[1:-1, 1:-1]*((Hy[1:, 1:-1] - Hy[:-1, 1:-1])
                                                       - (Hx[1:-1, 1:] - Hx[1:-1, :-1])))
-            if tilt != 0.0:
-                Ez[src_ix, :] += envelope*xp.sin(2*np.pi*f0*t_phys + phase_y)*src_p
-            else:
-                Ez[src_ix, :] += envelope*float(np.sin(2*np.pi*f0*t_phys))*src_p
+            _vs.inject(Ez, t_phys, envelope)         # VCSEL (einseitig, Huygens)
             if _cpml:
                 bnd.terminate(Ez)                    # PEC hinter der PML
             else:                                    # Mur 1. Ordnung (Default)
@@ -868,6 +917,8 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
     res['transmission_intensity'] = Tr_I; res['transmission_def'] = tr_def
     res['steps_total'] = steps_total
     res['p_in_si'] = _p_si; res['p_in_unit'] = 'W/m'   # fuer Leistungs-Skalierung (Analyzer)
+    _vcsel_result(res, *(_emit_power(_flux, dx) if source_type != 'pulse' else (None, None)),
+                  _vd, _air, x_facet_um, vcsel_waist)
     if cad is not None:
         res['cad'] = dict(cad.meta(), cad_tilt_deg=tilt,
                           cad_det=[[ixin0, ixin1, iyi0, iyi1], [ixout0, ixout1, iyo0, iyo1]])
@@ -903,6 +954,10 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
     label = f'WG-{wg_mat}_Bead-{bead_mat}_d{bead_d_um:g}_L{lambda_nm:g}' + ('' if place_bead else '_ref')
     dx = dx_nm*1e-9
     dt = 0.5*dx/(C0*np.sqrt(2))
+    # VCSEL in Luft vor der Facette: input_gap_um = Abstand Taille -> Facette
+    _vd = float(input_gap_um or 0.0)
+    x_facet_um, _air, _zsrc = _vcsel_geom_2d((10 + 2) if _is_cpml else 5, dx, _vd)
+    input_gap_um = x_facet_um                        # ab hier: Facettenposition (Geometrie)
     if cad is not None:                              # freie CAD-Geometrie
         _cm = cad.meta()
         label = f'CAD-{os.path.splitext(_cm["cad_file"])[0]}_z{cad.z0_um:g}_L{lambda_nm:g}'
@@ -932,11 +987,13 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
     src_ix = (10 + 2) if _is_cpml else 5             # Quelle nicht in die PML legen
     tilt = vcsel_tilt
     cad_region = None
+    _yc = None
     if cad is not None:
         _s = cad.source(src_ix*dx*1e6)               # Quelle auf die Eintrittsflaeche
         tilt = vcsel_tilt + _s['tilt_deg']
-        iy_src, src_p, ys_idx = _src_setup(Ny, dx, T_WG, vcsel_offset, vcsel_waist,
-                                           y0_m=y0_m, y_center_m=_s['y_um']*1e-6)
+        _yc = _s['y_um']*1e-6
+        _air = _cad_air_um(_s, src_ix*dx*1e6); _zsrc = vcsel.z_at_source(_vd, _air)
+        x_facet_um = float(_s['facet_center'][0])
         Nx_full = int(round(L/dx))
         cad_region = np.zeros((Nx_full, Ny), dtype=np.int8)
         for _x0 in range(0, Nx_full, 4096):
@@ -946,14 +1003,14 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
         det_x = ((0.5*(_a0 + _a1)*dx*1e6, 'in', iyi0, iyi1),
                  (0.5*(_b0 + _b1)*dx*1e6, 'out', iyo0, iyo1))
         print(f'Source (auto): spot y={_s["y_um"] + vcsel_offset:.2f}um, tilt {tilt:.2f} deg')
-    else:
-        iy_src, src_p, ys_idx = _src_setup(Ny, dx, T_WG, vcsel_offset, vcsel_waist)
-    src_p_ey = 0.5*(src_p[:-1] + src_p[1:])
-    f0 = C0/LAM; sigma_t = 4/(2*np.pi*f0); k0 = 2*np.pi/LAM
-    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, iy_src, y0_m, dx, wg_n, T_WG,
+    f0 = C0/LAM; sigma_t = 4/(2*np.pi*f0)
+    _iy0 = int(round(((T_WG/2 if _yc is None else _yc) + vcsel_offset*1e-6 - y0_m)/dx))
+    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, _iy0, y0_m, dx, wg_n, T_WG,
                           n_aq_l if stack is None else _stack_n_below(stack, n_co_l), input_gap_um)
-    phase_y = float(np.sin(np.radians(tilt)))*k0*_n_src*(ys_idx - iy_src)*dx   # Winkel im Medium an der Quelle
-    phase_y_ey = 0.5*(phase_y[:-1] + phase_y[1:])
+    iy_src, _vs, _vs_ey = _vcsel_source_2d(Ny, dx, dt, T_WG, src_ix, vcsel_offset, vcsel_waist,
+                                           lambda_nm, tilt, _n_src, _zsrc, f0, y0_m=y0_m,
+                                           y_center_m=_yc)
+    print('  ' + vcsel.describe(vcsel_waist, lambda_nm, _vd, _air, LASER_POWER_MW))
     mur = mur1_coeff(dx, dt)
     NPML = 10
     bnd = make_boundary(_bnd_kind, _pol, Nx, Ny, dx, dt, npml=NPML, lam_m=LAM) if _use_bnd else None
@@ -965,11 +1022,13 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
         iy_lo = int(round((0.0 + TEAR_BUFFER)/dx)); iy_hi = int(round((T_WG + TEAR_BUFFER)/dx))
         det_x = ((0.1*L_um, 'in', iy_lo, iy_hi), (0.9*L_um, 'out', iy_lo, iy_hi))
     # Eingangsebene stromab der Quelle halten (Quelle sitzt im ersten Fenster bei src_ix)
-    _xi_g = guard_in_plane(int(round(det_x[0][0]/(dx*1e6))), src_ix, int(round(L/dx)))*dx*1e6
+    _xi_g = guard_in_plane(int(round(det_x[0][0]/(dx*1e6))),
+                           max(src_ix, int(round(x_facet_um/(dx*1e6)))), int(round(L/dx)))*dx*1e6   # im WG
     det_x = ((_xi_g,) + tuple(det_x[0][1:]), det_x[1])
     iy_h_det =max(1, int(round(min(DET_LEN/2, 0.05*L_um*1e-6)/dx)))   # halbe Fensterbreite in x
     P_in = xp.zeros((), dtype=xp.float64); P_out = xp.zeros((), dtype=xp.float64)   # Device
     S_in = xp.zeros((), dtype=xp.float64); S_out = xp.zeros((), dtype=xp.float64)   # Poynting
+    S_up = xp.zeros((), dtype=xp.float64); S_dn = xp.zeros((), dtype=xp.float64)   # um die VCSEL-Quelle
     frames = []
     ez_mm = None; mm_path = None; k_fr = 0
     if save_frames:
@@ -1044,10 +1103,7 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
                     Ex_t[:, 1:-1] += Ca_ex[:, 1:-1]*(Hz_t[:, 1:] - Hz_t[:, :-1])
                     Ey_t[1:-1, :] += -Ca_ey[1:-1, :]*(Hz_t[1:, :] - Hz_t[:-1, :])
                 if src_active:
-                    if tilt != 0.0:
-                        Ey_t[src_ix, :] += envelope*xp.sin(2*np.pi*f0*t_phys + phase_y_ey)*src_p_ey
-                    else:
-                        Ey_t[src_ix, :] += envelope*float(np.sin(2*np.pi*f0*t_phys))*src_p_ey
+                    _vs_ey.inject(Ey_t, t_phys, envelope)   # VCSEL (einseitig, Huygens)
                 if _is_cpml:
                     bnd.terminate(Ex_t, Ey_t)
                 else:
@@ -1073,16 +1129,17 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
                                       + Ce_H[1:-1, 1:-1]*((Hy[1:, 1:-1] - Hy[:-1, 1:-1])
                                                           - (Hx[1:-1, 1:] - Hx[1:-1, :-1])))
                 if src_active:
-                    if tilt != 0.0:
-                        Ez[src_ix, :] += envelope*xp.sin(2*np.pi*f0*t_phys + phase_y)*src_p
-                    else:
-                        Ez[src_ix, :] += envelope*float(np.sin(2*np.pi*f0*t_phys))*src_p
+                    _vs.inject(Ez, t_phys, envelope)         # VCSEL (einseitig, Huygens)
                 if _is_cpml:
                     bnd.terminate(Ez)
                 else:
                     Ez[0, :] = ex1 + ms.xl*(Ez[1, :] - Ez[0, :]); Ez[-1, :] = ex2 + ms.xr*(Ez[-2, :] - Ez[-1, :])
                     Ez[:, 0] = ey1 + ms.b*(Ez[:, 1] - Ez[:, 0]); Ez[:, -1] = ey2 + ms.t*(Ez[:, -2] - Ez[:, -1])
                 field = Ez
+            if src_active:                              # Energie um die VCSEL-Quelle
+                for _il, _acc in ((_vs.plane_up, S_up), (_vs.plane_dn, S_dn)):
+                    _acc += (_sx_plane_2d('s', _il, Ez=Ez, Hy=Hy) if _pol == 's'
+                             else _sx_plane_2d('p', _il, Ey=Ey_t, Hz=Hz_t))
             for (xg, which, iy_lo, iy_hi) in det_x:
                 if x_start_um <= xg <= x_end_um:
                     cl = int(round((xg - x_start_um)*1e-6/dx))
@@ -1124,6 +1181,9 @@ def run_beads_sliding(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsho
                         x_wg_start_um=(input_gap_um or 0.0), x_wg_end_um=L_um,
                         polarization=_pol, stack=stack, n_lip=n_lip_l)
     res['transmission_intensity'] = Tr_I; res['transmission_def'] = tr_def
+    # VCSEL: abgestrahlte/reflektierte Energie (Zeitintegral, J/m) -> Kopplungseffizienz
+    _vcsel_result(res, (float(S_dn) - float(S_up))*dx, -float(S_up)*dx, _vd, _air, x_facet_um,
+                  vcsel_waist, p_in=S_in*dx, energy=True)
     if cad is not None:
         res['cad'] = dict(cad.meta(), cad_tilt_deg=tilt,
                           cad_det=[[int(det_x[0][0]/(dx*1e6)), int(det_x[0][0]/(dx*1e6)) + 1,
@@ -1178,6 +1238,10 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
     label = f'WG-{wg_mat}_Bead-{bead_mat}_d{bead_d_um:g}_L{lambda_nm:g}' + ('' if place_bead else '_ref')
     dx = dx_nm*1e-9
     dt = 0.5*dx/(C0*np.sqrt(2))
+    # VCSEL in Luft vor der Facette: input_gap_um = Abstand Taille -> Facette
+    _vd = float(input_gap_um or 0.0)
+    x_facet_um, _air, _zsrc = _vcsel_geom_2d((10 + 2) if _ucpml else 5, dx, _vd)
+    input_gap_um = x_facet_um                        # ab hier: Facettenposition (Geometrie)
     if cad is not None:                              # freie CAD-Geometrie
         _cm = cad.meta()
         label = f'CAD-{os.path.splitext(_cm["cad_file"])[0]}_z{cad.z0_um:g}_L{lambda_nm:g}'
@@ -1213,11 +1277,13 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
     src_ix = (NPML_ST + 2) if _ucpml else 5               # Quelle nicht in die x-PML
     tilt = vcsel_tilt
     cad_region = None
+    _yc = None
     if cad is not None:
         _s = cad.source(src_ix*dx*1e6)                    # Quelle auf die Eintrittsflaeche
         tilt = vcsel_tilt + _s['tilt_deg']
-        iy_src, src_p, ys_idx = _src_setup(Ny, dx, T_WG, vcsel_offset, vcsel_waist,
-                                           y0_m=y0_m, y_center_m=_s['y_um']*1e-6)
+        _yc = _s['y_um']*1e-6
+        _air = _cad_air_um(_s, src_ix*dx*1e6); _zsrc = vcsel.z_at_source(_vd, _air)
+        x_facet_um = float(_s['facet_center'][0])
         print(f'Source (auto): facet {np.round(_s["facet_center"][:2], 2)} um -> spot '
               f'y={_s["y_um"] + vcsel_offset:.2f}um, tilt {tilt:.2f} deg')
         # Regionskarte der ganzen Laenge (fuer Detektoren + Analyzer), blockweise
@@ -1225,13 +1291,13 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
         for _x0 in range(0, Nx_full, 4096):
             _x1 = min(_x0 + 4096, Nx_full)
             cad_region[_x0:_x1] = cad.eps2d(_x0*dx*1e6, _x1 - _x0, Ny, smooth=1)[1]
-    else:
-        iy_src, src_p, ys_idx = _src_setup(Ny, dx, T_WG, vcsel_offset, vcsel_waist)
-    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, iy_src, y0_m, dx, wg_n, T_WG,
+    _iy0 = int(round(((T_WG/2 if _yc is None else _yc) + vcsel_offset*1e-6 - y0_m)/dx))
+    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, _iy0, y0_m, dx, wg_n, T_WG,
                           n_aq_l if stack is None else _stack_n_below(stack, n_co_l), input_gap_um)
-    phase_y = float(np.sin(np.radians(tilt)))*k0*_n_src*(ys_idx - iy_src)*dx   # Winkel im Medium an der Quelle
-    src_p_ey = 0.5*(src_p[:-1] + src_p[1:])
-    phase_y_ey = 0.5*(phase_y[:-1] + phase_y[1:])
+    iy_src, _vs, _vs_ey = _vcsel_source_2d(Ny, dx, dt, T_WG, src_ix, vcsel_offset, vcsel_waist,
+                                           lambda_nm, tilt, _n_src, _zsrc, f0, y0_m=y0_m,
+                                           y_center_m=_yc)
+    print('  ' + vcsel.describe(vcsel_waist, lambda_nm, _vd, _air, LASER_POWER_MW))
     _Nyc = (Ny-1) if _pol == 'p' else Ny                  # y-Groesse der Hauptkomp.
     print(f'Polarization: {_pol}-pol ({"TM/Ey" if _pol=="p" else "TE/Ez"})'
           + f'  outer boundary: {_bnd_kind}; inner window boundaries: CPML (extension)')
@@ -1279,7 +1345,7 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
         iy_lo = int(round((0.0 + TEAR_BUFFER)/dx)); iy_hi = int(round((T_WG + TEAR_BUFFER)/dx))
         ix_in = int(round(0.1*Nx_full)); ix_out = int(round(0.9*Nx_full))
         iyi0, iyi1, iyo0, iyo1 = iy_lo, iy_hi, iy_lo, iy_hi
-    ix_in = guard_in_plane(ix_in, src_ix, Nx_full)       # stromab der Quelle
+    ix_in = guard_in_plane(ix_in, max(src_ix, int(round(x_facet_um/(dx*1e6)))), Nx_full)   # im WG
     _flux = PlaneFluxDFT(omega, dt)
     for w in range(n_win):
         gx0 = _gx0(w)
@@ -1290,6 +1356,8 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
         _ghi = min(gx0 + Nx_win, Nx_full)
         _fpl = {k: g - gx0 for k, g in (('in', ix_in), ('out', ix_out))
                 if _glo <= g < _ghi and g - gx0 >= 1}
+        if w == 0:                                  # VCSEL-Leistung um die Quelle
+            _fpl.update(src_up=_vs.plane_up, src_dn=_vs.plane_dn)
         Nxw = Nx_win + (0 if _last else _EXT)       # Rechengebiet dieses Fensters
         _bp = {}                                   # Bead-Daten fuer TM-Tensor
         if cad is not None:
@@ -1351,10 +1419,7 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                     Ex_t[:, 1:-1] += Ca_ex[:, 1:-1]*(Hz_t[:, 1:] - Hz_t[:, :-1])
                     Ey_t[1:-1, :] += -Ca_ey[1:-1, :]*(Hz_t[1:, :] - Hz_t[:-1, :])
                 if w == 0:
-                    if tilt != 0.0:
-                        Ey_t[src_ix, :] += env*xp.sin(2*np.pi*f0*t_phys + phase_y_ey)*src_p_ey
-                    else:
-                        Ey_t[src_ix, :] += env*float(np.sin(2*np.pi*f0*t_phys))*src_p_ey
+                    _vs_ey.inject(Ey_t, t_phys, env)          # VCSEL (einseitig, Huygens)
                     if not _pml_l:                   # linkes Ende: Mur, ausser echtes CPML-Ende
                         Ey_t[0, :] = ey_l + ms.xl*(Ey_t[1, :] - Ey_t[0, :])
                 else:
@@ -1390,10 +1455,7 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                                       + Ce_H[1:-1, 1:-1]*((Hy[1:, 1:-1] - Hy[:-1, 1:-1])
                                                           - (Hx[1:-1, 1:] - Hx[1:-1, :-1])))
                 if w == 0:
-                    if tilt != 0.0:
-                        Ez[src_ix, :] += env*xp.sin(2*np.pi*f0*t_phys + phase_y)*src_p
-                    else:
-                        Ez[src_ix, :] += env*float(np.sin(2*np.pi*f0*t_phys))*src_p
+                    _vs.inject(Ez, t_phys, env)               # VCSEL (einseitig, Huygens)
                     if not _pml_l:                   # linkes Ende: Mur, ausser echtes CPML-Ende
                         Ez[0, :] = ex1 + ms.xl*(Ez[1, :] - Ez[0, :])
                 else:
@@ -1506,6 +1568,7 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
     res['view_primary'] = 'cw'
     res['cw_only'] = True
     res['p_in_si'] = _p_si; res['p_in_unit'] = 'W/m'   # fuer Leistungs-Skalierung (Analyzer)
+    _vcsel_result(res, *_emit_power(_flux, dx), _vd, _air, x_facet_um, vcsel_waist)
     if ExI_full is not None:
         res['Iavg'] = ExI_full          # TM: volles <|E|^2> (TE: Analyzer mittelt die CW-Phasen exakt)
     if ExA_full is not None:
@@ -1556,6 +1619,10 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
     label = f'WG-{wg_mat}_Bead-{bead_mat}_d{bead_d_um:g}_L{lambda_nm:g}' + ('' if place_bead else '_ref')
     dx = dx_nm*1e-9
     dt = 0.5*dx/(C0*np.sqrt(2))
+    # VCSEL in Luft vor der Facette: input_gap_um = Abstand Taille -> Facette
+    _vd = float(input_gap_um or 0.0)
+    x_facet_um, _air, _zsrc = _vcsel_geom_2d(10 + 2, dx, _vd)
+    input_gap_um = x_facet_um                        # ab hier: Facettenposition (Geometrie)
     if cad is not None:
         _cm = cad.meta()
         label = f'CAD-{os.path.splitext(_cm["cad_file"])[0]}_z{cad.z0_um:g}_L{lambda_nm:g}'
@@ -1599,17 +1666,20 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
     # Quelle (nur Fenster 0)
     tilt = vcsel_tilt
     src_ix = NPML + 2
+    _yc = None
     if cad is not None:
         _s = cad.source(src_ix*dx*1e6)
         tilt = vcsel_tilt + _s['tilt_deg']
-        iy_src, src_p, ys_idx = _src_setup(Ny, dx, T_WG, vcsel_offset, vcsel_waist,
-                                           y0_m=y0_m, y_center_m=_s['y_um']*1e-6)
-    else:
-        iy_src, src_p, ys_idx = _src_setup(Ny, dx, T_WG, vcsel_offset, vcsel_waist)
-    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, iy_src, y0_m, dx, wg_n, T_WG,
+        _yc = _s['y_um']*1e-6
+        _air = _cad_air_um(_s, src_ix*dx*1e6); _zsrc = vcsel.z_at_source(_vd, _air)
+        x_facet_um = float(_s['facet_center'][0])
+    _iy0 = int(round(((T_WG/2 if _yc is None else _yc) + vcsel_offset*1e-6 - y0_m)/dx))
+    _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, _iy0, y0_m, dx, wg_n, T_WG,
                           n_aq_l if stack is None else _stack_n_below(stack, n_co_l), input_gap_um)
-    phase_y = float(np.sin(np.radians(tilt)))*k0*_n_src*(ys_idx - iy_src)*dx   # Winkel im Medium an der Quelle
-    src_p_ey = 0.5*(src_p[:-1] + src_p[1:]); phase_y_ey = 0.5*(phase_y[:-1] + phase_y[1:])
+    iy_src, _vs, _vs_ey = _vcsel_source_2d(Ny, dx, dt, T_WG, src_ix, vcsel_offset, vcsel_waist,
+                                           lambda_nm, tilt, _n_src, _zsrc, f0, y0_m=y0_m,
+                                           y_center_m=_yc)
+    print('  ' + vcsel.describe(vcsel_waist, lambda_nm, _vd, _air, LASER_POWER_MW))
     env_t = np.exp(-((np.arange(N)*dt - tc)/sp)**2)
     os.makedirs('results', exist_ok=True)
     _safe = ''.join(c if (c.isalnum() or c in '-_.') else '_' for c in label)
@@ -1622,6 +1692,7 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
     rec_in = None                                   # (E(n), H(n+1/2)) fuer dieses Fenster
     P_in = P_out = 0.0
     S_in = S_out = 0.0                                          # Poynting (Pulsenergie)
+    S_up = S_dn = 0.0                                           # um die VCSEL-Quelle (Fenster 0)
     cad_region = None
     if cad is not None:
         cad_region = np.zeros((Nx_full, Ny), dtype=np.int8)
@@ -1633,7 +1704,7 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
     else:
         iyi0 = iyo0 = int(round(TEAR_BUFFER/dx)); iyi1 = iyo1 = int(round((T_WG + TEAR_BUFFER)/dx))
         ix_in = int(round(0.1*Nx_full)); ix_out = int(round(0.9*Nx_full))
-    ix_in = guard_in_plane(ix_in, src_ix, Nx_full)       # stromab der Quelle
+    ix_in = guard_in_plane(ix_in, max(src_ix, int(round(x_facet_um/(dx*1e6)))), Nx_full)   # im WG
     for w in range(n_win):
         t1 = time.time()
         gx0 = _gx0(w); last = (w == n_win - 1)
@@ -1700,7 +1771,7 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
                 else:
                     e = float(env_t[n])
                     if e > 1e-9:
-                        Ez[src_ix, :] += e*xp.sin(omega*t_phys + phase_y)*src_p
+                        _vs.inject(Ez, t_phys, e)              # VCSEL (einseitig, Huygens)
                 bnd.terminate(Ez)
                 field = Ez
             else:
@@ -1719,7 +1790,7 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
                 else:
                     e = float(env_t[n])
                     if e > 1e-9:
-                        Ey_t[src_ix, :] += e*xp.sin(omega*t_phys + phase_y_ey)*src_p_ey
+                        _vs_ey.inject(Ey_t, t_phys, e)         # VCSEL (einseitig, Huygens)
                 bnd.terminate(Ex_t, Ey_t)
                 field = None
             hit = np.nonzero(n_j == n)[0]
@@ -1727,6 +1798,13 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
                 F = to_np(_tm_node_field(Ey_t) if _pol == 'p' else Ez)
                 for jj in hit:
                     fr_mm[jj, gx0 + a_g:gx0 + b_g] = F[a_g:b_g]
+            if w == 0:                                  # Energie um die VCSEL-Quelle
+                if _pol == 's':
+                    S_up += _sx_plane_2d('s', _vs.plane_up, Ez=Ez, Hy=Hy)
+                    S_dn += _sx_plane_2d('s', _vs.plane_dn, Ez=Ez, Hy=Hy)
+                else:
+                    S_up += _sx_plane_2d('p', _vs.plane_up, Ey=Ey_t, Hz=Hz_t)
+                    S_dn += _sx_plane_2d('p', _vs.plane_dn, Ey=Ey_t, Hz=Hz_t)
             # Detektoren (zeitintegriert, wie full): Kern-Ebene bei 10 % / 90 %
             for ixg, y_a, y_b, which in ((ix_in, iyi0, iyi1, 'in'), (ix_out, iyo0, iyo1, 'out')):
                 il = ixg - gx0
@@ -1774,6 +1852,8 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
                        x_wg_start_um=(input_gap_um or 0.0), x_wg_end_um=L_um, polarization=_pol,
                        stack=stack, n_lip=n_lip_l)
     res['transmission_intensity'] = Tr_I; res['transmission_def'] = tr_def
+    _vcsel_result(res, (float(S_dn) - float(S_up))*dx, -float(S_up)*dx, _vd, _air, x_facet_um,
+                  vcsel_waist, p_in=S_in*dx, energy=True)
     res.update(view_primary='transient', cw_only=False,
                pulse=dict(cycles=pulse_cycles, s_fs=sp*1e15, tmax_fs=t_max*1e15, dispersion=False))
     if cad is not None:
@@ -2104,6 +2184,7 @@ def save_results(result, out_dir='results'):
     if result.get('p_in_si') is not None:      # eingekoppelte Leistung (SI) -> Leistungs-Skalierung
         _kw_ia['p_in_si'] = np.array([float(result['p_in_si'])])
         _kw_ia['p_in_unit'] = np.array([str(result.get('p_in_unit', 'W/m'))])
+    _kw_ia.update(vcsel.npz_keys(result))               # VCSEL: Laserleistung, Kopplung
     npz = f'{out_dir}/beads_{tag}_frames.npz'
     kw = dict(Ez=ezs, meta=meta, scenario=result['scenario'],
               layers=np.array(result['layers'], dtype=np.float64),

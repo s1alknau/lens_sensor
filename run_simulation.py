@@ -41,6 +41,7 @@ for _sub in ("planar_beads", "planar_3d"):
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 from common.physics import n_at, tear_index_at, cornea_default, parse_n, split_n   # noqa: E402
+from common.vcsel import VCSEL_DEFAULTS                                    # noqa: E402
 
 # WSL-Ziel fuer den Meep-Zweig (Meep laeuft nur unter Linux).
 WSL_DISTRO = "Ubuntu-24.04"
@@ -168,6 +169,10 @@ def _prepare_meep_cad(args):
                         dx_um=dx, lx_um=cad.lx_um, ly_um=cad.ly_um, lz_um=cad.lz_um,
                         y0_um=cad.y0_um, z0_um=cad.z0_um, x_src_um=x_src,
                         src_y_um=src['y_um'], src_z_um=src['z_um'], src_tilt_deg=src['tilt_deg'],
+                        src_air_um=float(np.linalg.norm(np.asarray(src['facet_center'], float)
+                                                        - np.array([x_src, src['y_um'], src['z_um']])
+                                                        [:len(src['facet_center'])])),
+                        facet_x_um=float(src['facet_center'][0]),
                         det_in_x_um=lo[0] + 0.1*L, det_out_x_um=lo[0] + 0.9*L,
                         meta_json=_json.dumps(meta, default=float))
     print(f'[engine=meep] CAD prepared: {nx}x{ny}' + (f'x{nz}' if args.dim == 3 else '')
@@ -286,6 +291,7 @@ def _run_2d(args, layers):
     import fdtd2d_core as d2
     d2.KAPPA = dict(getattr(args, 'kappa', {}) or {})   # Absorption je Schicht
     d2.SRC_CORE_ONLY = bool(getattr(args, 'source_core_only', False))   # Quelle nur im Kern
+    d2.LASER_POWER_MW = float(args.laser_power)          # VCSEL-Leistung (Analyzer-Skalierung)
     result = d2.run_beads(
         wg_mat=args.wg_material, bead_mat=args.bead_material,
         bead_d_um=(args.bead_diameter if _place_bead(args) else 0.0),
@@ -328,6 +334,7 @@ def _run_3d(args, layers):
     import fdtd3d_core as f3d
     f3d.KAPPA = dict(getattr(args, 'kappa', {}) or {})  # Absorption je Schicht
     f3d.SRC_CORE_ONLY = bool(getattr(args, 'source_core_only', False))  # Quelle nur im Kern
+    f3d.LASER_POWER_MW = float(args.laser_power)         # VCSEL-Leistung (Analyzer-Skalierung)
     bead = None
     if _place_bead(args):
         bead = dict(x_um=(args.bead_x if args.bead_x is not None else args.length_um/2.0),
@@ -365,7 +372,8 @@ def _run_3d(args, layers):
                  _cornea_full_tear(layers, 1.2 if (args.boundary or 'cpml') == 'sponge'
                                    else 0.2)),
         lz_um=args.lz_um, dx_nm=args.resolution_nm,
-        vcsel_waist_um=args.vcsel_waist, vcsel_waist_z_um=args.vcsel_waist_z,
+        vcsel_waist_um=args.vcsel_waist,
+        vcsel_waist_z_um=(args.vcsel_waist_z if args.vcsel_waist_z is not None else args.vcsel_waist),
         source_type=args.source_type, n_snapshots=args.snapshots, bead=bead,
         vol_dtype=args.vol_dtype, wg_width_um=args.wg_width,
         n_clad_side=args.wg_clad_n, vcsel_tilt_deg=args.vcsel_tilt,
@@ -658,10 +666,28 @@ def build_parser():
                              'file _ref) for the bead difference. Check/set flag = '
                              'bead run only.')
 
-    g_src = ap.add_argument_group('Source (VCSEL)')
-    g_src.add_argument('--vcsel-waist', type=float, default=2.0, help='Waist (y) in um')
-    g_src.add_argument('--vcsel-waist-z', type=float, default=2.0, help='Waist z in um (3D only)')
-    g_src.add_argument('--vcsel-tilt', type=float, default=0.0, help='Beam tilt in degrees')
+    g_src = ap.add_argument_group(
+        'Source (VCSEL)',
+        'The VCSEL sits in air IN FRONT OF the coupling facet and emits a Gaussian TEM00 beam '
+        '(waist w0 at the emitter, wavefront curvature, forward-only Huygens source). Air path, '
+        'Fresnel reflection and mode coupling are computed rigorously by the FDTD. '
+        'Defaults: typical single-mode 850 nm VCSEL (w0 = 3 um -> ~10 deg full divergence, 20 mW).')
+    g_src.add_argument('--vcsel-waist', type=float, default=VCSEL_DEFAULTS['waist_um'],
+                       help='Beam waist w0 (1/e^2 intensity radius) in y, in um. Full far-field '
+                            'divergence = 2 atan(lambda/(pi w0)) (3 um -> 10.3 deg at 850 nm)')
+    g_src.add_argument('--vcsel-waist-z', type=float, default=None,
+                       help='Waist in z in um (3D only; default = --vcsel-waist, round beam)')
+    g_src.add_argument('--vcsel-tilt', type=float, default=VCSEL_DEFAULTS['tilt_deg'],
+                       help='Beam tilt in degrees')
+    g_src.add_argument('--vcsel-distance', '--input-gap', dest='input_gap', type=float,
+                       default=VCSEL_DEFAULTS['distance_um'],
+                       help='Distance VCSEL waist (emitter) -> coupling facet in um. '
+                            'Default 0 = waist with plane wavefront exactly on the facet. '
+                            '(--input-gap is the old name.)')
+    g_src.add_argument('--laser-power', type=float, default=VCSEL_DEFAULTS['power_mw'],
+                       metavar='MW', help='Optical output power of the VCSEL in mW (default 20). '
+                                          'Fields are scaled to it in the analyzer; the log '
+                                          'shows the power coupled into the waveguide.')
     g_src.add_argument('--source-core-only', action='store_true',
                        help='Inject the source ONLY inside the waveguide core (soft 0.2 um edge): '
                             'no direct light from the Gaussian tails into air/tear film '
@@ -670,8 +696,6 @@ def build_parser():
                        help='Spot offset in y (um); in 3D = offset y')
     g_src.add_argument('--vcsel-offset-z', type=float, default=0.0,
                        help='Spot offset in z (um, 3D only)')
-    g_src.add_argument('--input-gap', type=float, default=0.0,
-                       help='Laser-to-WG coupling gap in um (air path + Fresnel entry)')
 
     g_3d = ap.add_argument_group('3D specific')
     g_3d.add_argument('--lz-um', type=float, default=8.0,

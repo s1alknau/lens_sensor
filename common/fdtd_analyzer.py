@@ -178,12 +178,14 @@ def compute_npz_stats(path):
 POWER = {'mw': None, 'depth_um': 4.0}    # global fuer alle Dateien (Analyzer + Compare + Referenz)
 
 
-def power_scale(p_si, unit):
-    """Feld-Skalenfaktor s = sqrt(P_soll / P_sim) fuer eine Datei. p_si = vom Solver
-    exakt berechnete eingekoppelte Leistung (Fluss durch die Eingangsebene): 3D in W,
-    2D in W/m (pro Meter Tiefe in z -> mal angenommene Tiefe POWER['depth_um']).
-    Rueckgabe (s, P_sim_W) bzw. (1.0, None), wenn keine Skalierung (aus / Datei ohne p_in_si)."""
-    mw = POWER.get('mw')
+def power_scale(p_si, unit, mw_file=None):
+    """Feld-Skalenfaktor s = sqrt(P_soll / P_sim) fuer eine Datei. p_si = vom Solver exakt
+    berechnete Leistung: bei VCSEL-Laeufen die vom Laser ABGESTRAHLTE Leistung (p_src_si),
+    bei aelteren Dateien die eingekoppelte (Fluss durch die Eingangsebene). 3D in W, 2D in
+    W/m (pro Meter Tiefe in z -> mal angenommene Tiefe POWER['depth_um']).
+    P_soll: Eingabe 'Power [mW]', leer -> Laserleistung des Laufs (mw_file).
+    Rueckgabe (s, P_sim_W) bzw. (1.0, None), wenn keine Skalierung (aus / Datei ohne Leistung)."""
+    mw = POWER.get('mw') or mw_file
     if not mw or p_si is None or not np.isfinite(p_si) or p_si <= 0:
         return 1.0, None
     p_w = float(p_si)*(float(POWER['depth_um'])*1e-6 if str(unit) == 'W/m' else 1.0)
@@ -273,10 +275,24 @@ def _npz_stream_frames(path, name):
 
 
 def _npz_power(d):
+    """(P_sim [SI], Einheit, Laserleistung des Laufs [mW] oder None). VCSEL-Laeufe:
+    abgestrahlte Laserleistung (p_src_si) -> Skalierung auf die LASER-Leistung; aeltere
+    Dateien: eingekoppelte Leistung (p_in_si), ohne Standard-Leistung."""
     files = set(d.files)
-    p = float(np.asarray(d['p_in_si']).flat[0]) if 'p_in_si' in files else None
     u = str(np.asarray(d['p_in_unit']).flat[0]) if 'p_in_unit' in files else None
-    return p, u
+
+    def _f(k):
+        try:
+            v = float(np.asarray(d[k]).flat[0])
+            return v if np.isfinite(v) and v > 0 else None
+        except Exception:
+            return None
+    ps = _f('p_src_si') if 'p_src_si' in files else None
+    if ps is not None:
+        mw = _f('laser_power_mw') if 'laser_power_mw' in files else None
+        return ps, u, mw
+    p = float(np.asarray(d['p_in_si']).flat[0]) if 'p_in_si' in files else None
+    return p, u, None
 
 
 def _sibling_polarization(path):
@@ -350,7 +366,7 @@ def compare_stats(path, comp, cw):
         else:
             note = f'{comp} n/v'
         _sc, _pw = power_scale(*_npz_power(d))
-        if POWER.get('mw') and _pw is None:
+        if (POWER.get('mw') or _npz_power(d)[2]) and _pw is None:
             note = (note + ' ' if note else '') + 'no P'
     finally:
         d.close()
@@ -497,8 +513,8 @@ class Analyzer:
         self.pol_tag = 'TM/p' if self.pol == 'p' else 'TE/s'
         self.ex_amp2d = None
         # eingekoppelte Leistung (SI) -> Felder bei gewuenschter Leistung in V/m
-        self.p_in_si, self.p_in_unit = _npz_power(d)
-        self._escale, self._p_sim_w = power_scale(self.p_in_si, self.p_in_unit)
+        self.p_in_si, self.p_in_unit, self.p_laser_mw = _npz_power(d)
+        self._escale, self._p_sim_w = power_scale(self.p_in_si, self.p_in_unit, self.p_laser_mw)
         _sc = self._escale
 
         def _S(a, k=1):                         # Feld (k=1) bzw. Intensitaet (k=2) skalieren
@@ -1305,10 +1321,12 @@ class Analyzer:
         h = getattr(self, '_power_hint', None)
         if h is None:
             return
-        if not POWER.get('mw'):
+        _mwf = getattr(self, 'p_laser_mw', None)
+        if not POWER.get('mw') and not _mwf:
             t = 'empty = relative units'
         elif getattr(self, '_p_sim_w', None):
-            t = (f'P_sim = {self._p_sim_w:.3g} W -> fields x{self._escale:.3g} (V/m), '
+            t = (f'laser {POWER.get("mw") or _mwf:g} mW' + ('' if POWER.get('mw') else ' (from run)')
+                 + f': P_sim = {self._p_sim_w:.3g} W -> fields x{self._escale:.3g} (V/m), '
                  f'intensities x{self._escale**2:.3g}')
         else:
             t = 'this file has no power info (older run) -> unscaled'

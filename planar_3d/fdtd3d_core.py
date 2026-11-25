@@ -43,6 +43,7 @@ from common.physics import C0, EPS0, MU0, N_AIR, DISPERSION, n_at, cornea_defaul
 from common.physics import core_source_mask, SRC_CORE_RAMP_UM  # noqa: E402
 from common.subpixel import sphere_fraction, blend, cell_average_column  # noqa: E402
 from common.flux import PlaneFluxDFT, pairs_3d, guard_in_plane  # noqa: E402
+from common import vcsel                                         # noqa: E402
 from common.layer_stack import (stack_total_um, legacy_stack, legacy_layers_tuple,  # noqa: E402
                                 stack_to_npz, describe as describe_stack)
 BEAD_SUBPIXEL = True     # Bead-Rand per Volumenanteil glaetten (False = harte Maske)
@@ -51,6 +52,8 @@ BEAD_SUBPIXEL = True     # Bead-Rand per Volumenanteil glaetten (False = harte M
 KAPPA = {}
 # Quelle nur im Kern einpraegen (--source-core-only), gesetzt vom Treiber
 SRC_CORE_ONLY = False
+# optische VCSEL-Leistung [mW] (--laser-power), gesetzt vom Treiber (Analyzer-Skalierung)
+LASER_POWER_MW = vcsel.VCSEL_DEFAULTS['power_mw']
 LAM_LOSS = 850e-9        # Wellenlaenge fuer kappa -> sigma (je Lauf gesetzt)
 from planar_3d.boundaries3d import make_boundary_3d, mur_speeds_3d               # noqa: E402
 
@@ -492,44 +495,70 @@ def _build_gauss_source(n_sp, t_wg_um, y0_um, z0_um, dx_um, dx, LAM, Nj, Nk,
                         vcsel_waist_um, vcsel_waist_z_um,
                         vcsel_offset_y_um, vcsel_offset_z_um, vcsel_tilt_deg,
                         center_y_um=None, center_z_um=None, n_src_fn=None, pol='s',
-                        wg_width_um=None):
-    """Gauss-Spot-Quelle (Taille in y und z) auf der getriebenen Komponente.
+                        wg_width_um=None, dt=None, z_prop_um=0.0):
+    """VCSEL-Gauss-Strahl (Taillen y/z, Wellenfrontkruemmung, Neigung) als einseitige
+    Huygens-Quelle (common/vcsel.py) auf der getriebenen Komponente in der Ebene src_ix.
     Zentrum standardmaessig WG-Mitte (y=t_wg/2) und z=0; center_y_um/center_z_um
-    (CAD: automatisch auf die Eintrittsflaeche ausgerichtet) ersetzen das. Rueckgabe
-    (src_ix, j_src, k_src, src_p, use_tilt, src_phase); src_phase ist None ohne
-    Neigung. Geteilt von run_3d und run_3d_stitched (zuvor doppelt)."""
+    (CAD: automatisch auf die Eintrittsflaeche ausgerichtet) ersetzen das. z_prop_um:
+    Lage der Quellebene relativ zur Taille (z < 0: Taille stromab). Rueckgabe
+    (src_ix, j_src, k_src, src). Geteilt von allen 3D-Methoden."""
     src_ix = n_sp + 6
     cy = t_wg_um/2 if center_y_um is None else center_y_um
     cz = 0.0 if center_z_um is None else center_z_um
-    j_src = min(max(int(round((cy + vcsel_offset_y_um - y0_um)/dx_um)), 0), Nj-1)
-    k_src = min(max(int(round((cz + vcsel_offset_z_um - z0_um)/dx_um)), 0), Nk-1)
-    wy = max(2.0, vcsel_waist_um/dx_um)
-    wz = max(2.0, vcsel_waist_z_um/dx_um)
-    jj = xp.arange(Nj, dtype=xp.float32)[:, None]
-    kk = xp.arange(Nk, dtype=xp.float32)[None, :]
-    src_p = xp.exp(-((jj - j_src)/wy)**2 - ((kk - k_src)/wz)**2)
+    yc = cy + vcsel_offset_y_um; zc = cz + vcsel_offset_z_um
+    j_src = min(max(int(round((yc - y0_um)/dx_um)), 0), Nj-1)
+    k_src = min(max(int(round((zc - z0_um)/dx_um)), 0), Nk-1)
+    # Gitterlagen der getriebenen Komponente: Ey (p) bei j+1/2, Ez (s) bei k+1/2
+    _yv = y0_um + (np.arange(Nj) + (0.5 if pol == 'p' else 0.0))*dx_um
+    _zv = z0_um + (np.arange(Nk) + (0.5 if pol == 's' else 0.0))*dx_um
+    _n = float(n_src_fn(j_src, k_src)) if n_src_fn is not None else 1.0
+    lam_nm = LAM*1e9
+    amp, ph = vcsel.profile_2d(_yv, _zv, yc, zc, z_prop_um, vcsel_waist_um, vcsel_waist_z_um,
+                               lam_nm, _n, vcsel_tilt_deg)
     if SRC_CORE_ONLY:
         if center_y_um is None:
-            # nur durch den Kern einkoppeln (weiche Kante); Ey (p) liegt bei j+1/2
-            _yv = y0_um + (np.arange(Nj) + (0.5 if pol == 'p' else 0.0))*dx_um
-            _zv = z0_um + (np.arange(Nk) + (0.5 if pol == 's' else 0.0))*dx_um
             _m = core_source_mask(_yv[:, None], t_wg_um, z_um=_zv[None, :],
                                   wg_width_um=wg_width_um)
-            src_p = src_p*xp.asarray(_m.astype(np.float32))
+            amp = amp*_m
             print(f'  Source in core only (--source-core-only, soft edge {SRC_CORE_RAMP_UM:g} um)')
         else:
             print('  [Note] --source-core-only applies to the layer stack only, not to CAD')
-    # Strahlneigung in der x-y-Ebene: lineare Phasenrampe entlang y ueber die
-    # Quellebene -> der Gauss laeuft unter dem Winkel vcsel_tilt_deg zur x-Achse.
-    use_tilt = abs(vcsel_tilt_deg) > 1e-9
-    src_phase = None
-    if use_tilt:
-        # Winkel im MEDIUM an der Quelle (k0*n*sin); n_src_fn(j, k) -> n, sonst Vakuum
-        _n = float(n_src_fn(j_src, k_src)) if n_src_fn is not None else 1.0
+    if abs(vcsel_tilt_deg) > 1e-9:
         print(f'  Source tilt {vcsel_tilt_deg:g} deg in the medium n={_n:.3f} at the source')
-        _ky = 2*np.pi/LAM*_n*np.sin(np.deg2rad(vcsel_tilt_deg))*dx   # Phase pro Zelle in y
-        src_phase = xp.asarray(_ky*(np.arange(Nj) - j_src), dtype=xp.float32)[:, None]
-    return src_ix, j_src, k_src, src_p, use_tilt, src_phase
+    kdx = vcsel.numerical_kx_dx(lam_nm, dx, C0*dt, _n, vcsel_tilt_deg)
+    src = vcsel.HuygensSource(src_ix, amp, ph, 2*np.pi*C0/LAM, kdx)
+    return src_ix, j_src, k_src, src
+
+
+def _vcsel_geom_3d(n_sp, dx_um, distance_um):
+    """VCSEL vor der Facette: (x_src_um, x_facette_um, Luftweg_um, z_um an der Quellebene)."""
+    x_src_um = (n_sp + 6)*dx_um
+    air = vcsel.air_path_um(distance_um, dx_um)
+    return x_src_um, x_src_um + air, air, vcsel.z_at_source(distance_um, air)
+
+
+def _cad_air_um_3d(_s, x_src_um):
+    """CAD: Abstand Quellpunkt -> Facettenmitte [um]."""
+    fc = np.asarray(_s['facet_center'], dtype=float)
+    return float(np.sqrt((fc[0] - x_src_um)**2 + (fc[1] - _s['y_um'])**2
+                         + (fc[2] - _s['z_um'])**2))
+
+
+def _vcsel_res(p_emit, p_refl, p_in, distance_um, air_um, x_facet_um, waist_um, waist_z_um,
+               energy=False):
+    """VCSEL-Kennwerte fuers Ergebnis (W; energy=True: Pulsenergie J, keine Skalierung)."""
+    r = dict(laser_power_mw=LASER_POWER_MW, vcsel_distance_um=float(distance_um or 0.0),
+             vcsel_air_um=float(air_um), x_facet_um=float(x_facet_um),
+             vcsel_waist_um=float(waist_um), vcsel_waist_z_um=float(waist_z_um),
+             p_src_si=(None if energy else p_emit))
+    if p_emit and p_emit > 0:
+        eta = (p_in/p_emit) if p_in is not None else float('nan')
+        refl = (p_refl/p_emit) if p_refl is not None else float('nan')
+        r.update(coupling_efficiency=eta, facet_reflection=refl)
+        print(f'[VCSEL] emitted {"energy" if energy else "P"}={p_emit:.4e} {"J" if energy else "W"}  '
+              f'facet reflection={100*refl:.2f}%  coupled through input plane: eta={100*eta:.2f}%'
+              f'  -> at {LASER_POWER_MW:g} mW: {LASER_POWER_MW*eta:.3f} mW')
+    return r
 
 
 def _n_source_fn_3d(cad, x_src_um, Ny, Nz, y0_um, dx_um, wg_n, t_wg_um, n_below,
@@ -766,7 +795,7 @@ def run_3d(label, wg_n, t_wg_um=5.0,
            n_lip=1.480, n_aq=1.336, n_mu=1.342, n_co=1.376,
            lam_nm=850.0,
            lx_um=40.0, air_um=3.0, tear_um=None, lz_um=8.0,
-           dx_nm=50.0, vcsel_waist_um=2.0, vcsel_waist_z_um=2.0,
+           dx_nm=50.0, vcsel_waist_um=3.0, vcsel_waist_z_um=3.0,
            source_type='cw', n_snapshots=8, steps_factor=2.0,
            bead=None, n_sponge=None, sponge_um=1.2, sponge_alpha=0.3,
            det_in_um=None, det_out_um=None, vol_dtype='float32',
@@ -889,11 +918,11 @@ def run_3d(label, wg_n, t_wg_um=5.0,
               f'(Fresnel reflection)')
     # Einkoppelabstand: Quelle sitzt bei x=(n_sp+6)*dx; der WG beginnt input_gap
     # dahinter -> Laser laeuft input_gap um durch Luft bis zur Eintrittsfacette.
-    x_src_um = (n_sp + 6)*dx_um
-    x_wg_start_um = (x_src_um + input_gap_um) if (input_gap_um and input_gap_um > 0) else 0.0
-    if x_wg_start_um:
-        print(f'Coupling gap: laser at x={x_src_um:.2f}um, WG entry at '
-              f'x={x_wg_start_um:.2f}um -> {input_gap_um:g}um air path (Fresnel entry)')
+    # VCSEL in Luft vor der Facette: input_gap_um = Abstand Taille -> Facette
+    _vd = float(input_gap_um or 0.0)
+    x_src_um, x_wg_start_um, _air, _zsrc = _vcsel_geom_3d(n_sp, dx_um, _vd)
+    print(f'VCSEL: source plane x={x_src_um:.2f}um, WG entry (facet) at '
+          f'x={x_wg_start_um:.2f}um -> {_air:.2f}um air path (Fresnel entry)')
     cad_region = None
     _tp = {}                                  # Bead-Rand fuer Tensor-Mittelung
     if cad is not None:
@@ -944,6 +973,8 @@ def run_3d(label, wg_n, t_wg_um=5.0,
     if cad is not None:
         _s = cad.source((n_sp + 6)*dx_um)
         _cy, _cz = _s['y_um'], _s['z_um']
+        _air = _cad_air_um_3d(_s, x_src_um); _zsrc = vcsel.z_at_source(_vd, _air)
+        x_wg_start_um = float(_s['facet_center'][0])   # Facette (nur Ausgabe/Detektor-Schutz)
         vcsel_tilt_deg = vcsel_tilt_deg + _s['tilt_deg']
         print(f'Source (auto): facet {np.round(_s["facet_center"], 2)} um, normal '
               f'{np.round(_s["facet_normal"], 3)} -> spot y={_cy:.2f} z={_cz:.2f} um, '
@@ -951,7 +982,7 @@ def run_3d(label, wg_n, t_wg_um=5.0,
         if abs(_s['tilt_z_deg']) > 1.0:
             print(f'  [Note] Facet is also tilted in z ({_s["tilt_z_deg"]:.1f} deg): the '
                   f'source tilts only in the x-y plane.')
-    src_ix, j_src, k_src, src_p, _use_tilt, src_phase = _build_gauss_source(
+    src_ix, j_src, k_src, _vs = _build_gauss_source(
         n_sp, t_wg_um, y0_um, z0_um, dx_um, dx, LAM, _Nj, _Nk,
         vcsel_waist_um, vcsel_waist_z_um,
         vcsel_offset_y_um, vcsel_offset_z_um, vcsel_tilt_deg,
@@ -959,7 +990,9 @@ def run_3d(label, wg_n, t_wg_um=5.0,
         n_src_fn=_n_source_fn_3d(cad, x_src_um, Ny, Nz, y0_um, dx_um, wg_n, t_wg_um,
                                  n_aq if stack is None else _stack_n_below(stack, n_co),
                                  x_wg_start_um, _pol),
-        pol=_pol, wg_width_um=wg_width_um)
+        pol=_pol, wg_width_um=wg_width_um, dt=dt, z_prop_um=_zsrc)
+    print('  ' + vcsel.describe(vcsel_waist_um, lam_nm, _vd, _air, LASER_POWER_MW,
+                                waist_z_um=vcsel_waist_z_um))
     print(f'Polarization: {_pol}-pol -> source drives '
           f'{"Ey (TM, E in x-y plane)" if _pol=="p" else "Ez (TE, E along z)"}')
 
@@ -988,11 +1021,12 @@ def run_3d(label, wg_n, t_wg_um=5.0,
         iout0, iout1 = xrange_at(det_out_um)
     # Eingangsbox stromab der Quelle halten (sonst misst sie die Rueckwaerts-Haelfte)
     _ci = (iin0 + iin1)//2
-    _sh = guard_in_plane(_ci, src_ix, Nx) - _ci
+    _sh = guard_in_plane(_ci, max(src_ix, int(round(x_wg_start_um/dx_um))), Nx) - _ci   # im WG
     iin0, iin1 = iin0 + _sh, min(Nx, iin1 + _sh)
     det_in_um = 0.5*(iin0 + iin1)*dx_um
     _flux = PlaneFluxDFT(2*np.pi*f0, dt)          # exakter CW-Poynting-Fluss (E und H)
-    _fl_planes = {'in': max(1, (iin0 + iin1)//2), 'out': max(1, (iout0 + iout1)//2)}
+    _fl_planes = {'in': max(1, (iin0 + iin1)//2), 'out': max(1, (iout0 + iout1)//2),
+                  'src_up': _vs.plane_up, 'src_dn': _vs.plane_dn}   # VCSEL-Leistung
 
     # Laufzeit: Anlauf + steps_factor Transits beim GRUPPENindex (Marge N_G_FACTOR, die
     # reflektierte Welle laeuft mit v_g < c/n). Danach CW-Konvergenztest (s.u.).
@@ -1090,10 +1124,7 @@ def run_3d(label, wg_n, t_wg_um=5.0,
             envelope = float(np.exp(-((t_phys - 3*sp)/sp)**2))
         else:
             envelope = float(1 - np.exp(-((t_phys/(2*sigma_t))**2)))
-        if _use_tilt:
-            src_field[src_ix, :, :] += envelope*xp.sin(2*np.pi*f0*t_phys + src_phase)*src_p
-        else:
-            src_field[src_ix, :, :] += envelope*float(np.sin(2*np.pi*f0*t_phys))*src_p
+        _vs.inject(src_field, t_phys, envelope)     # VCSEL (einseitig, Huygens)
         # --- Absorber: CPML (im step) / Mur (Kanten) / gradierter Sponge ---
         if _cpml3d:
             pass                                 # Absorption + PEC-Abschluss im step
@@ -1249,7 +1280,11 @@ def run_3d(label, wg_n, t_wg_um=5.0,
             _cw_vol[k] = to_np(xp.real(Ecw*np.exp(1j*_omega*tk)).astype(_vdt_xp))
         _cw_vol.flush()
     _rs = _result_stack(stack, t_lip_um, t_aq_um, t_mu_um, n_lip, n_aq, n_mu)
-    return dict(scenario=label, dim='3D', P_in=P_in, P_out=P_out, p_in_si=_p_si, p_in_unit='W',
+    _cw_ok = source_type != 'pulse' and _flux.has('src_up') and _flux.has('src_dn')
+    _vres = _vcsel_res(((_flux.flux('src_dn') - _flux.flux('src_up'))*dx*dx) if _cw_ok else None,
+                       (-_flux.flux('src_up')*dx*dx) if _cw_ok else None, _p_si, _vd, _air,
+                       x_wg_start_um, vcsel_waist_um, vcsel_waist_z_um)
+    return dict(**_vres, scenario=label, dim='3D', P_in=P_in, P_out=P_out, p_in_si=_p_si, p_in_unit='W',
                 transmission=Tr, vols_array=_va,
                 vols_ex=_vx, vols_ey=_vy, vector=bool(save_vector),
                 _stream_paths=_stream_paths,
@@ -1277,7 +1312,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
                     t_wg_um=5.0, t_lip_um=0.0, t_aq_um=3.5, t_mu_um=0.5,
                     n_lip=1.480, n_aq=1.336, n_mu=1.342, n_co=1.376,
                     lam_nm=850.0, lx_um=40.0, air_um=3.0, tear_um=None, lz_um=8.0,
-                    dx_nm=50.0, vcsel_waist_um=2.0, vcsel_waist_z_um=2.0,
+                    dx_nm=50.0, vcsel_waist_um=3.0, vcsel_waist_z_um=3.0,
                     source_type='cw', n_snapshots=8,
                     bead=None, n_sponge=None, sponge_um=1.2, sponge_alpha=0.3,
                     det_in_um=None, det_out_um=None, vol_dtype='float32',
@@ -1335,8 +1370,9 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
     if O_cells < max(8, n_sp):
         print(f'  [WARN] overlap {O_cells} < sponge {n_sp} -> choose window_w >> slide.')
     # Quelle/WG-Geometrie in globalen Koordinaten
-    x_src_um = (n_sp + 6)*dx_um
-    x_wg_start_um = (x_src_um + input_gap_um) if (input_gap_um and input_gap_um > 0) else 0.0
+    # VCSEL in Luft vor der Facette: input_gap_um = Abstand Taille -> Facette
+    _vd = float(input_gap_um or 0.0)
+    x_src_um, x_wg_start_um, _air, _zsrc = _vcsel_geom_3d(n_sp, dx_um, _vd)
     # Trennung: die gewaehlte Randbedingung gilt fuer die AEUSSEREN Flaechen (y, z,
     # Eintritt, Austritt). Die inneren Fenstergrenzen (xmax innerer Fenster) bekommen
     # IMMER eine CPML in einer Verlaengerung (NICHT assembliert, NICHT uebergeben):
@@ -1455,6 +1491,8 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
     if cad is not None:
         _s = cad.source((n_sp + 6)*dx_um)
         _cy, _cz = _s['y_um'], _s['z_um']
+        _air = _cad_air_um_3d(_s, x_src_um); _zsrc = vcsel.z_at_source(_vd, _air)
+        x_wg_start_um = float(_s['facet_center'][0])   # Facette (nur Ausgabe/Detektor-Schutz)
         vcsel_tilt_deg = vcsel_tilt_deg + _s['tilt_deg']
         print(f'CAD {_cm["cad_file"]}: core "{cad.core}" n={wg_n:.3f}\n{cad.scene.summary(lam_nm)}')
         print(f'Source (auto): facet {np.round(_s["facet_center"], 2)} um -> spot '
@@ -1463,7 +1501,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
         for _x0 in range(0, Nx_full, 256):
             _x1 = min(_x0 + 256, Nx_full)
             cad_region[_x0:_x1] = cad.eps3d(_x0*dx_um, _x1 - _x0, Ny, Nz)[1]
-    src_ix, j_src, k_src, src_p, _use_tilt, src_phase = _build_gauss_source(
+    src_ix, j_src, k_src, _vs = _build_gauss_source(
         n_sp, t_wg_um, y0_um, z0_um, dx_um, dx, LAM, _Nj, _Nk,
         vcsel_waist_um, vcsel_waist_z_um,
         vcsel_offset_y_um, vcsel_offset_z_um, vcsel_tilt_deg,
@@ -1471,7 +1509,9 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
         n_src_fn=_n_source_fn_3d(cad, x_src_um, Ny, Nz, y0_um, dx_um, wg_n, t_wg_um,
                                  n_aq if stack is None else _stack_n_below(stack, n_co),
                                  x_wg_start_um, _pol),
-        pol=_pol, wg_width_um=wg_width_um)
+        pol=_pol, wg_width_um=wg_width_um, dt=dt, z_prop_um=_zsrc)
+    print('  ' + vcsel.describe(vcsel_waist_um, lam_nm, _vd, _air, LASER_POWER_MW,
+                                waist_z_um=vcsel_waist_z_um))
     # cosinus-Taper fuer weiche Overlap-Einpraegung (1 -> 0 ueber O_cells)
     _wtap = xp.asarray((0.5*(1.0 + np.cos(np.pi*np.arange(O_cells)/max(O_cells-1, 1)))
                         ).astype(np.float32))[:, None, None]
@@ -1502,7 +1542,8 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
     Ehand = None                                 # Handoff: komplexe Ex,Ey,Ez des Overlaps
     # Detektor-Ebenen (global) fuer den exakten CW-Poynting-Fluss (E und H), im Fenster
     # mitgeschrieben, das die Ebene assembliert (gleiche Ebenen wie die Auswertung unten).
-    _gi = guard_in_plane(min(max(int(round(det_in_um/dx_um)), 1), Nx_full - 2), src_ix, Nx_full)
+    _gi = guard_in_plane(min(max(int(round(det_in_um/dx_um)), 1), Nx_full - 2),
+                         max(src_ix, int(round(x_wg_start_um/dx_um))), Nx_full)   # im WG
     det_in_um = _gi*dx_um                        # auch fuer die Intensitaets-Kennzahl unten
     _go = min(max(int(round(det_out_um/dx_um)), 1), Nx_full - 2)
     _flux = PlaneFluxDFT(omega, dt)
@@ -1515,6 +1556,8 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
         _ghi = Nx_full if last else min(gx0 + Nx_win, Nx_full)
         _fpl = {k: g - gx0 for k, g in (('in', _gi), ('out', _go))
                 if _glo <= g < _ghi and g - gx0 >= 1}
+        if w == 0:                                # VCSEL-Leistung um die Quelle
+            _fpl.update(src_up=_vs.plane_up, src_dn=_vs.plane_dn)
         _off = (_gx0(w + 1) - gx0) if not last else 0   # Overlap-Start fuers naechste Fenster
         _tp = {}                                  # Bead-Rand fuer Tensor-Mittelung
         if cad is not None:
@@ -1580,10 +1623,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
             t_phys = n*dt
             env = float(1 - np.exp(-((t_phys/(2*sigma_t))**2)))
             if w == 0:
-                if _use_tilt:
-                    src_field[src_ix, :, :] += env*xp.sin(2*np.pi*f0*t_phys + src_phase)*src_p
-                else:
-                    src_field[src_ix, :, :] += env*float(np.sin(2*np.pi*f0*t_phys))*src_p
+                _vs.inject(src_field, t_phys, env)     # VCSEL (einseitig, Huygens)
             else:
                 _ph = np.complex64(np.exp(1j*omega*t_phys))
                 for F, D in zip((Ex, Ey, Ez), _drive):      # alle drei E-Komponenten
@@ -1717,7 +1757,11 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
     print(f'\n[Result] {label} [3D stitch]: total {total_time:.0f}s  '
           f'Transmission={Tr:.4f} ({tr_def})  [intensity: {Tr_I:.4f}]  ({n_win} windows)')
     _rs = _result_stack(stack, t_lip_um, t_aq_um, t_mu_um, n_lip, n_aq, n_mu)
-    return dict(scenario=label, dim='3D', P_in=P_in, P_out=P_out, p_in_si=_p_si, p_in_unit='W',
+    _cw_ok = source_type != 'pulse' and _flux.has('src_up') and _flux.has('src_dn')
+    _vres = _vcsel_res(((_flux.flux('src_dn') - _flux.flux('src_up'))*dx*dx) if _cw_ok else None,
+                       (-_flux.flux('src_up')*dx*dx) if _cw_ok else None, _p_si, _vd, _air,
+                       x_wg_start_um, vcsel_waist_um, vcsel_waist_z_um)
+    return dict(**_vres, scenario=label, dim='3D', P_in=P_in, P_out=P_out, p_in_si=_p_si, p_in_unit='W',
                 transmission=Tr, vols_array=vol_buf, vols_ex=None, vols_ey=None,
                 vector=False, _stream_paths=_stream_paths,
                 snap_steps=snap_steps, snap_times=snap_times, Iavg=Iavg,
@@ -1742,7 +1786,7 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
                        t_wg_um=5.0, t_lip_um=0.0, t_aq_um=3.5, t_mu_um=0.5,
                        n_lip=1.480, n_aq=1.336, n_mu=1.342, n_co=1.376,
                        lam_nm=850.0, lx_um=40.0, air_um=3.0, tear_um=None, lz_um=8.0,
-                       dx_nm=50.0, vcsel_waist_um=2.0, vcsel_waist_z_um=2.0,
+                       dx_nm=50.0, vcsel_waist_um=3.0, vcsel_waist_z_um=3.0,
                        source_type='pulse', n_snapshots=8, bead=None, n_sponge=None, sponge_um=1.2,
                        sponge_alpha=0.3, det_in_um=None, det_out_um=None, vol_dtype='float32',
                        wg_width_um=None, n_clad_side=N_AIR, vcsel_tilt_deg=0.0,
@@ -1791,8 +1835,9 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
     i0 = n_sp + 2                                   # TF/SF-Ebene im Folgefenster
     if O_cells < i0 + 4:
         raise ValueError(f'Overlap {O_cells} cells < {i0 + 4}: choose window_w >> slide.')
-    x_src_um = (n_sp + 6)*dx_um
-    x_wg_start_um = (x_src_um + input_gap_um) if (input_gap_um and input_gap_um > 0) else 0.0
+    # VCSEL in Luft vor der Facette: input_gap_um = Abstand Taille -> Facette
+    _vd = float(input_gap_um or 0.0)
+    x_src_um, x_wg_start_um, _air, _zsrc = _vcsel_geom_3d(n_sp, dx_um, _vd)
     _EXT = n_sp + 4
     x_wg_end_um = lx_um + _EXT*dx_um
     n_win = (int(np.ceil((Nx_full - Nx_win)/S_cells)) + 1) if Nx_full > Nx_win else 1
@@ -1818,19 +1863,23 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
     if cad is not None:
         _s = cad.source(x_src_um)
         _cy, _cz = _s['y_um'], _s['z_um']
+        _air = _cad_air_um_3d(_s, x_src_um); _zsrc = vcsel.z_at_source(_vd, _air)
+        x_wg_start_um = float(_s['facet_center'][0])   # Facette (nur Ausgabe/Detektor-Schutz)
         vcsel_tilt_deg = vcsel_tilt_deg + _s['tilt_deg']
         cad_region = np.zeros((Nx_full, Ny, Nz), dtype=np.int8)
         for _x0 in range(0, Nx_full, 256):
             _x1 = min(_x0 + 256, Nx_full)
             cad_region[_x0:_x1] = cad.eps3d(_x0*dx_um, _x1 - _x0, Ny, Nz)[1]
-    src_ix, j_src, k_src, src_p, _use_tilt, src_phase = _build_gauss_source(
+    src_ix, j_src, k_src, _vs = _build_gauss_source(
         n_sp, t_wg_um, y0_um, z0_um, dx_um, dx, LAM, _Nj, _Nk,
         vcsel_waist_um, vcsel_waist_z_um, vcsel_offset_y_um, vcsel_offset_z_um,
         vcsel_tilt_deg, center_y_um=_cy, center_z_um=_cz,
         n_src_fn=_n_source_fn_3d(cad, x_src_um, Ny, Nz, y0_um, dx_um, wg_n, t_wg_um,
                                  n_aq if stack is None else _stack_n_below(stack, n_co),
                                  x_wg_start_um, _pol),
-        pol=_pol, wg_width_um=wg_width_um)
+        pol=_pol, wg_width_um=wg_width_um, dt=dt, z_prop_um=_zsrc)
+    print('  ' + vcsel.describe(vcsel_waist_um, lam_nm, _vd, _air, LASER_POWER_MW,
+                                waist_z_um=vcsel_waist_z_um))
     env_t = np.exp(-((np.arange(N)*dt - tc)/sp)**2)
     if cad is not None:
         (_a0, _a1, j_wg0, j_wg1), (_b0, _b1, _jo0, _jo1) = cad.detectors(cad_region[:, :, cad.core_k(Nz)], 0.0)
@@ -1841,7 +1890,7 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
         iin = int(round(det_in_um/dx_um)); iout = int(round(det_out_um/dx_um))
         j_wg0 = int(round((0.0 - y0_um)/dx_um)); j_wg1 = int(round((t_wg_um - y0_um)/dx_um))
         _jo0, _jo1 = j_wg0, j_wg1
-    iin = guard_in_plane(iin, src_ix, Nx_full)       # stromab der Quelle
+    iin = guard_in_plane(iin, max(src_ix, int(round(x_wg_start_um/dx_um))), Nx_full)   # im WG
     g_sp = _sponge_profile(n_sp, sponge_alpha)
     vol_dt = np.float16 if vol_dtype == 'float16' else np.float32
     _vdt_xp = xp.float16 if vol_dtype == 'float16' else xp.float32
@@ -1862,6 +1911,7 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
     rec_in = None
     P_in = P_out = 0.0
     S_in = S_out = 0.0                                          # Poynting (Pulsenergie)
+    S_up = S_dn = 0.0                                           # um die VCSEL-Quelle (Fenster 0)
     for w in range(n_win):
         t1 = time.time()
         gx0 = _gx0(w); last = (w == n_win - 1)
@@ -1937,10 +1987,7 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
             else:
                 e = float(env_t[n])
                 if e > 1e-9:
-                    if _use_tilt:
-                        src_field[src_ix] += e*xp.sin(omega*t_phys + src_phase)*src_p
-                    else:
-                        src_field[src_ix] += e*float(np.sin(omega*t_phys))*src_p
+                    _vs.inject(src_field, t_phys, e)   # VCSEL (einseitig, Huygens)
             if _pml is None:
                 for F in (Ex, Ey, Ez, Hx, Hy, Hz):
                     _apply_sponge(F, g_sp, n_sp, ALL_FACES)
@@ -1951,6 +1998,9 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
                     vol_buf[jj, gx0 + a_g:gx0 + b_g] = blk
             if n % _m_I == 0:
                 _accum_E2(acc_I, Ex[:Nx_win-1], Ey[:Nx_win], Ez[:Nx_win])
+            if w == 0:                                 # Energie um die VCSEL-Quelle
+                S_up += _sx_plane_3d(_vs.plane_up, Ey, Ez, Hy, Hz)
+                S_dn += _sx_plane_3d(_vs.plane_dn, Ey, Ez, Hy, Hz)
             for ixg, which in ((iin, 'in'), (iout, 'out')):
                 il = ixg - gx0
                 if a_g <= il < b_g:
@@ -1997,7 +2047,10 @@ def run_3d_stitched_td(label, wg_n, window_w_um=20.0, slide_um=12.0,
     print(f'\n[Result] {label} [3D time-domain stitch]: total {total_time:.0f}s  '
           f'Transmission={Tr:.4f} ({tr_def})  [intensity: {Tr_I:.4f}]  ({n_win} windows)')
     _rs = _result_stack(stack, t_lip_um, t_aq_um, t_mu_um, n_lip, n_aq, n_mu)
-    return dict(scenario=label, dim='3D', P_in=P_in, P_out=P_out, transmission=Tr,
+    _ea = dx*dx*dt                                              # Flaeche x Zeit -> Energie [J]
+    _vres = _vcsel_res((float(S_dn) - float(S_up))*_ea, -float(S_up)*_ea, float(S_in)*_ea, _vd,
+                       _air, x_wg_start_um, vcsel_waist_um, vcsel_waist_z_um, energy=True)
+    return dict(**_vres, scenario=label, dim='3D', P_in=P_in, P_out=P_out, transmission=Tr,
                 vols_array=vol_buf, vols_ex=None, vols_ey=None, vector=False,
                 _stream_paths=_stream_paths, snap_steps=[int(n) for n in n_j],
                 snap_times=[float(n*dt) for n in n_j], Iavg=Iavg, total_time=total_time,
@@ -2290,6 +2343,7 @@ def save_results_3d(result, out_dir='results', prefix='fdtd3d',
     _kw_p = ({'p_in_si': np.array([float(result['p_in_si'])]),
               'p_in_unit': np.array([str(result.get('p_in_unit', 'W'))])}
              if result.get('p_in_si') is not None else {})
+    _kw_p.update(vcsel.npz_keys(result))                # VCSEL: Laserleistung, Kopplung
     _kw_ia.update(_kw_p)
     fr_path = f'{out_dir}/{prefix}_{tag}_frames.npz'
     np.savez_compressed(

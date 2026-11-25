@@ -128,10 +128,12 @@ _LABELS = {
     'kappa_bead': 'Bead absorption kappa (n = n + i*kappa)',
     'no_reference': 'Do NOT compute reference (bead run only)',
     # Quelle (VCSEL)
-    'vcsel_waist': 'Beam waist y (um)', 'vcsel_waist_z': 'Beam waist z (um, 3D only)',
+    'vcsel_waist': 'Beam waist w0 y (um, 1/e^2; 3 um = 10 deg divergence @850nm)',
+    'vcsel_waist_z': 'Beam waist z (um, 3D only; empty = same as y)',
+    'laser_power': 'Laser power (mW)',
     'vcsel_tilt': 'Beam tilt (deg)', 'source_core_only': 'Source only in the core (no direct light into the tear film)', 'vcsel_offset': 'Spot offset y (um)',
     'vcsel_offset_z': 'Spot offset z (um, 3D only)',
-    'input_gap': 'Coupling gap laser->WG (um)',
+    'input_gap': 'Distance waist->facet (um; 0 = plane wavefront on facet)',
     # 3D-spezifisch
     'lz_um': 'TOTAL domain depth z (+/-lz/2 around z=0)',
     'air': 'Air above WG (um, 3D only)',
@@ -348,7 +350,8 @@ class SimGUI:
             # Skizze bei Aenderung relevanter Felder neu zeichnen.
             for dest in ('geometry', 'dim', 'wg_material', 'wg_thickness_um', 'bead_diameter',
                          'bead_x', 'bead_y_um', 'no_bead', 'vcsel_offset', 'vcsel_tilt',
-                         'input_gap', 'length_um', 'wg_width', 'lz_um', 'scenario',
+                         'input_gap', 'laser_power', 'vcsel_waist', 'length_um', 'wg_width',
+                         'lz_um', 'scenario',
                          'cad', 'cad_plane_z', 'cad_scale', 'lambda_nm', 'layer_names'):
                 v = self.vars.get(dest)
                 if v is not None:
@@ -757,12 +760,14 @@ class SimGUI:
         ysrc = ycm - off*3.0
         dy = math.tan(math.radians(tilt))*(xL - 12)
         c.create_line(10, ysrc - dy, xL - 2, ysrc, fill='#e23', width=3, arrow='last')
-        c.create_text(10, ysrc - 12, anchor='w', text='VCSEL', fill='#e23',
-                      font=('Segoe UI', 7, 'bold'))
-        if gap > 0:
-            c.create_line(xL, yT, xL, yB, fill='#e23', dash=(2, 2))
-            c.create_text(xL + 3, yB - 6, anchor='w', text=f'gap {gap:g}um',
-                          fill='#e23', font=('Segoe UI', 6))
+        _pw = self._sketch_val('laser_power', 20.0)
+        _w0 = self._sketch_val('vcsel_waist', 3.0)
+        c.create_text(10, ysrc - 12, anchor='w', text=f'VCSEL {_pw:g} mW, w0={_w0:g}um',
+                      fill='#e23', font=('Segoe UI', 7, 'bold'))
+        c.create_line(xL, yT, xL, yB, fill='#e23', dash=(2, 2))     # Einkoppelflaeche
+        c.create_text(xL + 3, yB - 6, anchor='w',
+                      text=(f'waist {gap:g}um before facet' if gap > 0 else 'waist on facet'),
+                      fill='#e23', font=('Segoe UI', 6))
         # evaneszenter Pfeil in den Traenenfilm
         xa = xL + 0.62*(xR - xL)
         c.create_line(xa, ycore + core_h, xa, ycore + core_h + 0.16*Ht,

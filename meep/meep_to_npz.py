@@ -66,7 +66,7 @@ def _flags(has_cw=False):
                 cw_only=np.array([0]), view_primary=np.array(['transient']))
 
 
-def _extra(result):
+def _extra(result, cfg=None, dim=None):
     """Transmission (Poynting-Fluss ueber den ganzen Querschnitt) + CW-Konvergenz."""
     out = dict(engine=np.array(['meep']))
     if 'transmission' in result:
@@ -74,6 +74,20 @@ def _extra(result):
         out['transmission_def'] = np.array([str(result.get('transmission_def', 'poynting'))])
     if result.get('cw_rel_change') is not None:
         out['cw_rel_change'] = np.array([float(result['cw_rel_change'])])
+    # VCSEL-Leistung: Meep-Einheiten (eps0 = mu0 = c = 1, a = 1 um) -> SI-Aequivalent, mit den
+    # Feldzahlen als V/m: P = P_meep * a^(d-1) / Z0 (3D in W, 2D in W/m) -> Analyzer skaliert
+    # wie native auf die Laserleistung.
+    if result.get('p_emit') and dim in (2, 3):
+        _f = (1e-6**(dim - 1))/376.730313668
+        out['p_src_si'] = np.array([float(result['p_emit'])*_f])
+        out['p_in_si'] = np.array([float(result['P_in'])*_f])
+        out['p_in_unit'] = np.array(['W' if dim == 3 else 'W/m'])
+        out['coupling_efficiency'] = np.array([float(result['coupling_efficiency'])])
+        out['facet_reflection'] = np.array([float(result['facet_reflection'])])
+    if cfg is not None:
+        out['laser_power_mw'] = np.array([float(cfg.get('laser_power_mw') or 20.0)])
+        out['vcsel_distance_um'] = np.array([float(cfg.get('vcsel_distance') or 0.0)])
+        out['vcsel_waist_um'] = np.array([float(cfg.get('vcsel_waist') or 0.0)])
     return out
 
 
@@ -144,7 +158,7 @@ def save_2d(cfg, result, out_dir, prefix='meep'):
         t_wg_um=np.array([cfg['t_wg']]),
         **_wg_x_kw(cfg),
         polarization=np.array([cfg['pol']]), lam_nm=np.array([cfg['lam_nm']]),
-        **_bead_kw(cfg), **_flags(cw is not None), **cw_kw, **_extra(result),
+        **_bead_kw(cfg), **_flags(cw is not None), **cw_kw, **_extra(result, cfg, 2),
         **_cad_kw(cfg, ez.shape[1:]))
     print(f'  Saved: {path}  ({ez.shape})' + ('  +CW set' if cw is not None else ''))
     return path
@@ -171,7 +185,7 @@ def save_3d(cfg, result, out_dir, prefix='meep'):
         t_wg_um=np.array([cfg['t_wg']]),
         **_wg_x_kw(cfg),
         polarization=np.array([cfg['pol']]), lam_nm=np.array([cfg['lam_nm']]),
-        **bead, **_flags(cw is not None), **_extra(result),
+        **bead, **_flags(cw is not None), **_extra(result, cfg, 3),
         **(dict(Ez_cw=cw[:, :, :, kmid], meta_cw=meta_cw) if cw is not None else {}),
         **_cad_kw(cfg, ez_slice.shape[1:]))
     print(f'  Saved: {fr_path}  (z mid-plane {ez_slice.shape})')
@@ -191,7 +205,7 @@ def save_3d(cfg, result, out_dir, prefix='meep'):
         wg_width_um=np.array([cfg.get('wg_width') or 0.0]),
         lx_um=np.array([cfg.get('lx_total', cfg['lx'])]), lam_nm=np.array([cfg['lam_nm']]),
         polarization=np.array([cfg['pol']]),
-        **bead, **_flags(cw is not None), **_extra(result),
+        **bead, **_flags(cw is not None), **_extra(result, cfg, 3),
         **(dict(Ez_cw=cw, meta_cw=meta_cw) if cw is not None else {}))
     print(f'  Saved: {vol_path}  ({vol.shape})' + ('  +CW set' if cw is not None else ''))
     return fr_path
