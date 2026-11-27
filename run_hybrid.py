@@ -18,9 +18,15 @@ a margin; 'none' keeps the full lens thickness.
 
 Output:
   results/hybrid_<case>.npz : BPM over 0..x_h+L (|E|^2 every --bpm-rec-um) and the FDTD
-                              CW |E|^2 in lens coordinates, plus the power in core /
-                              tear film along x for both, and the z spreading w_z(x)
-                              (see run_bpm.py, --bpm-z-model).
+                              CW |E|^2 and complex field (fdtd_E) in lens coordinates, plus
+                              the power in core / tear film along x for both, and the z
+                              spreading w_z(x) (see run_bpm.py, --bpm-z-model). With
+                              --hybrid-end-um also ret_* : the BPM restarted from the FDTD
+                              field after the sensor, up to that x.
+
+Sensor: with --geometry planar and a bead (--bead-x in lens coordinates, default the middle
+of the FDTD region) the bead sits in the FDTD part; run once more with --no-bead for the
+reference (the difference is the sensor signal).
   results/beads_*_handoff<x>_full.pkl/.npz : the usual FDTD result (analyzer), with x
                               counted from the FDTD domain start (source at ~0.5 um).
 """
@@ -52,6 +58,10 @@ def build_parser():
     g.add_argument('--fdtd-y-top-um', default='auto',
                    help="Top of the FDTD domain in um ('auto' = BPM beam extent + "
                         f"{Y_TOP_MARGIN_UM:g} um, 'none' = full lens)")
+    g.add_argument('--hybrid-end-um', type=float, default=None,
+                   help='Return FDTD -> BPM: the field at the end of the FDTD region (after the '
+                        'sensor) restarts the BPM, which continues to this x (um, e.g. the lens '
+                        'end / detector). The undisturbed BPM is run to the same x for comparison.')
     g.add_argument('--hybrid-out', default=None, help='Output file (default results/hybrid_*.npz)')
     return ap
 
@@ -76,16 +86,20 @@ def main(argv=None):
     x_h, L_f = float(args.handoff_x_um), float(args.fdtd_length_um)
     if x_h <= 0 or L_f <= 0:
         raise SystemExit('--handoff-x-um and --fdtd-length-um must be > 0')
+    x_end = float(args.hybrid_end_um) if args.hybrid_end_um is not None else None
+    if x_end is not None and x_end <= x_h + L_f:
+        raise SystemExit('--hybrid-end-um must lie behind the FDTD region')
+    L_b = x_end if x_end is not None else x_h + L_f   # reference BPM runs this far
     args.length_um = x_h + L_f
     c = run_bpm.prepare(args)
     bp, y, pol = c['bp'], c['y'], c['pol']
     if args.geometry != 'lens' and args.geometry != 'planar':
         raise SystemExit('run_hybrid.py supports --geometry lens / planar.')
-    print(f'  Hybrid    : BPM 0 .. {x_h:g} um, FDTD {x_h:g} .. {x_h + L_f:g} um '
-          f'(BPM continued for comparison)')
+    print(f'  Hybrid    : BPM 0 .. {x_h:g} um, FDTD {x_h:g} .. {x_h + L_f:g} um'
+          + (f', BPM again .. {x_end:g} um' if x_end else '') + ' (BPM alone for comparison)')
 
     # ---- 1. BPM through everything, complex field kept at the hand-off plane
-    r = bp.propagate(c['u0'], x_h + L_f, dx_um=args.bpm_dx_um, rec_dx_um=args.bpm_rec_um,
+    r = bp.propagate(c['u0'], L_b, dx_um=args.bpm_dx_um, rec_dx_um=args.bpm_rec_um,
                      regions=c['regions'], probes_um=c['probes'], field_planes_um=(x_h,),
                      intensity='E', absorb_regions=c['absorb_regions'])
     u_h = r['fields'][x_h]
@@ -106,6 +120,11 @@ def main(argv=None):
     print(f'  FDTD      : {L_f:g} um at dx {args.resolution_nm:g} nm, y '
           f'{-d2.TEAR_BUFFER*1e6:g} .. {y_top if y_top is not None else c["t_wg"] + 5:g} um'
           + ('' if y_top is None else ' (cropped above the beam)'))
+    if rs._place_bead(args):                         # sensor in the FDTD part (planar)
+        if args.bead_x is None:
+            args.bead_x = x_h + 0.5*L_f
+        print(f'  Bead      : {args.bead_material} d={args.bead_diameter:g} um at x = '
+              f'{args.bead_x:g} um (lens coordinates, inside the FDTD region)')
     args.length_um = L_f
     args.method = 'full'
     args.input_gap = 0.0
@@ -149,7 +168,31 @@ def main(argv=None):
     print(f'    BPM  : max {tb.max():.3e} at x = {xb[in_f][int(np.argmax(tb))]:.1f} um')
 
     zb = run_bpm.z_model(args, c, xb); zf = run_bpm.z_model(args, c, x_f)
-    run_bpm.print_absorption(r, x_h + L_f)
+    run_bpm.print_absorption(r, L_b)
+
+    # ---- 4. Return FDTD -> BPM after the sensor
+    ret = {}
+    if x_end is not None:
+        x_all = x_h + np.arange(Nx)*dx - x_src
+        ki = np.nonzero(keep)[0]
+        ix_ret = int(ki[-1]) - 2                              # last clean column
+        ix_ref = int(ki[0]) + int(round(1.0/dx))              # 1 um behind the source
+        x_ret = float(x_all[ix_ret])
+        u_r, P_r = run_bpm.fdtd_column_to_bpm(c, E, y_f, ix_ret, ix_ref, P_h)
+        r2 = bp.propagate(u_r, x_end - x_ret, dx_um=args.bpm_dx_um, rec_dx_um=args.bpm_rec_um,
+                          x0_um=x_ret, regions=c['regions'], probes_um=c['probes'],
+                          intensity='E', absorb_regions=c['absorb_regions'])
+        P_b_ret = float(np.interp(x_ret, xb, r['P_total']))
+        Pc2 = _region_sum(r2['I'], y, w_b, 0.0, t_wg); Pt2 = _region_sum(r2['I'], y, w_b, yb, 0.0)
+        print(f'  Return    : FDTD field at x = {x_ret:.2f} um -> BPM to {x_end:g} um '
+              f'({r2["runtime_s"]:.0f} s); power there {P_r:.4f} (BPM alone {P_b_ret:.4f})')
+        print(f'  At the end: power {r2["P_total"][-1]:.4f} (BPM alone {r["P_total"][-1]:.4f}), '
+              f'core |E|^2 {Pc2[-1]:.4e} (BPM alone {Pc_b[-1]:.4e}), '
+              f'ratio {Pc2[-1]/Pc_b[-1]:.4f}')
+        ret = dict(ret_x_um=r2['x_um'], ret_I=r2['I'], ret_P_total=r2['P_total'],
+                   ret_P_core=Pc2, ret_P_tear=Pt2, ret_I_probe=r2['I_probe'], ret_x0_um=x_ret,
+                   bpm_P_total=r['P_total'],
+                   **{f'ret_A_cum_{k}': v for k, v in r2.get('A_cum', {}).items()})
     run_bpm.print_absolute(args, c, r, zb)
     sx = max(1, int(round(0.2/dx)))                  # store the FDTD map every ~0.2 um
     out = args.hybrid_out
@@ -163,6 +206,8 @@ def main(argv=None):
         bpm_x_um=xb, bpm_y_um=y, bpm_I=r['I'], bpm_P_core=Pc_b, bpm_P_tear=Pt_b,
         bpm_I_probe=r['I_probe'], probe_depths_um=np.asarray(run_bpm.PROBE_DEPTHS_UM),
         fdtd_x_um=x_f[::sx], fdtd_y_um=y_f, fdtd_I=I_f[::sx].astype(np.float32),
+        fdtd_E=E[keep][::sx].astype(np.complex64),       # complex CW field (TE Ez, TM Ey)
+        bead_x_um=(np.nan if not rs._place_bead(args) else float(args.bead_x)),
         fdtd_P_core=Pc_f, fdtd_P_tear=Pt_f, fdtd_x_full_um=x_f,
         t_wg_um=t_wg, stack_bottom_um=yb, lam_nm=c['lam'], pol=pol, tilt_deg=c['tilt'],
         curved_R_um=(c['curved'] or 0.0), dx_nm=float(args.resolution_nm),
@@ -172,7 +217,7 @@ def main(argv=None):
         fdtd_w_z_um=zf['w_z_um'], fdtd_z_factor_per_um=zf['z_factor_per_um'],
         **{f'bpm_A_cum_{k}': v for k, v in r.get('A_cum', {}).items()},
         **{f'bpm_A_rate_{k}': v for k, v in r.get('A_rate', {}).items()},
-        kappa=str(c['kappa']))
+        kappa=str(c['kappa']), **ret)
     print(f'  Saved: {out}')
     return out
 

@@ -184,6 +184,27 @@ def print_absorption(r, L):
           f'{10*math.log10(P[0]/max(P[0] - A, 1e-300))/(L/1e3):.3e} dB/mm')
 
 
+def fdtd_column_to_bpm(c, E, y_f, ix, ix_ref, P_ref):
+    """BPM field u on c['y'] from column ix of a complex 2D FDTD CW field E[x, y] (TE Ez,
+    TM Ey; FDTD exp(-iwt) -> BPM exp(+i(kx - wt)): conjugate). Its power P is P_ref times
+    the ratio of the BPM power measure (TE |Ez|^2, TM eps|Ey|^2, over the BPM domain) at
+    column ix to that at the reference column ix_ref (where the power P_ref is known).
+    Returns (u, P)."""
+    col = np.conj(E[ix])
+    if c['pol'] == 'p':                        # FDTD Ey -> BPM Hz (inverse of run_hybrid)
+        col = col*np.interp(y_f, c['y'], np.real(c['bp'].eps))/c['n_wg']**2
+    y = c['y']
+    u = (np.interp(y, y_f, col.real, left=0, right=0)
+         + 1j*np.interp(y, y_f, col.imag, left=0, right=0))
+    yf_in = (y_f > c['y_lo'] + 2.0) & (y_f < c['y_hi'] - 2.0)     # inside the BPM domain
+    w = (np.interp(y_f[yf_in], c['y'], np.real(c['bp'].eps)) if c['pol'] == 'p'
+         else np.ones(int(yf_in.sum())))
+    S = lambda i: float((w*np.abs(E[i][yf_in])**2).sum())
+    P = float(P_ref)*S(ix)/S(ix_ref)
+    from common.bpm import normalize_power
+    return normalize_power(c['bp'], u, P), P
+
+
 def fdtd_start_field(args, c, x_start_um, margin_um=15.0):
     """Short 2D FDTD run of the coupling (same parameters, method full, no bead) and its
     complex CW field at x_start_um after the facet, as a BPM start field on c['y'].
@@ -210,20 +231,8 @@ def fdtd_start_field(args, c, x_start_um, margin_um=15.0):
     if ix >= E.shape[0] - 14:
         raise SystemExit('--bpm-start-fdtd-um: plane too close to the end of the FDTD domain')
     y_f = -d2.TEAR_BUFFER*1e6 + np.arange(E.shape[1])*dx
-    col = np.conj(E[ix])                       # FDTD exp(-iwt)  -> BPM exp(+i(kx - wt))
-    if c['pol'] == 'p':                        # FDTD Ey -> BPM Hz (inverse of run_hybrid)
-        col = col*np.interp(y_f, c['y'], np.real(c['bp'].eps))/c['n_wg']**2
-    y = c['y']
-    u = (np.interp(y, y_f, col.real, left=0, right=0)
-         + 1j*np.interp(y, y_f, col.imag, left=0, right=0))
-    yf_in = (y_f > c['y_lo'] + 2.0) & (y_f < c['y_hi'] - 2.0)     # inside the BPM domain
-    w = (np.interp(y_f[yf_in], c['y'], np.real(c['bp'].eps)) if c['pol'] == 'p'
-         else np.ones(int(yf_in.sum())))
-    S = lambda i: float((w*np.abs(E[i][yf_in])**2).sum())
     ix_f = int(round((res['x_facet_global_um'] + 0.2)/dx))        # just behind the facet
-    P = float(res['coupling_efficiency'])*S(ix)/S(ix_f)
-    from common.bpm import normalize_power
-    u = normalize_power(c['bp'], u, P)
+    u, P = fdtd_column_to_bpm(c, E, y_f, ix, ix_f, float(res['coupling_efficiency']))
     eta = P
     print(f'  FDTD start: FDTD input-plane coupling {100*float(res.get("coupling_efficiency", np.nan)):.2f} %, '
           f'power at the start plane {100*P:.2f} %')

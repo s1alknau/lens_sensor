@@ -662,6 +662,11 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
     if _ho is not None:                              # Uebergabe: Kern bis in die linke PML
         x_facet_um = input_gap_um = -1.0
         label += f'_handoff{float(_ho["x0_um"]):g}'
+        if bead_x_um is not None:                    # Bead-x in Linsenkoordinaten (ab Facette)
+            bx_um = float(bead_x_um) - float(_ho['x0_um']) + src_ix*dx*1e6
+            if not (src_ix*dx*1e6 + 1.0 < bx_um < L_um - 1.0):
+                raise ValueError(f'bead x = {bead_x_um:g} um (lens) lies outside the FDTD '
+                                 f'region {float(_ho["x0_um"]):g} .. {float(_ho["x0_um"]) + L_um:g} um')
     if cad is not None:                              # freie CAD-Geometrie
         _cm = cad.meta()
         label = f'CAD-{os.path.splitext(_cm["cad_file"])[0]}_z{cad.z0_um:g}_L{lambda_nm:g}'
