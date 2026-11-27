@@ -57,6 +57,14 @@ SRC_CORE_ONLY = False
 # optische VCSEL-Leistung [mW] (--laser-power), gesetzt vom Treiber; nur fuer die
 # Skalierung im Analyzer (FDTD ist linear) und die Ausgabe der eingekoppelten Leistung
 LASER_POWER_MW = vcsel.VCSEL_DEFAULTS['power_mw']
+# Uebergabe BPM -> FDTD (run_hybrid.py), gesetzt vom Treiber; None = normale VCSEL-Quelle.
+# dict(y_um, u, n_src, tilt_core_deg, x0_um[, y_top_um]): u = komplexes Feld (TE: Ez,
+# TM: Ey) auf y_um in der BPM-Konvention exp(+i(kx x - w t)). Dann gilt fuer run_beads
+# (nur method='full', nur eingebauter Schichtstapel): keine Eintrittsfacette (Kern ueber
+# die ganze Domaene), die Huygens-Quelle (Spalte src_ix) praegt u ein = Linsenort x0_um,
+# y_top_um schneidet die Domaene oben ab (CPML im Kern; Strahl muss darunter bleiben).
+HANDOFF = None
+RETURN_CW = False      # True: run_beads (full) gibt das komplexe CW-Feld E_cw zurueck
 LAM_LOSS = 850e-9       # Wellenlaenge, bei der kappa -> sigma umgerechnet wird (je Lauf gesetzt)
 T_MU = 0.5e-6            # Mucin-Dicke (physiologisch ~0.2-0.5 um)
 T_AQ = 3.5e-6            # Aqueous(Wasser)-Dicke (physiologisch ~3-4 um; > typ. Bead)
@@ -397,6 +405,23 @@ def _vcsel_source_2d(Ny, dx, dt, T_WG, src_ix, vcsel_offset, vcsel_waist, lambda
     return iy_src, src, src.to_ey()
 
 
+def _handoff_source_2d(ho, Ny, dx, dt, y0_m, src_ix, lambda_nm, f0):
+    """Huygens-Quelle aus einem uebergebenen komplexen Feld (BPM -> FDTD, siehe HANDOFF).
+    BPM-Konvention exp(+i(kx x - w t)) -> FDTD-Phase = -arg(u) (wie vcsel.profile_1d: positive
+    Neigung = Phase +k sin(t) y). kx des Huygens-Paars aus der Strahlneigung im Kern; Anteile
+    mit anderem kx strahlen schwach rueckwaerts in die linke PML."""
+    y_um = (y0_m + np.arange(Ny)*dx)*1e6
+    yb = np.asarray(ho['y_um'], dtype=float); ub = np.asarray(ho['u'], dtype=complex)
+    u = np.interp(y_um, yb, ub.real, left=0.0, right=0.0)         + 1j*np.interp(y_um, yb, ub.imag, left=0.0, right=0.0)
+    amp, ph = np.abs(u), -np.unwrap(np.angle(u))     # stetig (to_ey mittelt Nachbarn)
+    kdx = vcsel.numerical_kx_dx(lambda_nm, dx, C0*dt, float(ho['n_src']), float(ho['tilt_core_deg']))
+    src = vcsel.HuygensSource(src_ix, amp, ph, 2*np.pi*f0, kdx)
+    print(f'  Source: BPM hand-off at x = {float(ho["x0_um"]):g} um in the lens '
+          f'(field on {len(yb)} BPM nodes -> {Ny} FDTD rows, kx from tilt '
+          f'{float(ho["tilt_core_deg"]):.2f} deg in n={float(ho["n_src"]):.4f})')
+    return int(np.argmax(amp)), src, src.to_ey()
+
+
 def _cad_air_um(_s, src_x_um):
     """CAD: Abstand Quellebene -> Facettenmitte [um] (Luftweg des Strahls)."""
     fc = np.asarray(_s['facet_center'], dtype=float)
@@ -607,6 +632,9 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
                                   n_lipid=n_lipid, polarization=polarization, curved=curved,
                                   boundary=boundary, cad=cad, stack=stack)
     _pol = 'p' if str(polarization).lower() in ('p', 'tm') else 's'
+    _ho = HANDOFF
+    if _ho is not None and (cad is not None or method != 'full'):
+        raise ValueError('HANDOFF (BPM -> FDTD) needs method=full and the built-in layer stack')
     t_aq_um = t_aqueous_um if t_aqueous_um is not None else T_AQ*1e6   # feste Aqueous-Dicke
     t_total = time.time()
     wg_n = wg_n if wg_n is not None else n_at(wg_mat, lambda_nm)
@@ -631,6 +659,9 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
     _vd = float(input_gap_um or 0.0)
     x_facet_um, _air, _zsrc = _vcsel_geom_2d(src_ix, dx, _vd)
     input_gap_um = x_facet_um                        # ab hier: Facettenposition (Geometrie)
+    if _ho is not None:                              # Uebergabe: Kern bis in die linke PML
+        x_facet_um = input_gap_um = -1.0
+        label += f'_handoff{float(_ho["x0_um"]):g}'
     if cad is not None:                              # freie CAD-Geometrie
         _cm = cad.meta()
         label = f'CAD-{os.path.splitext(_cm["cad_file"])[0]}_z{cad.z0_um:g}_L{lambda_nm:g}'
@@ -640,6 +671,8 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
     else:
         y0_m = -TEAR_BUFFER                          # y bei j=0
         H_total = T_WG + AIR_BUFFER + TEAR_BUFFER
+        if _ho is not None and _ho.get('y_top_um') is not None:
+            H_total = min(H_total, float(_ho['y_top_um'])*1e-6 + TEAR_BUFFER)
     print(f'\n===== Bead-Demo [full]: {label} =====')
     Nx = int(round(L/dx)); Ny = int(round(H_total/dx))
     cad_region = None
@@ -706,10 +739,13 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
     _iy0 = int(round(((T_WG/2 if _yc is None else _yc) + vcsel_offset*1e-6 - y0_m)/dx))
     _n_src = _n_source_2d(cad, src_ix*dx*1e6, Ny, _iy0, y0_m, dx, wg_n, T_WG,
                           n_aq_l if stack is None else _stack_n_below(stack, n_co_l), input_gap_um)
-    iy_src, _vs, _vs_ey = _vcsel_source_2d(Ny, dx, dt, T_WG, src_ix, vcsel_offset, vcsel_waist,
-                                           lambda_nm, tilt, _n_src, _zsrc, f0, y0_m=y0_m,
-                                           y_center_m=_yc)
-    print('  ' + vcsel.describe(vcsel_waist, lambda_nm, _vd, _air, LASER_POWER_MW))
+    if _ho is not None:
+        iy_src, _vs, _vs_ey = _handoff_source_2d(_ho, Ny, dx, dt, y0_m, src_ix, lambda_nm, f0)
+    else:
+        iy_src, _vs, _vs_ey = _vcsel_source_2d(Ny, dx, dt, T_WG, src_ix, vcsel_offset, vcsel_waist,
+                                               lambda_nm, tilt, _n_src, _zsrc, f0, y0_m=y0_m,
+                                               y_center_m=_yc)
+        print('  ' + vcsel.describe(vcsel_waist, lambda_nm, _vd, _air, LASER_POWER_MW))
     mur = mur1_coeff(dx, dt)
     bnd = make_boundary(boundary, _pol, Nx, Ny, dx, dt, npml=NPML, lam_m=LAM)
     if not _cpml:
@@ -729,6 +765,8 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
         (ixin0, ixin1, iyi0, iyi1), (ixout0, ixout1, iyo0, iyo1) = cad.detectors(cad_region, 0.0)
     else:
         iy_lo = int(round((0.0 + TEAR_BUFFER)/dx)); iy_hi = int(round((T_WG + TEAR_BUFFER)/dx))
+        if _ho is not None:                          # abgeschnittene Domaene: vor der PML enden
+            iy_hi = min(iy_hi, Ny - NPML - 2)
 
         # Fensterbreite hoechstens 10 % der Laenge: sonst ueberdecken sich Ein- und
         # Ausgangsfenster bei kurzen Domaenen (L < 2*DET_LEN) -> P_in = P_out, T = 1.
@@ -924,6 +962,15 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
                           cad_det=[[ixin0, ixin1, iyi0, iyi1], [ixout0, ixout1, iyo0, iyo1]])
         res['cad_region'] = cad_region
     res['view_primary'] = 'transient'      # full: einlaufend ist der Hauptsatz
+    if RETURN_CW and Ecw is not None:                # BPM-Start aus dem FDTD (run_bpm.py)
+        res['E_cw'] = Ecw
+        res['x_facet_global_um'] = float(x_facet_um)
+    if _ho is not None:
+        res['x_wg_start_um'] = 0.0
+        res['E_cw'] = Ecw                            # komplexe CW-Amplitude (Vergleich BPM)
+        res['handoff'] = dict(x0_um=float(_ho['x0_um']), src_x_um=src_ix*dx*1e6,
+                              y_top_um=_ho.get('y_top_um'),
+                              tilt_core_deg=float(_ho['tilt_core_deg']))
     return res
 
 
