@@ -42,7 +42,7 @@ from common.backend import xp, cp, GPU_AVAILABLE, to_np           # noqa: E402
 from common.physics import C0, EPS0, MU0, N_AIR, DISPERSION, n_at, cornea_default  # noqa: E402
 from common.physics import core_source_mask, SRC_CORE_RAMP_UM  # noqa: E402
 from common.subpixel import sphere_fraction, blend, cell_average_column  # noqa: E402
-from common.flux import PlaneFluxDFT, pairs_3d, guard_in_plane  # noqa: E402
+from common.flux import PlaneFluxDFT, pairs_3d, guard_in_plane, SideBox  # noqa: E402
 from common import vcsel                                         # noqa: E402
 from common.layer_stack import (stack_total_um, legacy_stack, legacy_layers_tuple,  # noqa: E402
                                 stack_to_npz, describe as describe_stack)
@@ -544,6 +544,20 @@ def _cad_air_um_3d(_s, x_src_um):
                          + (fc[2] - _s['z_um'])**2))
 
 
+def _box_margin(boundary, n_sp):
+    """Abstand der Energiebilanz-Box vom Rand: Absorberdicke + 2 Zellen."""
+    b = str(boundary or 'cpml').lower()
+    return (10 if b == 'cpml' else int(n_sp) if b == 'sponge' else 1) + 2
+
+
+def _core_kslice(wg_width_um, lz_um, z0_um, dx_um):
+    """z-Bereich des Kerns: Rippe/Kanal (wg_width) -> deren Breite, Slab -> ganze Tiefe."""
+    if wg_width_um is not None and 0 < wg_width_um < lz_um:
+        return slice(int(round((-0.5*wg_width_um - z0_um)/dx_um)),
+                     int(round((0.5*wg_width_um - z0_um)/dx_um)))
+    return slice(None)
+
+
 def _vcsel_res(p_emit, p_refl, p_in, distance_um, air_um, x_facet_um, waist_um, waist_z_um,
                energy=False):
     """VCSEL-Kennwerte fuers Ergebnis (W; energy=True: Pulsenergie J, keine Skalierung)."""
@@ -934,6 +948,13 @@ def run_3d(label, wg_n, t_wg_um=5.0,
                           t_lip_um, t_aq_um, t_mu_um, n_lip, n_aq, n_mu, n_co, bead,
                           wg_width_um=wg_width_um, n_clad_side=n_clad_side,
                           end_facet_um=end_facet_um, x_wg_start_um=x_wg_start_um,
+                          # global x like the stitch and 2D: only the CORE is missing in
+                          # front of the facet (and behind an end facet); the layers below
+                          # keep running. Without this, the whole column in front of the
+                          # facet became air -> different beam environment than stitch/2D
+                          # (VCSEL: ~11 % more emitted power, ~10 % less coupled into the core).
+                          x0_um=0.0,
+                          x_wg_end_um=((lx_um - end_facet_um) if end_facet_um else None),
                           tensor_patch=_tp, stack=stack)
     eps, _eim = _split_eps3(eps)                     # Absorption: eps' + eps''
     # eps ist float32 -> nur float32 uebertragen (halber Host-Puffer statt float64),
@@ -1027,6 +1048,8 @@ def run_3d(label, wg_n, t_wg_um=5.0,
     _flux = PlaneFluxDFT(2*np.pi*f0, dt)          # exakter CW-Poynting-Fluss (E und H)
     _fl_planes = {'in': max(1, (iin0 + iin1)//2), 'out': max(1, (iout0 + iout1)//2),
                   'src_up': _vs.plane_up, 'src_dn': _vs.plane_dn}   # VCSEL-Leistung
+    _mg = _box_margin(boundary, n_sp)              # Energiebilanz-Box (Seitenfluesse)
+    _sbox = SideBox(_vs.plane_dn, _fl_planes['out'], _mg, Ny - 1 - _mg, _mg, Nz - 1 - _mg)
 
     # Laufzeit: Anlauf + steps_factor Transits beim GRUPPENindex (Marge N_G_FACTOR, die
     # reflektierte Welle laeuft mit v_g < c/n). Danach CW-Konvergenztest (s.u.).
@@ -1153,6 +1176,8 @@ def run_3d(label, wg_n, t_wg_um=5.0,
             nacc_cw += 1
             for _k, _il in _fl_planes.items():          # exakter Fluss (E und H)
                 _flux.add(_k, t_phys, pairs_3d(_il, Ey, Ez, Hy, Hz))
+            for _k, _pr in _sbox.faces_3d(Ex, Ey, Ez, Hx, Hy, Hz):   # Seiten (Bilanz)
+                _flux.add(_k, t_phys, _pr)
             if _conv:
                 acc_pl_b += src_field[:, :, _kc].astype(xp.complex64)*_ph; n_pl_b += 1
         elif _conv and n >= steps_total - 2*n_acc_cw:
@@ -1284,6 +1309,13 @@ def run_3d(label, wg_n, t_wg_um=5.0,
     _vres = _vcsel_res(((_flux.flux('src_dn') - _flux.flux('src_up'))*dx*dx) if _cw_ok else None,
                        (-_flux.flux('src_up')*dx*dx) if _cw_ok else None, _p_si, _vd, _air,
                        x_wg_start_um, vcsel_waist_um, vcsel_waist_z_um)
+    if _cw_ok:
+        _kz = _core_kslice(wg_width_um, lz_um, z0_um, dx_um)
+        _vres.update(vcsel.core_metrics(_flux, dx*dx, _vres.get('p_src_si'),
+                                        (slice(j_wg0, j_wg1), _kz), (slice(_jo0, _jo1), _kz),
+                                        LASER_POWER_MW))
+        _vres.update(vcsel.energy_balance(_flux, dx*dx, _vres.get('p_src_si'),
+                                          -_flux.flux('src_up')*dx*dx, _sbox, LASER_POWER_MW))
     return dict(**_vres, scenario=label, dim='3D', P_in=P_in, P_out=P_out, p_in_si=_p_si, p_in_unit='W',
                 transmission=Tr, vols_array=_va,
                 vols_ex=_vx, vols_ey=_vy, vector=bool(save_vector),
@@ -1547,6 +1579,7 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
     det_in_um = _gi*dx_um                        # auch fuer die Intensitaets-Kennzahl unten
     _go = min(max(int(round(det_out_um/dx_um)), 1), Nx_full - 2)
     _flux = PlaneFluxDFT(omega, dt)
+    _sbox = None                                   # Energiebilanz-Box (nach _gi/_go)
     for w in range(n_win):
         gx0 = _gx0(w)
         x0_um = gx0*dx_um
@@ -1558,6 +1591,9 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
                 if _glo <= g < _ghi and g - gx0 >= 1}
         if w == 0:                                # VCSEL-Leistung um die Quelle
             _fpl.update(src_up=_vs.plane_up, src_dn=_vs.plane_dn)
+        if _sbox is None:
+            _mg = _box_margin(boundary, n_sp)
+            _sbox = SideBox(_vs.plane_dn, _go, _mg, Ny - 1 - _mg, _mg, Nz - 1 - _mg)
         _off = (_gx0(w + 1) - gx0) if not last else 0   # Overlap-Start fuers naechste Fenster
         _tp = {}                                  # Bead-Rand fuer Tensor-Mittelung
         if cad is not None:
@@ -1642,6 +1678,9 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
                 acc_n += 1
                 for _k, _il in _fpl.items():             # exakter Fluss (E und H)
                     _flux.add(_k, t_phys, pairs_3d(_il, Ey, Ez, Hy, Hz))
+                for _k, _pr in _sbox.faces_3d(Ex, Ey, Ez, Hx, Hy, Hz, glo=_glo, ghi=_ghi,
+                                              gx0=gx0, tag=f'w{w}'):
+                    _flux.add(_k, t_phys, _pr)
                 if hand_acc is not None:
                     _e = np.complex64(np.exp(-1j*omega*t_phys))
                     for A, F in zip(hand_acc, (Ex, Ey, Ez)):
@@ -1761,6 +1800,13 @@ def run_3d_stitched(label, wg_n, window_w_um=20.0, slide_um=12.0,
     _vres = _vcsel_res(((_flux.flux('src_dn') - _flux.flux('src_up'))*dx*dx) if _cw_ok else None,
                        (-_flux.flux('src_up')*dx*dx) if _cw_ok else None, _p_si, _vd, _air,
                        x_wg_start_um, vcsel_waist_um, vcsel_waist_z_um)
+    if _cw_ok:
+        _kz = _core_kslice(wg_width_um, lz_um, z0_um, dx_um)
+        _vres.update(vcsel.core_metrics(_flux, dx*dx, _vres.get('p_src_si'),
+                                        (slice(j_wg0, j_wg1), _kz), (slice(_jo0, _jo1), _kz),
+                                        LASER_POWER_MW))
+        _vres.update(vcsel.energy_balance(_flux, dx*dx, _vres.get('p_src_si'),
+                                          -_flux.flux('src_up')*dx*dx, _sbox, LASER_POWER_MW))
     return dict(**_vres, scenario=label, dim='3D', P_in=P_in, P_out=P_out, p_in_si=_p_si, p_in_unit='W',
                 transmission=Tr, vols_array=vol_buf, vols_ex=None, vols_ey=None,
                 vector=False, _stream_paths=_stream_paths,
@@ -2345,6 +2391,10 @@ def save_results_3d(result, out_dir='results', prefix='fdtd3d',
              if result.get('p_in_si') is not None else {})
     _kw_p.update(vcsel.npz_keys(result))                # VCSEL: Laserleistung, Kopplung
     _kw_ia.update(_kw_p)
+    if not _cad:                                        # Kerndicke -> Analyzer: Slab-Koordinaten,
+        _kw_ia['t_wg_um'] = np.array([result.get('t_wg_um', 0.0)])   # Overlay und Bildausschnitt
+        if result.get('wg_width_um'):
+            _kw_ia['wg_width_um'] = np.array([float(result['wg_width_um'])])
     fr_path = f'{out_dir}/{prefix}_{tag}_frames.npz'
     np.savez_compressed(
         fr_path, Ez=ez_xy, meta=meta, scenario=tag, **_kw_ia,

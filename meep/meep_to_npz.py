@@ -84,6 +84,9 @@ def _extra(result, cfg=None, dim=None):
         out['p_in_unit'] = np.array(['W' if dim == 3 else 'W/m'])
         out['coupling_efficiency'] = np.array([float(result['coupling_efficiency'])])
         out['facet_reflection'] = np.array([float(result['facet_reflection'])])
+        for _k in ('coupling_core', 'core_out', 'transmission_total'):
+            if result.get(_k) is not None:
+                out[_k] = np.array([float(result[_k])])
     if cfg is not None:
         out['laser_power_mw'] = np.array([float(cfg.get('laser_power_mw') or 20.0)])
         out['vcsel_distance_um'] = np.array([float(cfg.get('vcsel_distance') or 0.0)])

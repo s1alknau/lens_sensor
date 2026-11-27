@@ -186,7 +186,65 @@ def describe(waist_um, lambda_nm, distance_um, air_um, power_mw, waist_z_um=None
             f'R={"inf" if not math.isfinite(R) else f"{R:.1f} um"}), P={power_mw:g} mW, forward-only (Huygens)')
 
 
+def core_metrics(flux, scale, p_emit, region_in, region_out, power_mw=None):
+    """Kopplung IN DEN KERN: Poynting-Fluss nur ueber den Kern-Querschnitt an der
+    Eingangs- ('in') und Ausgangsebene ('out'), bezogen auf die abgestrahlte Leistung.
+    coupling_efficiency (ganzer Querschnitt) zaehlt auch Licht in Luft/Mantel hinter der
+    Facette mit; coupling_core nur das, was im Kern ankommt, core_out das, was am Ende
+    noch im Kern laeuft (gefuehrt). transmission_total: Ausgang (ganzer Querschnitt) bezogen
+    auf die Laserleistung (inkl. Facettenverlust) - im Gegensatz zu 'transmission'
+    (Ausgang/Eingang hinter der Facette). scale: Flaechenelement (2D dx, 3D dx^2)."""
+    out = {}
+    if not p_emit or p_emit <= 0 or flux is None:
+        return out
+    if flux.has('out'):                      # Ausgang (ganzer Querschnitt) / Laserleistung
+        out['transmission_total'] = flux.flux('out')*scale/p_emit
+    for key, reg, name in (('in', region_in, 'coupling_core'), ('out', region_out, 'core_out')):
+        if reg is None or not flux.has(key):
+            continue
+        try:
+            out[name] = flux.flux(key, reg)*scale/p_emit
+        except Exception as ex:                      # pragma: no cover
+            print(f'  [WARN] core flux {key}: {ex}')
+    if out:
+        pm = power_mw
+        msg = '  '.join(f'{lbl}={100*out[k]:.2f}%' + (f' ({pm*out[k]:.3f} mW)' if pm else '')
+                        for k, lbl in (('coupling_core', 'in core after facet'),
+                                       ('core_out', 'in core at output'),
+                                       ('transmission_total', 'T_total = out/laser')) if k in out)
+        print(f'[VCSEL] {msg}')
+    return out
+
+
+def energy_balance(flux, scale, p_emit, p_refl, box, power_mw=None):
+    """Energiebilanz bezogen auf die Laserleistung (CW):
+        1 = R + S + A + T_total
+    R: Facettenreflexion (zurueck zum VCSEL), S: seitlich aus dem Gebiet (Streuung,
+    Abstrahlung; gemessen auf den Seiten der Messbox), T_total: Ausgang (ganzer
+    Querschnitt), A: Rest = Absorption + numerischer Fehler (verlustfreie Materialien:
+    nur Fehler). box: common.flux.SideBox."""
+    from common.flux import SideBox
+    out = {}
+    if box is None or not p_emit or p_emit <= 0 or not (flux.has('src_dn') and flux.has('out')):
+        return out
+    side = SideBox.side_total(flux)*scale
+    b_in = flux.flux('src_dn', box.region)*scale
+    b_out = flux.flux('out', box.region)*scale
+    out['side_loss'] = side/p_emit
+    out['absorbed_residual'] = (b_in - b_out - side)/p_emit
+    R = (p_refl or 0.0)/p_emit
+    T = flux.flux('out')*scale/p_emit
+    pm = power_mw or 0.0
+    f = (lambda v: f'{100*v:6.2f}%' + (f' ({pm*v:7.3f} mW)' if pm else ''))
+    print(f'[VCSEL] energy balance (of laser power):  R facet {f(R)}  |  S sides {f(out["side_loss"])}'
+          f'  |  A abs.+error {f(out["absorbed_residual"])}  |  T_total {f(T)}'
+          f'  |  sum {100*(R + out["side_loss"] + out["absorbed_residual"] + T):.2f}%')
+    return out
+
+
 NPZ_KEYS = ('laser_power_mw', 'p_src_si', 'coupling_efficiency', 'facet_reflection',
+            'coupling_core', 'core_out', 'transmission_total', 'side_loss',
+            'absorbed_residual',
             'vcsel_distance_um', 'vcsel_air_um', 'vcsel_waist_um', 'vcsel_waist_z_um',
             'x_facet_um')
 

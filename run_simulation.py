@@ -270,6 +270,33 @@ def _enforce_lens_stitch(args):
         args.method = 'stitch'
 
 
+def _plan_stitch_windows(args, layers):
+    """Fenster/Slide fuer Stitch bestimmen (common/stitch_plan.py): automatisch, wenn der
+    Nutzer nichts vorgibt; sonst nur pruefen und melden, ob Nahtstellen auf Strukturen
+    (Bead, Facetten) liegen."""
+    from common import stitch_plan as sp
+    from common.layer_stack import stack_total_um
+    dx = float(args.resolution_nm)/1000.0
+    L = float(args.length_um)
+    t_wg = float(layers['t_wg_um'])
+    if args.dim == 2:
+        cross = (t_wg + 5.0 + 10.0)/dx                 # 2D: AIR_BUFFER 5 + TEAR_BUFFER 10 um
+    else:
+        tear = args.tear if args.tear is not None else stack_total_um(layers.get('stack')) + 2.0
+        cross = ((t_wg + args.air + tear)/dx)*(args.lz_um/dx)
+    feats = []
+    if _place_bead(args):
+        feats.append(args.bead_x if args.bead_x is not None else L/2.0)
+    if getattr(args, 'end_facet', None):
+        feats.append(L - float(args.end_facet))
+    lossy = any(complex(x['n']).imag > 0 for x in (layers.get('stack') or [])) or         bool(getattr(args, 'kappa', None))
+    p = sp.plan(L, dx, args.dim, cross, feats, lossy,
+                window_um=None if args._window_auto else args.window_um,
+                slide_um=None if args._window_auto else args.slide_um)
+    args.window_um, args.slide_um = p['window_um'], p['slide_um']
+    print(sp.describe(p))
+
+
 def _place_bead(args):
     """Bead nur im planaren Fall und nur wenn nicht --no-bead und d>0."""
     return (args.geometry == 'planar') and (not args.no_bead) and (args.bead_diameter > 0)
@@ -807,6 +834,10 @@ def resolve_args(args):
         args.length_um = args.length_um or 0.0   # Laenge kommt aus der CAD-Szene
     if args.length_um is None:
         args.length_um = DEFAULT_LENGTH_UM[(args.geometry, args.dim)]
+    # Stitch ohne --window-um/--slide-um: automatische Planung in main()
+    # (common/stitch_plan.py, nach Speicher und Geometrie). Fuer 'sliding' (2D) und als
+    # Rueckfall bleiben die bisherigen festen Werte.
+    args._window_auto = (args.window_um is None and args.slide_um is None)
     if args.window_um is None:
         args.window_um = 350.0 if args.dim == 2 else 20.0
     if args.slide_um is None:
@@ -845,9 +876,13 @@ def main(argv=None):
 
     layers = resolve_args(args)
     args._cad = _make_cad(args) if args.geometry == 'cad' else None
+    if args.method == 'stitch':
+        _plan_stitch_windows(args, layers)
 
     print('===================== FDTD configuration =====================')
-    _gname = {'lens': 'contact lens (flattened)', 'planar': 'planar waveguide',
+    _gname = {'lens': ('contact lens (curved, R = 8.3 mm, conformal mapping)'
+                       if (args.curved and args.dim == 2) else 'contact lens (flattened)'),
+              'planar': 'planar waveguide',
               'cad': f'CAD {os.path.basename(args.cad or "")}'}[args.geometry]
     print(f'  Geometry  : {_gname}')
     print(f'  Dimension : {args.dim}D')

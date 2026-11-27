@@ -26,7 +26,7 @@ from common.backend import xp, cp, GPU_AVAILABLE, to_np           # noqa: E402
 from common.physics import (C0, EPS0, MU0, N_AIR, DISPERSION, n_at, cornea_default,  # noqa: E402
                             loss_sigma, core_source_mask, SRC_CORE_RAMP_UM)
 from common.subpixel import circle_fraction, blend, cell_average_column  # noqa: E402
-from common.flux import PlaneFluxDFT, pairs_2d, pairs_3d, guard_in_plane  # noqa: E402,F401
+from common.flux import PlaneFluxDFT, pairs_2d, pairs_3d, guard_in_plane, SideBox  # noqa: E402,F401
 from common import vcsel                                                  # noqa: E402
 from common.layer_stack import (stack_total_um, legacy_stack, legacy_layers_tuple,  # noqa: E402
                                 stack_to_npz, describe as describe_stack)
@@ -788,6 +788,8 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
     _flux = PlaneFluxDFT(2*np.pi*f0, dt)
     _fl_planes = {'in': max(1, (ixin0 + ixin1)//2), 'out': max(1, (ixout0 + ixout1)//2),
                   'src_up': _vs.plane_up, 'src_dn': _vs.plane_dn}   # VCSEL-Leistung
+    _mg = (NPML if _cpml else 10) + 2              # Energiebilanz-Box (Seitenfluesse in y)
+    _sbox = SideBox(_vs.plane_dn, _fl_planes['out'], _mg, Ny - 1 - _mg)
     # CW-Steady per laufendem DFT bei f0 (letzte ~8 Perioden) -> zweiter,
     # eingeschwungener Frame-Satz (Phasen ueber 1 Periode), zusaetzlich zum
     # transienten (einlaufenden) Satz. Akkumulation auf dem Device.
@@ -880,6 +882,8 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
                 acc_cw_ex += _tm_ex_node(Ex_t).astype(xp.complex64)*np.exp(-1j*omega*t_phys)
             for _k, _il in _fl_planes.items():
                 _flux.add(_k, t_phys, pairs_2d(_pol, _il, Ez=Ez, Hy=Hy, Ey=Ey_t, Hz=Hz_t))
+            for _k, _pr in _sbox.faces_2d(_pol, Ez=Ez, Hx=Hx, Ex=Ex_t, Hz=Hz_t):
+                _flux.add(_k, t_phys, _pr)
         elif _conv and n >= steps_total - 2*n_acc_cw:   # Fenster davor (Konvergenztest)
             acc_prev += field.astype(xp.complex64)*np.exp(-1j*omega*t_phys)
             nacc_prev += 1
@@ -957,6 +961,11 @@ def run_beads(wg_mat, bead_mat, bead_d_um, dx_nm=20.0, save_frames=True, n_snaps
     res['p_in_si'] = _p_si; res['p_in_unit'] = 'W/m'   # fuer Leistungs-Skalierung (Analyzer)
     _vcsel_result(res, *(_emit_power(_flux, dx) if source_type != 'pulse' else (None, None)),
                   _vd, _air, x_facet_um, vcsel_waist)
+    if source_type != 'pulse':
+        res.update(vcsel.core_metrics(_flux, dx, res.get('p_src_si'), (slice(iyi0, iyi1),),
+                                      (slice(iyo0, iyo1),), LASER_POWER_MW))
+        _pe, _pr_ = _emit_power(_flux, dx)
+        res.update(vcsel.energy_balance(_flux, dx, _pe, _pr_, _sbox, LASER_POWER_MW))
     if cad is not None:
         res['cad'] = dict(cad.meta(), cad_tilt_deg=tilt,
                           cad_det=[[ixin0, ixin1, iyi0, iyi1], [ixout0, ixout1, iyo0, iyo1]])
@@ -1299,6 +1308,10 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
         y0_m = -TEAR_BUFFER
         H_total = T_WG + AIR_BUFFER + TEAR_BUFFER
     Ny = int(round(H_total/dx))
+    if window_w_um*1e-6 > L:                        # Fenster nie groesser als die Domaene
+        print(f'  [Note] window {window_w_um:g} um > length {L_um:g} um -> window = length '
+              f'(single window; the 2D default of 350 um is meant for the long lens)')
+        window_w_um = L_um
     Nx_win = int(round(window_w_um*1e-6/dx))
     S_cells = int(round(slide_um*1e-6/dx))
     O_cells = Nx_win - S_cells                     # Ueberlappung (Yee-Zellen)
@@ -1394,6 +1407,7 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
         iyi0, iyi1, iyo0, iyo1 = iy_lo, iy_hi, iy_lo, iy_hi
     ix_in = guard_in_plane(ix_in, max(src_ix, int(round(x_facet_um/(dx*1e6)))), Nx_full)   # im WG
     _flux = PlaneFluxDFT(omega, dt)
+    _sbox = SideBox(_vs.plane_dn, ix_out, 12, Ny - 13)   # Energiebilanz-Box (Seiten in y)
     for w in range(n_win):
         gx0 = _gx0(w)
         x_start_um = gx0*dx*1e6
@@ -1486,6 +1500,9 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                     acc_n += 1
                     for _k, _il in _fpl.items():
                         _flux.add(_k, t_phys, pairs_2d('p', _il, Ey=Ey_t, Hz=Hz_t))
+                    for _k, _pr in _sbox.faces_2d('p', Ex=Ex_t, Hz=Hz_t, glo=_glo, ghi=_ghi,
+                                                  gx0=gx0, tag=f'w{w}'):
+                        _flux.add(_k, t_phys, _pr)
             else:
                 # --- TE (Ez, Hx, Hy) ---
                 if _is_cpml_st:
@@ -1519,6 +1536,9 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
                     acc_n += 1
                     for _k, _il in _fpl.items():
                         _flux.add(_k, t_phys, pairs_2d('s', _il, Ez=Ez, Hy=Hy))
+                    for _k, _pr in _sbox.faces_2d('s', Ez=Ez, Hx=Hx, glo=_glo, ghi=_ghi,
+                                                  gx0=gx0, tag=f'w{w}'):
+                        _flux.add(_k, t_phys, _pr)
         Ew = to_np((2.0/max(acc_n, 1))*acc)                       # komplexe Amplitude
         if not _last:                                             # Overlap fuers naechste
             _off = _gx0(w + 1) - gx0                              # (letztes Fenster: <= S)
@@ -1616,6 +1636,10 @@ def run_beads_stitched(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_snapsh
     res['cw_only'] = True
     res['p_in_si'] = _p_si; res['p_in_unit'] = 'W/m'   # fuer Leistungs-Skalierung (Analyzer)
     _vcsel_result(res, *_emit_power(_flux, dx), _vd, _air, x_facet_um, vcsel_waist)
+    res.update(vcsel.core_metrics(_flux, dx, res.get('p_src_si'), (slice(iyi0, iyi1),),
+                                  (slice(iyo0, iyo1),), LASER_POWER_MW))
+    _pe, _pr_ = _emit_power(_flux, dx)
+    res.update(vcsel.energy_balance(_flux, dx, _pe, _pr_, _sbox, LASER_POWER_MW))
     if ExI_full is not None:
         res['Iavg'] = ExI_full          # TM: volles <|E|^2> (TE: Analyzer mittelt die CW-Phasen exakt)
     if ExA_full is not None:
@@ -1680,6 +1704,10 @@ def run_beads_stitched_td(wg_mat, bead_mat, bead_d_um, dx_nm, save_frames, n_sna
         y0_m = -TEAR_BUFFER
         H_total = T_WG + AIR_BUFFER + TEAR_BUFFER
     Ny = int(round(H_total/dx))
+    if window_w_um*1e-6 > L:                        # Fenster nie groesser als die Domaene
+        print(f'  [Note] window {window_w_um:g} um > length {L_um:g} um -> window = length '
+              f'(single window; the 2D default of 350 um is meant for the long lens)')
+        window_w_um = L_um
     Nx_win = int(round(window_w_um*1e-6/dx))
     S_cells = int(round(slide_um*1e-6/dx))
     O_cells = Nx_win - S_cells

@@ -370,6 +370,27 @@ def _flux_region(cfg, x_phys):
                          size=mp.Vector3(0, hy, hz))
 
 
+def _core_region(cfg, x_phys):
+    """Flussebene NUR ueber den Kern (y in [0, t_wg], 3D: Rippenbreite oder ganze Tiefe)
+    -> Leistung im Kern. None bei CAD/gekruemmt (Kernlage nicht achsparallel)."""
+    if cfg.get('cad') is not None or cfg.get('curved'):
+        return None
+    is3d = cfg['dim'] == 3
+    d = cfg.get('dpml', 0.0)
+    hz = 0
+    if is3d:
+        hz = cfg['wg_width'] if cfg.get('wg_width') else cfg['lz'] - 2*d
+    return mp.FluxRegion(center=mp.Vector3(x_phys - cfg['cx'], cfg['t_wg']/2 - cfg['cy'], 0),
+                         size=mp.Vector3(0, cfg['t_wg'], hz))
+
+
+def _add_core_fluxes(sim, cfg):
+    r_in, r_out = _core_region(cfg, cfg['det_in_x']), _core_region(cfg, cfg['det_out_x'])
+    if r_in is None:
+        return None, None
+    return sim.add_flux(cfg['f0'], 0, 1, r_in), sim.add_flux(cfg['f0'], 0, 1, r_out)
+
+
 def run(cfg, progress=True):
     """Baut die Simulation, laeuft bis (nahe) Steady-State, sammelt Frames der
     getriebenen Komponente und Transmission (Flux out/in). Rueckgabe: dict."""
@@ -409,6 +430,7 @@ def run(cfg, progress=True):
         f_out = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['det_out_x']))
         f_up = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['src_x'] - _dsrc))
         f_dn = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['src_x'] + _dsrc))
+        fc_in, fc_out = _add_core_fluxes(sim, cfg)
 
     n_grp = max(cfg['wg_n'], 1.4)
     T = cfg.get('run_time') or (2.2*cfg['lx']*n_grp + 20.0)
@@ -482,6 +504,7 @@ def run(cfg, progress=True):
         f_out = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['det_out_x']))
         f_up = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['src_x'] - _dsrc))
         f_dn = sim.add_flux(cfg['f0'], 0, 1, _flux_region(cfg, cfg['src_x'] + _dsrc))
+        fc_in, fc_out = _add_core_fluxes(sim, cfg)
         sim.run(until=4*Tp)
 
     pin = float(mp.get_fluxes(f_in)[0])
@@ -497,9 +520,16 @@ def run(cfg, progress=True):
     p_emit = pdn - pup
     if cfg.get('vcsel_impl') == 'meep-gaussianbeam' and p_emit > 0:
         eta = pin/p_emit
-        out.update(p_emit=p_emit, coupling_efficiency=eta, facet_reflection=-pup/p_emit)
+        out.update(p_emit=p_emit, coupling_efficiency=eta, facet_reflection=-pup/p_emit,
+                   transmission_total=pout/p_emit)
         print(f'[meep VCSEL] emitted P={p_emit:.4e} (Meep units)  facet reflection='
-              f'{-100*pup/p_emit:.2f}%  coupled through input plane: eta={100*eta:.2f}%')
+              f'{-100*pup/p_emit:.2f}%  coupled through input plane: eta={100*eta:.2f}%  '
+              f'T_total = out/laser = {pout/p_emit:.4f}')
+        if fc_in is not None:
+            cc = float(mp.get_fluxes(fc_in)[0])/p_emit
+            co = float(mp.get_fluxes(fc_out)[0])/p_emit
+            out.update(coupling_core=cc, core_out=co)
+            print(f'[meep VCSEL] in core after facet={100*cc:.2f}%  in core at output={100*co:.2f}%')
     if cw_frames is not None:
         out.update(cw_frames=cw_frames, cw_times=cw_times)
     return out

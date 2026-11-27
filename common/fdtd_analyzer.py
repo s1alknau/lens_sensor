@@ -514,6 +514,15 @@ class Analyzer:
         self.ex_amp2d = None
         # eingekoppelte Leistung (SI) -> Felder bei gewuenschter Leistung in V/m
         self.p_in_si, self.p_in_unit, self.p_laser_mw = _npz_power(d)
+        self.vcsel_eta = {}
+        for _k in ('facet_reflection', 'coupling_efficiency', 'coupling_core', 'core_out', 'side_loss', 'absorbed_residual',
+                   'transmission_total'):
+            try:
+                _v = float(np.asarray(d[_k]).flat[0]) if _k in d.files else None
+                if _v is not None and np.isfinite(_v):
+                    self.vcsel_eta[_k] = _v
+            except Exception:
+                pass
         self._escale, self._p_sim_w = power_scale(self.p_in_si, self.p_in_unit, self.p_laser_mw)
         _sc = self._escale
 
@@ -1330,6 +1339,14 @@ class Analyzer:
                  f'intensities x{self._escale**2:.3g}')
         else:
             t = 'this file has no power info (older run) -> unscaled'
+        _e = getattr(self, 'vcsel_eta', None) or {}
+        _lbl = (('facet_reflection', 'R'), ('coupling_efficiency', 'past facet'),
+                ('coupling_core', 'in core'), ('core_out', 'core at end'),
+                ('transmission_total', 'T_total (out/laser)'), ('side_loss', 'S sides'),
+                ('absorbed_residual', 'A abs.+err'))
+        _p = '  '.join(f'{l} {100*_e[k]:.1f}%' for k, l in _lbl if k in _e)
+        if _p:
+            t = t + '\n' + _p
         h.set_text(t)
 
     def on_power(self, text):
@@ -1887,8 +1904,23 @@ class Analyzer:
             span = max(xb - xa, yb - ya, zb - za)
             psize = float(np.clip(15.0*(s*dx/span*100.0)**2, 3.0, 80.0))
             order = np.argsort(frac)                # strong points drawn last (on top)
-            ax.scatter(xs[order], ys[order], zs[order], c=rgba[order], s=psize,
-                       linewidths=0, depthshade=False)
+            st['sc_full'] = ax.scatter(xs[order], ys[order], zs[order], c=rgba[order], s=psize,
+                                       linewidths=0, depthshade=False)
+            # Light preview for mouse rotation/zoom: matplotlib re-projects and depth-sorts
+            # EVERY point on every mouse move (CPU only) -> with ~1e5 points dragging is
+            # sluggish. While a mouse button is held only <= PREVIEW_N points are shown
+            # (the strongest ones weighted, so the structure stays recognisable).
+            PREVIEW_N = 6000
+            if order.size > PREVIEW_N:
+                sel = order[np.linspace(0, order.size - 1, PREVIEW_N).astype(int)]
+                sel = sel[np.argsort(frac[sel])]
+                pv = ax.scatter(xs[sel], ys[sel], zs[sel], c=rgba[sel],
+                                s=psize*min(4.0, (order.size/PREVIEW_N)**(1/3)),
+                                linewidths=0, depthshade=False)
+                pv.set_visible(False)
+                st['sc_prev'] = pv
+            else:
+                st['sc_prev'] = None
             if max(0.0, ya) < min(t_wg, yb):
                 self._wire_box3d(ax, xa, xb, max(0.0, ya), min(t_wg, yb), za, zb, '#FFD75E')
             self._layer_planes3d(ax, xa, xb, za, zb, ya, yb)
@@ -2022,8 +2054,25 @@ class Analyzer:
                     lim[2*n_], lim[2*n_ + 1] = c - hh, c + hh
             _set_lim(lim)
 
+        def _preview(on):
+            """Swap the full point cloud for the light preview while dragging."""
+            full, pv = st.get('sc_full'), st.get('sc_prev')
+            if full is None or pv is None or _mode2d():
+                return False
+            if full.get_visible() == (not on):
+                return False
+            full.set_visible(not on)
+            pv.set_visible(on)
+            return True
+
+        def on_press(ev):
+            if ev.inaxes is ax and ev.button in (1, 2, 3) and _preview(True):
+                fig.canvas.draw_idle()
+
         def on_release(ev):
             """After a mouse/toolbar zoom or pan, take over the new limits."""
+            if _preview(False):
+                fig.canvas.draw_idle()
             if ev.inaxes is ax2 and _mode2d():
                 d = DEPTH[st['view_set']]
                 h, v = [n_ for n_ in range(3) if n_ != d]
@@ -2039,6 +2088,7 @@ class Analyzer:
             if st['lim'] is not None and not np.allclose(cur, st['lim'], atol=1e-6):
                 _set_lim(cur)
         fig.canvas.mpl_connect('scroll_event', on_scroll)
+        fig.canvas.mpl_connect('button_press_event', on_press)
         fig.canvas.mpl_connect('button_release_event', on_release)
 
         a_db = fig.add_axes([0.18, 0.075, 0.46, 0.025], facecolor='#1a1a1a')
